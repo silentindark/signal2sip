@@ -10,3 +10,4 @@ spike4/pjsua-audio-test
 spike4/pjsip-echo-test
 gateway/pjproject-audio-build/
 gateway/pjsip-gateway
+native/build/
