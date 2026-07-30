@@ -124,3 +124,29 @@ target_link_libraries(signal_roundtrip_test PRIVATE signal2sip_signal signal2sip
 add_executable(refresh_prekeys_test test/refresh_prekeys_test.cpp)
 target_link_libraries(refresh_prekeys_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
     nlohmann_json::nlohmann_json)
+
+# RingRTC's Milestone D/E C ABI (see /home/vlad/.claude/plans/
+# jiggly-mapping-plum.md and this project's memory) - built via `cargo
+# build --features native,prebuilt_webrtc` in the sibling
+# ~/GIT/vladonv/ringrtc checkout, linking its own prebuilt WebRTC static
+# lib (fetched via `bin/fetch-artifact --platform linux-x64`).
+# native/ringrtc/signal2sip_ringrtc.h is hand-written (that crate has no
+# cbindgen setup) and kept in sync with cpp_ffi.rs manually.
+set(RINGRTC_DIR "$ENV{HOME}/GIT/vladonv/ringrtc" CACHE PATH "Path to the ringrtc checkout")
+add_library(ringrtc STATIC IMPORTED)
+set_target_properties(ringrtc PROPERTIES
+    IMPORTED_LOCATION ${RINGRTC_DIR}/target/debug/libringrtc.a
+)
+add_library(webrtc STATIC IMPORTED)
+set_target_properties(webrtc PROPERTIES
+    IMPORTED_LOCATION ${RINGRTC_DIR}/out/release/obj/libwebrtc.a
+)
+
+add_executable(ringrtc_two_party_test test/ringrtc_two_party_test.cpp)
+target_include_directories(ringrtc_two_party_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ringrtc_two_party_test PRIVATE ringrtc webrtc ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
+# GNU ld chokes on the prebuilt WebRTC static lib's .eh_frame sections
+# (hundreds of "table will not be created" errors, fatal in this ld
+# version, --no-eh-frame-hdr does not suppress it) - lld (Chromium's own
+# toolchain's usual linker) handles them fine.
+target_link_options(ringrtc_two_party_test PRIVATE -fuse-ld=lld)
