@@ -30,12 +30,23 @@ struct Peer {
     std::atomic<bool> isCallee{false};
 };
 
+// Every onSend* callback below must call signal2sip_call_message_sent()
+// once it has finished "delivering" the message (here, a direct synchronous
+// call into the other peer's handle - always succeeds) - RingRTC's own
+// signaling queue serializes messages per call and will not invoke the
+// next send_* callback (e.g. the next ICE candidate) until this is called.
+// Missing it was a real bug: only the first message per call (the offer/
+// answer) ever went out, every ICE candidate queued up forever, and the
+// call stalled in ConnectingBeforeAccepted until RingRTC's own ~60s
+// CallTimeout ended it.
+
 void onSendOffer(void* ctx, const char* /*remotePeerId*/, uint64_t callId, int32_t /*mediaType*/,
                   const uint8_t* opaque, size_t opaqueLen) {
     auto* self = static_cast<Peer*>(ctx);
     self->callId = callId;
     std::cout << "[" << self->name << "] send_offer (len=" << opaqueLen << ") -> " << self->other->name << "\n";
     signal2sip_call_received_offer(self->other->handle, self->name, callId, 1, 1, opaque, opaqueLen);
+    signal2sip_call_message_sent(self->handle, callId);
 }
 
 void onSendAnswer(void* ctx, const char* /*remotePeerId*/, uint64_t callId, const uint8_t* opaque,
@@ -43,18 +54,21 @@ void onSendAnswer(void* ctx, const char* /*remotePeerId*/, uint64_t callId, cons
     auto* self = static_cast<Peer*>(ctx);
     std::cout << "[" << self->name << "] send_answer (len=" << opaqueLen << ") -> " << self->other->name << "\n";
     signal2sip_call_received_answer(self->other->handle, self->name, callId, 1, opaque, opaqueLen);
+    signal2sip_call_message_sent(self->handle, callId);
 }
 
 void onSendIce(void* ctx, const char* /*remotePeerId*/, uint64_t callId, bool /*hasDeviceId*/,
                uint32_t /*deviceId*/, const uint8_t* opaque, size_t opaqueLen) {
     auto* self = static_cast<Peer*>(ctx);
     signal2sip_call_received_ice(self->other->handle, self->name, callId, 1, opaque, opaqueLen);
+    signal2sip_call_message_sent(self->handle, callId);
 }
 
-void onSendHangup(void* ctx, const char* /*remotePeerId*/, uint64_t /*callId*/, int32_t /*hangupType*/,
+void onSendHangup(void* ctx, const char* /*remotePeerId*/, uint64_t callId, int32_t /*hangupType*/,
                    uint32_t /*hangupDeviceId*/) {
     auto* self = static_cast<Peer*>(ctx);
     std::cout << "[" << self->name << "] send_hangup\n";
+    signal2sip_call_message_sent(self->handle, callId);
 }
 
 void onCallState(void* ctx, const char* /*remotePeerId*/, uint64_t callId, int32_t state) {

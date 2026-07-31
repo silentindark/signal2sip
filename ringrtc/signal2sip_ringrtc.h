@@ -63,6 +63,15 @@ bool signal2sip_call_received_answer(Signal2sipCallManagerHandle* handle, const 
 bool signal2sip_call_received_ice(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
                                    uint64_t call_id, uint32_t sender_device_id, const uint8_t* opaque,
                                    size_t opaque_len);
+// Must be called after actually delivering each send_offer/send_answer/
+// send_ice/send_hangup callback's message - RingRTC's signaling queue
+// will not send the next queued message (e.g. the next ICE candidate)
+// until this (or the failure variant below) is called. Missing this is
+// what caused calls to gather ICE candidates on both sides but never
+// exchange them, stalling in ConnectingBeforeAccepted until RingRTC's own
+// ~60s CallTimeout ended the call.
+bool signal2sip_call_message_sent(Signal2sipCallManagerHandle* handle, uint64_t call_id);
+bool signal2sip_call_message_send_failure(Signal2sipCallManagerHandle* handle, uint64_t call_id);
 bool signal2sip_call_hangup(Signal2sipCallManagerHandle* handle);
 
 } // extern "C"
