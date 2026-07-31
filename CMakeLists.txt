@@ -198,3 +198,29 @@ add_executable(pjsip_ringrtc_echo_test test/pjsip_ringrtc_echo_test.cpp)
 target_include_directories(pjsip_ringrtc_echo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(pjsip_ringrtc_echo_test PRIVATE signal2sip_voip ringrtc webrtc_pjsip_safe ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
 target_link_options(pjsip_ringrtc_echo_test PRIVATE -fuse-ld=lld)
+
+# Milestone G: bidirectional bridge between real Signal CallMessage
+# protobufs and RingRTC's C ABI - see native/daemon/CallSignaling.h.
+add_library(signal2sip_daemon STATIC
+    daemon/CallSignaling.cpp
+    daemon/Config.cpp
+)
+target_include_directories(signal2sip_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_authsocket signal2sip_proto
+    signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json)
+
+add_executable(signal2sip-daemon daemon/main.cpp)
+target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip-daemon PRIVATE signal2sip_daemon signal2sip_signal signal2sip_authsocket
+    signal2sip_proto signal2sip_voip ringrtc webrtc_pjsip_safe PkgConfig::PJSIP
+    ${CMAKE_DL_LIBS} pthread m stdc++ pulse nlohmann_json::nlohmann_json)
+# libringrtc.a and libsignal_ffi.a are two INDEPENDENT Rust static libs
+# (separate `cargo build` invocations, separate crates/workspaces) - each
+# embeds its own copy of Rust std's runtime support symbols
+# (rust_eh_personality etc), which collide as hard duplicate-definition
+# link errors when both land in one binary (unlike the libwebrtc/libsrtp
+# collision fixed above, which was a silent wrong-symbol-wins problem -
+# this is the opposite: a byte-identical-in-effect symbol that the
+# linker refuses to pick between). Safe to just take either copy here -
+# same host triple, same ABI, purely a runtime personality routine.
+target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld -Wl,--allow-multiple-definition)

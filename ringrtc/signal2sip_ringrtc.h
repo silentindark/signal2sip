@@ -52,9 +52,23 @@ size_t signal2sip_pull_playout_samples(Signal2sipCallManagerHandle* handle, int1
 
 uint64_t signal2sip_call_start_outgoing(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
                                         uint32_t local_device_id);
+// sender_identity_key/receiver_identity_key must each point to exactly 32
+// bytes (raw Curve25519 public key, NOT libsignal's 33-byte serialize()
+// form) - see the Rust side's doc comment on this function for why this
+// matters (wrong SRTP keys, not an error, if you get this wrong).
 bool signal2sip_call_received_offer(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
                                      uint64_t call_id, uint32_t sender_device_id, uint32_t receiver_device_id,
-                                     const uint8_t* opaque, size_t opaque_len);
+                                     const uint8_t* opaque, size_t opaque_len,
+                                     const uint8_t* sender_identity_key, const uint8_t* receiver_identity_key);
+// hangup_type mirrors protobuf CallMessage.Hangup.Type numerically:
+// 0=Normal, 1=AcceptedOnAnotherDevice, 2=DeclinedOnAnotherDevice,
+// 3=BusyOnAnotherDevice, 4=NeedPermission. hangup_device_id is only
+// meaningful for the *OnAnotherDevice variants.
+bool signal2sip_call_received_hangup(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
+                                      uint64_t call_id, uint32_t sender_device_id, int32_t hangup_type,
+                                      uint32_t hangup_device_id);
+bool signal2sip_call_received_busy(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
+                                    uint64_t call_id, uint32_t sender_device_id);
 bool signal2sip_call_accept(Signal2sipCallManagerHandle* handle, uint64_t call_id);
 bool signal2sip_call_proceed(Signal2sipCallManagerHandle* handle, uint64_t call_id);
 bool signal2sip_call_received_answer(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,

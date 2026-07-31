@@ -165,9 +165,14 @@ void signalingReaderLoop(LocalPeer& self) {
         size_t payloadLen = static_cast<size_t>(n) - kHeaderLen;
 
         switch (type) {
-            case MsgType::Offer:
-                signal2sip_call_received_offer(self.handle, self.otherName, callId, 1, 1, payload, payloadLen);
+            case MsgType::Offer: {
+                // Synthetic same-process test - see ringrtc_two_party_test.cpp's
+                // identical comment (all-zero keys work symmetrically here).
+                uint8_t zeroKey[32] = {0};
+                signal2sip_call_received_offer(self.handle, self.otherName, callId, 1, 1, payload, payloadLen,
+                                                zeroKey, zeroKey);
                 break;
+            }
             case MsgType::Answer:
                 signal2sip_call_received_answer(self.handle, self.otherName, callId, 1, payload, payloadLen);
                 break;
