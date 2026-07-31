@@ -7,6 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
 pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
+# Same shared /usr/local install tg2sip-webrtc itself links against (built
+# with --disable-sound - fine here too, since the whole point of Milestone
+# F's ring-buffer bridge is to never touch PJSIP's own sound-device layer;
+# it registers custom virtual pjmedia_port objects via registerMediaPort()
+# instead, same proven pattern tg2sip-webrtc uses for its own calls).
+pkg_check_modules(PJSIP REQUIRED IMPORTED_TARGET libpjproject)
 find_package(Protobuf REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
@@ -150,3 +156,45 @@ target_link_libraries(ringrtc_two_party_test PRIVATE ringrtc webrtc ${CMAKE_DL_L
 # version, --no-eh-frame-hdr does not suppress it) - lld (Chromium's own
 # toolchain's usual linker) handles them fine.
 target_link_options(ringrtc_two_party_test PRIVATE -fuse-ld=lld)
+
+# Milestone F: bridges the ring-buffer PJSIP ports (ported from
+# tg2sip-webrtc/tg2sip/voip/{ring_buffer,audio_bridge}.h) to RingRTC's
+# raw-PCM C ABI - see native/voip/ringrtc_sip_bridge.h.
+#
+# Any binary linking both `webrtc` (RingRTC's prebuilt WebRTC, which
+# vendors its own libsrtp) and PJSIP (which vendors a separate,
+# differently-versioned copy of the exact same libsrtp API under the
+# exact same symbol names) must NOT link the plain `webrtc` target above -
+# see tools/isolate_webrtc_srtp_symbols.py's docstring for the full story
+# (real bug hit live: pjsua_init() failed with a libsrtp bad_param error
+# because PJSIP's calls silently resolved into WebRTC's incompatible
+# copy, since libwebrtc.a comes first on the link line). Use
+# `webrtc_pjsip_safe` instead, a derived copy with the vendored libsrtp's
+# plain-C symbols renamed out of the way.
+set(WEBRTC_PJSIP_SAFE_LIB ${CMAKE_CURRENT_BINARY_DIR}/generated/libwebrtc_pjsip_safe.a)
+add_custom_command(
+    OUTPUT ${WEBRTC_PJSIP_SAFE_LIB}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_srtp_symbols.py
+            ${RINGRTC_DIR}/out/release/obj/libwebrtc.a ${WEBRTC_PJSIP_SAFE_LIB}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_srtp_symbols.py
+            ${RINGRTC_DIR}/out/release/obj/libwebrtc.a
+    COMMENT "Isolating WebRTC's vendored libsrtp symbols from PJSIP's"
+    VERBATIM
+)
+add_custom_target(webrtc_pjsip_safe_gen DEPENDS ${WEBRTC_PJSIP_SAFE_LIB})
+add_library(webrtc_pjsip_safe STATIC IMPORTED)
+set_target_properties(webrtc_pjsip_safe PROPERTIES IMPORTED_LOCATION ${WEBRTC_PJSIP_SAFE_LIB})
+add_dependencies(webrtc_pjsip_safe webrtc_pjsip_safe_gen)
+
+add_library(signal2sip_voip STATIC
+    voip/audio_bridge.cpp
+    voip/ringrtc_sip_bridge.cpp
+)
+target_include_directories(signal2sip_voip PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip_voip PUBLIC PkgConfig::PJSIP ringrtc webrtc_pjsip_safe)
+
+add_executable(pjsip_ringrtc_echo_test test/pjsip_ringrtc_echo_test.cpp)
+target_include_directories(pjsip_ringrtc_echo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pjsip_ringrtc_echo_test PRIVATE signal2sip_voip ringrtc webrtc_pjsip_safe ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
+target_link_options(pjsip_ringrtc_echo_test PRIVATE -fuse-ld=lld)

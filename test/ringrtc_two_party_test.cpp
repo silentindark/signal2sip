@@ -208,15 +208,24 @@ int runPeerA(int sockFd) {
 
     std::thread reader(signalingReaderLoop, std::ref(peer));
 
+    // A std::thread destructing while still joinable calls std::terminate()
+    // (not catchable) - every early return below must join `reader` first,
+    // or the process aborts instead of reporting FAIL cleanly. Real bug hit
+    // live in the sibling pjsip_ringrtc_echo_test.cpp (same pattern,
+    // copied from here) - fixed there and backported here.
     uint64_t callId = signal2sip_call_start_outgoing(peer.handle, "peerB", 1);
     if (callId == 0) {
         std::cerr << "[peerA] FAIL: signal2sip_call_start_outgoing failed\n";
+        shutdown(sockFd, SHUT_RDWR);
+        reader.join();
         return 1;
     }
     std::cout << "[peerA] PASS: started outgoing call, callId=" << callId << "\n";
 
     if (!waitForState(peer, SIGNAL2SIP_CALL_STATE_CONNECTED, 60000)) {
         std::cerr << "[peerA] FAIL: never reached Connected (last state=" << peer.lastState.load() << ")\n";
+        shutdown(sockFd, SHUT_RDWR);
+        reader.join();
         return 1;
     }
     std::cout << "[peerA] PASS: reached Connected\n";
@@ -224,6 +233,8 @@ int runPeerA(int sockFd) {
     sendMessage(peer, MsgType::Ready, callId, nullptr, 0);
     if (!waitForOtherReady(peer, 10000)) {
         std::cerr << "[peerA] FAIL: peerB never signaled ready\n";
+        shutdown(sockFd, SHUT_RDWR);
+        reader.join();
         return 1;
     }
 
@@ -277,6 +288,8 @@ int runPeerB(int sockFd) {
 
     if (!waitForState(peer, SIGNAL2SIP_CALL_STATE_CONNECTED, 60000)) {
         std::cerr << "[peerB] FAIL: never reached Connected (last state=" << peer.lastState.load() << ")\n";
+        shutdown(sockFd, SHUT_RDWR);
+        reader.join();
         return 1;
     }
     std::cout << "[peerB] PASS: reached Connected\n";
@@ -284,6 +297,8 @@ int runPeerB(int sockFd) {
     sendMessage(peer, MsgType::Ready, peer.callId.load(), nullptr, 0);
     if (!waitForOtherReady(peer, 10000)) {
         std::cerr << "[peerB] FAIL: peerA never signaled ready\n";
+        shutdown(sockFd, SHUT_RDWR);
+        reader.join();
         return 1;
     }
 
