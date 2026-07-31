@@ -39,6 +39,7 @@
 #include "../ringrtc/signal2sip_ringrtc.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/Crypto.h"
+#include "../signal/FfiUtil.h"
 #include "../signal/PreKeys.h"
 #include "../signal/ProtocolStores.h"
 #include "../storage/Storage.h"
@@ -431,7 +432,7 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
             senderDeviceId = result.senderDeviceId;
         } else if (envelope.type() == signalservice::Envelope_Type_DOUBLE_RATCHET ||
                    envelope.type() == signalservice::Envelope_Type_PREKEY_MESSAGE) {
-            senderServiceId = envelope.sourceserviceid();
+            senderServiceId = resolveServiceId(envelope.sourceserviceidbinary());
             senderDeviceId = envelope.sourcedeviceid();
             uint8_t messageType = envelope.type() == signalservice::Envelope_Type_PREKEY_MESSAGE
                                         ? SignalCiphertextMessageTypePreKey

@@ -158,44 +158,52 @@ int main(int argc, char** argv) {
         std::cout << "PASS: reusing " << deviceIds.size() << " migrated session(s)\n";
     }
 
-    signalservice::Content content;
-    content.mutable_datamessage()->set_body(text);
-    content.mutable_datamessage()->set_timestamp(
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    std::string contentBytes;
-    content.SerializeToString(&contentBytes);
-    Bytes contentPlaintext(contentBytes.begin(), contentBytes.end());
+    auto sendOne = [&](const std::string& label, const std::string& body) {
+        signalservice::Content content;
+        content.mutable_datamessage()->set_body(body);
+        content.mutable_datamessage()->set_timestamp(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        std::string contentBytes;
+        content.SerializeToString(&contentBytes);
+        Bytes contentPlaintext(contentBytes.begin(), contentBytes.end());
 
-    json messages = json::array();
-    for (int deviceId : deviceIds) {
-        EncryptedMessage encrypted = encryptForDevice(stores, localAddress,
-                                                       Address{destinationServiceId, static_cast<uint32_t>(deviceId)},
-                                                       contentPlaintext);
-        int envelopeType = encrypted.type == SignalCiphertextMessageTypePreKey ? 3 : 1;
-        messages.push_back({{"type", envelopeType},
-                             {"destinationDeviceId", deviceId},
-                             {"destinationRegistrationId", registrationIds.count(deviceId) ? registrationIds[deviceId] : 0},
-                             {"content", base64Encode(encrypted.ciphertext)}});
-    }
-    std::cout << "PASS: encrypted message for " << messages.size() << " device(s)\n";
+        json messages = json::array();
+        int firstType = -1;
+        for (int deviceId : deviceIds) {
+            EncryptedMessage encrypted = encryptForDevice(
+                stores, localAddress, Address{destinationServiceId, static_cast<uint32_t>(deviceId)}, contentPlaintext);
+            int envelopeType = encrypted.type == SignalCiphertextMessageTypePreKey ? 3 : 1;
+            if (firstType == -1) firstType = envelopeType;
+            messages.push_back(
+                {{"type", envelopeType},
+                 {"destinationDeviceId", deviceId},
+                 {"destinationRegistrationId", registrationIds.count(deviceId) ? registrationIds[deviceId] : 0},
+                 {"content", base64Encode(encrypted.ciphertext)}});
+        }
+        std::cout << "PASS: [" << label << "] encrypted message for " << messages.size()
+                   << " device(s), envelope type=" << firstType << "\n";
 
-    json requestBody = {
-        {"destination", destinationServiceId},
-        {"timestamp",
-         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-             .count()},
-        {"messages", messages},
-        {"online", false},
-        {"urgent", true},
+        json requestBody = {{"destination", destinationServiceId},
+                             {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count()},
+                             {"messages", messages},
+                             {"online", true},
+                             {"urgent", true}};
+        std::string bodyStr = requestBody.dump();
+        Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
+        auto sendResponse = socket.request("PUT", "/v1/messages/" + destinationServiceId + "?story=false", &bodyBytes);
+        std::cout << "[" << label << "] PUT /v1/messages -> status " << sendResponse.status << "\n";
+        std::cout << "[" << label << "] body: " << std::string(sendResponse.body.begin(), sendResponse.body.end())
+                   << "\n";
+        return sendResponse.status / 100 == 2;
     };
-    std::string bodyStr = requestBody.dump();
-    Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
 
-    auto sendResponse = socket.request("PUT", "/v1/messages/" + destinationServiceId + "?story=false", &bodyBytes);
-    std::cout << "PUT /v1/messages -> status " << sendResponse.status << "\n";
-    std::cout << (sendResponse.status / 100 == 2 ? "PASS" : "FAIL") << ": message send round-trips\n";
+    bool ok1 = sendOne("first (PreKey, fresh session)", text);
+    bool ok2 = sendOne("second (Whisper, established session)", text + " [second]");
+    std::cout << (ok1 && ok2 ? "PASS" : "FAIL") << ": message send round-trips\n";
 
     socket.close();
-    return sendResponse.status / 100 == 2 ? 0 : 1;
+    return ok1 && ok2 ? 0 : 1;
 }

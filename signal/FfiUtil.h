@@ -87,4 +87,23 @@ inline SignalMutPointerProtocolAddress addressNew(const std::string& serviceId, 
     return addr;
 }
 
+// Modern chat.signal.org envelopes carry the sender/destination identity as
+// the fixed-width binary ServiceId encoding (Envelope.sourceServiceIdBinary/
+// destinationServiceIdBinary - 1 type byte + 16 UUID bytes), not the legacy
+// plain-UUID string field (Envelope.sourceServiceId/destinationServiceId,
+// left empty by the real server) - matches layer1/flowc-receive.js's
+// resolveServiceId()/Aci.parseFromServiceIdBinary(), just via the raw C ABI
+// instead of the Node bindings. Returns "" for an empty/missing binary field.
+inline std::string resolveServiceId(const std::string& binary) {
+    if (binary.empty()) return "";
+    Bytes bytes(binary.begin(), binary.end());
+    SignalType_FixedArray17_uint8_t normalized{};
+    checkError(signal_service_id_parse_from_service_id_binary(&normalized, borrow(bytes)));
+    SignalCStringPtr str = nullptr;
+    checkError(signal_service_id_service_id_string(&str, &normalized));
+    std::string result(reinterpret_cast<const char*>(str));
+    signal_free_string(str);
+    return result;
+}
+
 } // namespace signal2sip

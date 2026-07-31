@@ -1,6 +1,7 @@
 #include "ProtocolStores.h"
 
 #include <cstring>
+#include <iostream>
 #include <string>
 
 #include "FfiUtil.h"
@@ -27,7 +28,11 @@ int32_t guardCallback(F&& f) {
     try {
         f();
         return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon][DIAG] ProtocolStores callback threw: " << e.what() << "\n";
+        return -1;
     } catch (...) {
+        std::cerr << "[daemon][DIAG] ProtocolStores callback threw non-std::exception\n";
         return -1;
     }
 }
