@@ -127,6 +127,12 @@ add_executable(signal_roundtrip_test test/signal_roundtrip_test.cpp)
 target_link_libraries(signal_roundtrip_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
     nlohmann_json::nlohmann_json)
 
+# Local-only (no chat.signal.org) unit test for the DecryptionErrorMessage
+# session-recovery feature - just signal2sip_signal, no AuthSocket/proto/
+# json needed.
+add_executable(decryption_error_message_test test/decryption_error_message_test.cpp)
+target_link_libraries(decryption_error_message_test PRIVATE signal2sip_signal)
+
 add_executable(refresh_prekeys_test test/refresh_prekeys_test.cpp)
 target_link_libraries(refresh_prekeys_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
     nlohmann_json::nlohmann_json)
