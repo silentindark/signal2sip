@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <optional>
 
 #include <nlohmann/json.hpp>
 
@@ -25,19 +26,31 @@ int64_t nowMs() {
 
 // Same fallback signal_roundtrip_test.cpp uses for regular messages:
 // fetch the peer's prekey bundle and establish a session with every
-// device it reports. Returns the resulting device ids.
+// device it reports (or just `onlyDeviceId`, if given - avoids
+// establishing sessions with every linked device of a multi-device
+// account when only one is actually needed, e.g. sendDecryptionErrorReply
+// only ever needs the one device that sent the undecryptable envelope).
+// Returns the resulting device ids.
+//
+// Deliberately does its network fetch *before* taking stores.mutex(), and
+// only holds the lock around the actual session-store writes
+// (establishSession()) - see ProtocolStores::mutex()'s doc comment for
+// why holding it across blocking I/O is a real, previously-live bug, not
+// a hypothetical one.
 std::vector<int> fetchAndEstablishSessions(AuthSocket& socket, ProtocolStores& stores,
                                             const std::string& localServiceId, uint32_t localDeviceId,
-                                            const std::string& remoteServiceId) {
-    Address localAddress{localServiceId, localDeviceId};
-    auto response = socket.request("GET", "/v2/keys/" + remoteServiceId + "/*");
+                                            const std::string& remoteServiceId,
+                                            std::optional<uint32_t> onlyDeviceId = std::nullopt) {
+    std::string devicePath = onlyDeviceId ? std::to_string(*onlyDeviceId) : "*";
+    auto response = socket.request("GET", "/v2/keys/" + remoteServiceId + "/" + devicePath);
     if (response.status != 200) {
-        throw std::runtime_error("GET /v2/keys/" + remoteServiceId + "/* -> " + std::to_string(response.status));
+        throw std::runtime_error("GET /v2/keys/" + remoteServiceId + "/" + devicePath + " -> " +
+                                  std::to_string(response.status));
     }
     json body = json::parse(std::string(response.body.begin(), response.body.end()));
     Bytes identityKey = base64Decode(body.at("identityKey").get<std::string>());
 
-    std::vector<int> deviceIds;
+    std::vector<RemotePreKeyBundle> bundles;
     for (const auto& device : body.at("devices")) {
         RemotePreKeyBundle bundle;
         bundle.serviceId = remoteServiceId;
@@ -56,11 +69,34 @@ std::vector<int> fetchAndEstablishSessions(AuthSocket& socket, ProtocolStores& s
         bundle.kyberPreKeyId = pqPreKey.at("keyId").get<uint32_t>();
         bundle.kyberPreKeyPublic = b64(pqPreKey, "publicKey");
         bundle.kyberPreKeySignature = b64(pqPreKey, "signature");
+        bundles.push_back(std::move(bundle));
+    }
 
-        establishSession(stores, localAddress, bundle);
-        deviceIds.push_back(static_cast<int>(bundle.deviceId));
+    Address localAddress{localServiceId, localDeviceId};
+    std::vector<int> deviceIds;
+    {
+        std::lock_guard<std::mutex> lock(stores.mutex());
+        for (const auto& bundle : bundles) {
+            establishSession(stores, localAddress, bundle);
+            deviceIds.push_back(static_cast<int>(bundle.deviceId));
+        }
     }
     return deviceIds;
+}
+
+// Builds and sends the {destination, timestamp, messages, online, urgent}
+// PUT /v1/messages body shared by CallMessageSender::sendCallMessage() and
+// sendDecryptionErrorReply() - the only difference between those two call
+// sites was this framing, not the framing's contents.
+AuthSocket::Response putMessages(AuthSocket& socket, const std::string& destination, const json& messages,
+                                  bool online) {
+    json requestBody = {
+        {"destination", destination}, {"timestamp", nowMs()}, {"messages", messages},
+        {"online", online},           {"urgent", true},
+    };
+    std::string bodyStr = requestBody.dump();
+    Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
+    return socket.request("PUT", "/v1/messages/" + destination + "?story=false", &bodyBytes);
 }
 
 // Mirrors sendMessage.js's encryptForDevice(): destinationRegistrationId
@@ -96,13 +132,20 @@ void handleCallMessage(Signal2sipCallManagerHandle* handle, ProtocolStores& stor
     if (callMessage.has_offer()) {
         const auto& offer = callMessage.offer();
 
+        // Narrow lock around just the storage reads, released before
+        // calling into RingRTC below - RingRTC can synchronously call
+        // back into onSendAnswer/onSendIce (which take this same mutex
+        // themselves, briefly), and std::mutex isn't reentrant.
         Bytes senderIdentityKey(32, 0);
-        if (auto stored = stores.storage().loadRemoteIdentity(senderServiceId)) {
-            senderIdentityKey = rawPublicKeyBytes(*stored);
-        }
         Bytes receiverIdentityKey(32, 0);
-        if (auto keypair = stores.storage().loadIdentityKeypair(stores.identity())) {
-            receiverIdentityKey = rawPublicKeyBytes(keypair->public_key);
+        {
+            std::lock_guard<std::mutex> lock(stores.mutex());
+            if (auto stored = stores.storage().loadRemoteIdentity(senderServiceId)) {
+                senderIdentityKey = rawPublicKeyBytes(*stored);
+            }
+            if (auto keypair = stores.storage().loadIdentityKeypair(stores.identity())) {
+                receiverIdentityKey = rawPublicKeyBytes(keypair->public_key);
+            }
         }
 
         const std::string& opaque = offer.opaque();
@@ -139,17 +182,26 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
                                                       const signalservice::CallMessage& callMessage,
                                                       bool hasReceiverDeviceId, uint32_t receiverDeviceId) {
     std::vector<int> deviceIds;
-    if (hasReceiverDeviceId) {
-        deviceIds.push_back(static_cast<int>(receiverDeviceId));
-        std::string address = remotePeerId + "." + std::to_string(receiverDeviceId);
-        if (!stores_.storage().loadSession(address)) {
-            fetchAndEstablishSessions(socket_, stores_, localServiceId_, localDeviceId_, remotePeerId);
+    bool needSessions;
+    {
+        std::lock_guard<std::mutex> lock(stores_.mutex());
+        if (hasReceiverDeviceId) {
+            deviceIds.push_back(static_cast<int>(receiverDeviceId));
+            std::string address = remotePeerId + "." + std::to_string(receiverDeviceId);
+            needSessions = !stores_.storage().loadSession(address);
+        } else {
+            deviceIds = stores_.storage().knownDeviceIdsFor(remotePeerId);
+            needSessions = deviceIds.empty();
         }
-    } else {
-        deviceIds = stores_.storage().knownDeviceIdsFor(remotePeerId);
-        if (deviceIds.empty()) {
-            deviceIds = fetchAndEstablishSessions(socket_, stores_, localServiceId_, localDeviceId_, remotePeerId);
-        }
+    }
+    if (needSessions) {
+        // Network I/O - deliberately outside the lock (see
+        // fetchAndEstablishSessions()'s own doc comment); it takes the
+        // lock itself, briefly, only around the session-store write.
+        auto established = fetchAndEstablishSessions(socket_, stores_, localServiceId_, localDeviceId_, remotePeerId,
+                                                       hasReceiverDeviceId ? std::optional<uint32_t>(receiverDeviceId)
+                                                                            : std::nullopt);
+        if (!hasReceiverDeviceId) deviceIds = established;
     }
     if (deviceIds.empty()) return deviceIds;
 
@@ -159,32 +211,36 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
     content.SerializeToString(&contentBytes);
     Bytes plaintext(contentBytes.begin(), contentBytes.end());
 
-    // Serialize against every other encrypt/decrypt through this
-    // account's session store (concurrent sends, or a send racing the
-    // websocket thread's decrypt of an incoming envelope, can otherwise
-    // interleave Double Ratchet chain updates - see ProtocolStores::mutex()).
-    std::lock_guard<std::mutex> lock(stores_.mutex());
-
     Address localAddress{localServiceId_, localDeviceId_};
     json messages = json::array();
-    for (int deviceId : deviceIds) {
-        EncryptedMessage encrypted =
-            encryptForDevice(stores_, localAddress, Address{remotePeerId, static_cast<uint32_t>(deviceId)}, plaintext);
-        int envelopeType = encrypted.type == SignalCiphertextMessageTypePreKey ? 3 : 1;
-        std::string address = remotePeerId + "." + std::to_string(deviceId);
-        messages.push_back({{"type", envelopeType},
-                             {"destinationDeviceId", deviceId},
-                             {"destinationRegistrationId", remoteRegistrationIdFromSession(stores_.storage(), address)},
-                             {"content", base64Encode(encrypted.ciphertext)}});
+    {
+        // Serialize against every other encrypt/decrypt through this
+        // account's session store (concurrent sends, or a send racing
+        // the websocket thread's decrypt of an incoming envelope, can
+        // otherwise interleave Double Ratchet chain updates - see
+        // ProtocolStores::mutex()). Never held across the network PUT
+        // below - doing so previously reintroduced the exact
+        // self-deadlock class the CallMessage-handling dispatch (see
+        // main.cpp's onPush()) was written to avoid, since AuthSocket's
+        // single service thread can only ever deliver that PUT's
+        // response by running lws_service() again, which it can't do
+        // while blocked trying to acquire this same lock for an
+        // unrelated incoming envelope.
+        std::lock_guard<std::mutex> lock(stores_.mutex());
+        for (int deviceId : deviceIds) {
+            EncryptedMessage encrypted = encryptForDevice(
+                stores_, localAddress, Address{remotePeerId, static_cast<uint32_t>(deviceId)}, plaintext);
+            int envelopeType = encrypted.type == SignalCiphertextMessageTypePreKey ? 3 : 1;
+            std::string address = remotePeerId + "." + std::to_string(deviceId);
+            messages.push_back(
+                {{"type", envelopeType},
+                 {"destinationDeviceId", deviceId},
+                 {"destinationRegistrationId", remoteRegistrationIdFromSession(stores_.storage(), address)},
+                 {"content", base64Encode(encrypted.ciphertext)}});
+        }
     }
 
-    json requestBody = {
-        {"destination", remotePeerId}, {"timestamp", nowMs()}, {"messages", messages},
-        {"online", true},              {"urgent", true},
-    };
-    std::string bodyStr = requestBody.dump();
-    Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
-    auto response = socket_.request("PUT", "/v1/messages/" + remotePeerId + "?story=false", &bodyBytes);
+    auto response = putMessages(socket_, remotePeerId, messages, /*online=*/true);
     if (response.status / 100 != 2) {
         std::cerr << "[daemon] PUT /v1/messages/" << remotePeerId << " -> " << response.status << " (body: "
                    << std::string(response.body.begin(), response.body.end()) << ")\n";
@@ -257,14 +313,24 @@ void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const 
         plaintextContent.push_back(0x80);
 
         std::string address = senderServiceId + "." + std::to_string(senderDeviceId);
-        uint32_t registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
+        uint32_t registrationId;
+        {
+            std::lock_guard<std::mutex> lock(stores.mutex());
+            registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
+        }
         if (registrationId == 0) {
             // No usable local session for this specific device (the
             // "session not found" half of the problem this whole
             // mechanism exists for) - fetch fresh, same fallback
             // CallMessageSender::sendCallMessage() uses, so the server's
             // own stale-device check doesn't reject this reply itself.
-            fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId);
+            // Only this one device, not the sender's whole account - the
+            // reply only ever needs to reach the device that actually
+            // sent the undecryptable envelope. Network I/O, deliberately
+            // outside the lock (see fetchAndEstablishSessions()'s own
+            // doc comment).
+            fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId, senderDeviceId);
+            std::lock_guard<std::mutex> lock(stores.mutex());
             registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
         }
 
@@ -278,13 +344,7 @@ void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const 
                              {"destinationRegistrationId", registrationId},
                              {"content", base64Encode(plaintextContent)}});
 
-        json requestBody = {
-            {"destination", senderServiceId}, {"timestamp", nowMs()}, {"messages", messages},
-            {"online", false},                {"urgent", true},
-        };
-        std::string bodyStr = requestBody.dump();
-        Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
-        auto response = socket.request("PUT", "/v1/messages/" + senderServiceId + "?story=false", &bodyBytes);
+        auto response = putMessages(socket, senderServiceId, messages, /*online=*/false);
         std::cout << "[daemon] sent DecryptionErrorMessage to " << address << " -> " << response.status << "\n";
     } catch (const std::exception& e) {
         std::cerr << "[daemon] failed to send DecryptionErrorMessage to " << senderServiceId << "." << senderDeviceId

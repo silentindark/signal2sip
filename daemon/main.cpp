@@ -22,8 +22,11 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
+#include <deque>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -167,6 +170,78 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
     if (pniKeypair) refreshOne("pni", pniKeypair->private_key);
 }
 
+// Ordered, off-service-thread dispatch for work triggered by onPush() -
+// incoming CallMessage handling and DecryptionErrorMessage replies. Both
+// used to be a raw `std::thread(...).detach()` per envelope: that
+// avoided running on AuthSocket's single service thread (necessary - see
+// ProtocolStores::mutex()'s doc comment for the self-deadlock that
+// causes), but had three real problems found live: (1) no ordering
+// between envelopes, so a same-call ICE-candidate envelope's thread could
+// finish before an earlier Offer envelope's thread, and RingRTC would
+// drop the ICE candidate for a call it doesn't know about yet; (2)
+// unbounded thread creation under a burst/flood of envelopes; (3) nothing
+// tracked these threads, so a detached thread could still be running
+// when main() destroyed the objects (g_state.stores/socket/handle) it
+// dereferences, a genuine use-after-free on shutdown. A single worker
+// thread with a FIFO queue fixes all three: one thread total, strict
+// arrival order, and something concrete for shutdown to join.
+class EnvelopeDispatchQueue {
+public:
+    void start() {
+        worker_ = std::thread([this] { run(); });
+    }
+
+    void push(std::function<void()> work) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(std::move(work));
+        }
+        cv_.notify_one();
+    }
+
+    // Drains whatever's queued, stops, and joins the worker - call once
+    // from main()'s shutdown sequence, before destroying anything queued
+    // work might reference.
+    void stopAndJoin() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_one();
+        if (worker_.joinable()) worker_.join();
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::function<void()> work;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (stopping_) return;
+                    continue;
+                }
+                work = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            try {
+                work();
+            } catch (const std::exception& e) {
+                std::cerr << "[daemon] envelope dispatch: unhandled exception: " << e.what() << "\n";
+            } catch (...) {
+                std::cerr << "[daemon] envelope dispatch: unhandled non-standard exception\n";
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> queue_;
+    bool stopping_ = false;
+    std::thread worker_;
+};
+
 // Everything the C-ABI callbacks (plain function pointers, no captures)
 // need access to via their void* context.
 struct DaemonState {
@@ -196,6 +271,7 @@ struct DaemonState {
 };
 
 DaemonState g_state;
+EnvelopeDispatchQueue g_dispatchQueue;
 
 // --- RingRTC -> Signal CallMessage (send side) ---
 
@@ -207,49 +283,54 @@ DaemonState g_state;
 // fetch inside sendCallMessage's session-establishment fallback) took
 // the entire daemon down instead of just that one signaling message.
 // Every callback RingRTC calls into must therefore catch everything
-// itself; on failure, simply not calling signal2sip_call_message_sent()
-// leaves RingRTC to retry/timeout the call on its own, same as if the
-// message had been lost in transit.
+// itself (including non-std::exception types - the boundary contract is
+// "nothing ever crosses it", not just the common case); on failure,
+// simply not calling signal2sip_call_message_sent() leaves RingRTC to
+// retry/timeout the call on its own (it has its own ~60s per-call
+// timeout independent of this), same as if the message had been lost in
+// transit.
+template <typename F>
+void safeCallback(const char* name, F&& f) {
+    try {
+        f();
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] " << name << " failed: " << e.what() << "\n";
+    } catch (...) {
+        std::cerr << "[daemon] " << name << " failed: unknown exception\n";
+    }
+}
 
 void onSendOffer(void*, const char* remotePeerId, uint64_t callId, int32_t mediaType, const uint8_t* opaque,
                    size_t opaqueLen) {
     std::cout << "[daemon] send_offer -> " << remotePeerId << "\n";
-    try {
+    safeCallback("send_offer", [&] {
         g_state.sender->sendOffer(remotePeerId, callId, mediaType, opaque, opaqueLen);
         signal2sip_call_message_sent(g_state.handle, callId);
-    } catch (const std::exception& e) {
-        std::cerr << "[daemon] send_offer failed: " << e.what() << "\n";
-    }
+    });
 }
 
 void onSendAnswer(void*, const char* remotePeerId, uint64_t callId, const uint8_t* opaque, size_t opaqueLen) {
     std::cout << "[daemon] send_answer -> " << remotePeerId << "\n";
-    try {
+    safeCallback("send_answer", [&] {
         g_state.sender->sendAnswer(remotePeerId, callId, opaque, opaqueLen);
         signal2sip_call_message_sent(g_state.handle, callId);
-    } catch (const std::exception& e) {
-        std::cerr << "[daemon] send_answer failed: " << e.what() << "\n";
-    }
+    });
 }
 
 void onSendIce(void*, const char* remotePeerId, uint64_t callId, bool hasReceiverDeviceId, uint32_t receiverDeviceId,
                 const uint8_t* opaque, size_t opaqueLen) {
-    try {
+    safeCallback("send_ice", [&] {
         g_state.sender->sendIce(remotePeerId, callId, hasReceiverDeviceId, receiverDeviceId, opaque, opaqueLen);
         signal2sip_call_message_sent(g_state.handle, callId);
-    } catch (const std::exception& e) {
-        std::cerr << "[daemon] send_ice failed: " << e.what() << "\n";
-    }
+    });
 }
 
 void onSendHangup(void*, const char* remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId) {
     std::cout << "[daemon] send_hangup -> " << remotePeerId << "\n";
-    try {
+    safeCallback("send_hangup", [&] {
         g_state.sender->sendHangup(remotePeerId, callId, hangupType, hangupDeviceId);
         signal2sip_call_message_sent(g_state.handle, callId);
-    } catch (const std::exception& e) {
-        std::cerr << "[daemon] send_hangup failed: " << e.what() << "\n";
-    }
+    });
 }
 
 // --- SIP bridging (mirrors pjsip_ringrtc_echo_test.cpp's BridgeCall) ---
@@ -406,7 +487,7 @@ void onCallState(void*, const char* remotePeerId, uint64_t callId, int32_t state
 
     // Called synchronously from RingRTC (Rust) - same FFI-exception-safety
     // reasoning as the onSend* callbacks above.
-    try {
+    safeCallback("onCallState", [&] {
         if (state == SIGNAL2SIP_CALL_STATE_OUTGOING_AUDIO) {
             signal2sip_call_proceed(g_state.handle, callId);
         } else if (state == SIGNAL2SIP_CALL_STATE_INCOMING_AUDIO) {
@@ -426,9 +507,7 @@ void onCallState(void*, const char* remotePeerId, uint64_t callId, int32_t state
             stopSipBridge();
             g_state.isCallee = false;
         }
-    } catch (const std::exception& e) {
-        std::cerr << "[daemon] onCallState(" << state << ") handling failed: " << e.what() << "\n";
-    }
+    });
 }
 
 Signal2sipCallbacks makeCallbacks() {
@@ -505,13 +584,15 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
         // sealed-sender envelope whose outer unseal itself failed gives
         // us neither.
         if (isIdentifiedCiphertext && !senderServiceId.empty()) {
-            std::thread([senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
-                        clientTimestamp = envelope.clienttimestamp()] {
-                std::lock_guard<std::mutex> lock(g_state.stores->mutex());
+            // sendDecryptionErrorReply() manages its own (narrow, never
+            // held across network I/O) locking internally - see its
+            // definition - so no lock is taken here.
+            g_dispatchQueue.push([senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
+                                  clientTimestamp = envelope.clienttimestamp()] {
                 sendDecryptionErrorReply(*g_state.socket, *g_state.stores, g_state.localServiceId,
                                          static_cast<uint32_t>(g_state.account.device_id), senderServiceId,
                                          senderDeviceId, originalCiphertext, originalMessageType, clientTimestamp);
-            }).detach();
+            });
         }
         return;
     }
@@ -542,15 +623,15 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
     // "PUT /v1/messages ... timed out waiting for a response" exactly
     // 30s later, intermittently - only when RingRTC happened to react
     // synchronously rather than via its own actor thread). Dispatching
-    // to a fresh thread here, same pattern as onCallState's
-    // std::thread(runProbe).detach(), keeps this thread free to keep
-    // servicing the socket.
+    // via the ordered queue (see EnvelopeDispatchQueue) keeps this
+    // thread free to keep servicing the socket, while still processing
+    // envelopes in arrival order and giving shutdown something to join.
     signalservice::CallMessage callMessage = content.callmessage();
     uint32_t localDeviceId = static_cast<uint32_t>(g_state.account.device_id);
-    std::thread([senderServiceId, senderDeviceId, localDeviceId, callMessage] {
+    g_dispatchQueue.push([senderServiceId, senderDeviceId, localDeviceId, callMessage] {
         handleCallMessage(g_state.handle, *g_state.stores, senderServiceId, senderDeviceId, localDeviceId,
                           callMessage);
-    }).detach();
+    });
 }
 
 std::atomic<bool> g_running{true};
@@ -614,6 +695,10 @@ int main(int argc, char** argv) {
     g_state.socket = &socket;
     CallMessageSender sender(socket, stores, account.aci, static_cast<uint32_t>(account.device_id));
     g_state.sender = &sender;
+
+    // Must be running before connect() - onPush() can start pushing work
+    // onto it as soon as the socket is live.
+    g_dispatchQueue.start();
 
     socket.connect();
     std::cout << "[daemon] connected to chat.signal.org as " << account.e164 << "\n";
@@ -684,6 +769,16 @@ int main(int argc, char** argv) {
     }
 
     stopSipBridge();
+
+    // Must happen before anything below: queued work (handleCallMessage/
+    // sendDecryptionErrorReply) dereferences g_state.handle/stores/socket,
+    // and those are about to be destroyed. stopAndJoin() blocks until the
+    // worker thread finishes whatever it's currently running (bounded by
+    // AuthSocket::request()'s own ~30s timeout in the worst case, if a
+    // network call is in flight) - a bounded shutdown delay is a fine
+    // trade for not risking a use-after-free.
+    g_dispatchQueue.stopAndJoin();
+
     signal2sip_call_manager_destroy(g_state.handle);
     socket.close();
     return 0;

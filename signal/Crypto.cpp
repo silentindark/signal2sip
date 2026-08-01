@@ -184,11 +184,13 @@ Bytes buildDecryptionErrorMessage(const Bytes& originalCiphertext, uint8_t origi
         &dem, borrow(originalCiphertext), originalType, originalTimestamp, originalSenderDeviceId));
 
     SignalOwnedBuffer buffer{};
-    checkError(
-        signal_decryption_error_message_serialize(&buffer, SignalConstPointerDecryptionErrorMessage{dem.raw}));
-    Bytes serializedDem = takeOwned(buffer);
+    // Destroy dem unconditionally before checking the serialize error -
+    // checkError() throws on failure, and dem must not leak on that path.
+    SignalFfiError* serializeErr =
+        signal_decryption_error_message_serialize(&buffer, SignalConstPointerDecryptionErrorMessage{dem.raw});
     checkError(signal_decryption_error_message_destroy(dem));
-    return serializedDem;
+    checkError(serializeErr);
+    return takeOwned(buffer);
 }
 
 } // namespace signal2sip

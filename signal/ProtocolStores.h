@@ -46,6 +46,20 @@ public:
     // candidate, sent in a rapid burst) this way. Every call site that
     // encrypts or decrypts through this instance must hold this lock for
     // the duration of that libsignal call.
+    //
+    // Never hold it across blocking network I/O. AuthSocket runs a single
+    // service thread that both delivers every response to
+    // AuthSocket::request() and invokes every server-pushed message's
+    // callback (onPush) - if a thread holds this mutex while blocked
+    // inside request() waiting for its own response, and a new push
+    // arrives in the meantime, the service thread blocks trying to
+    // acquire this same mutex to handle it, and can then never return to
+    // servicing the socket to deliver the response the first thread is
+    // waiting on. Found live: this exact self-deadlock, reintroducing the
+    // one main.cpp's onPush() dispatch was written to avoid, surfaced as
+    // "PUT /v1/messages ... timed out waiting for a response" exactly at
+    // AuthSocket::request()'s hard-coded timeout. Lock narrowly around
+    // just the libsignal/Storage calls; do the network call unlocked.
     std::mutex& mutex() { return mutex_; }
 
 private:
