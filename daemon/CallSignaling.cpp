@@ -312,40 +312,47 @@ void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const 
         plaintextContent.insert(plaintextContent.end(), contentBytes.begin(), contentBytes.end());
         plaintextContent.push_back(0x80);
 
-        std::string address = senderServiceId + "." + std::to_string(senderDeviceId);
-        uint32_t registrationId;
-        {
-            std::lock_guard<std::mutex> lock(stores.mutex());
-            registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
-        }
-        if (registrationId == 0) {
-            // No usable local session for this specific device (the
-            // "session not found" half of the problem this whole
-            // mechanism exists for) - fetch fresh, same fallback
-            // CallMessageSender::sendCallMessage() uses, so the server's
-            // own stale-device check doesn't reject this reply itself.
-            // Only this one device, not the sender's whole account - the
-            // reply only ever needs to reach the device that actually
-            // sent the undecryptable envelope. Network I/O, deliberately
-            // outside the lock (see fetchAndEstablishSessions()'s own
-            // doc comment).
-            fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId, senderDeviceId);
-            std::lock_guard<std::mutex> lock(stores.mutex());
-            registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
-        }
+        // The server's mismatched-devices check (Signal-Server's
+        // MessageSender/getMismatchedDevices) requires every /v1/messages
+        // PUT to address *every* currently-registered device of the
+        // destination account, not just the one this reply is really
+        // about - addressing only senderDeviceId got a live 409
+        // (missing devices) the first time this was tested against a
+        // real 3-device account. Unlike an encrypted send, there's no
+        // per-device crypto cost to paying that: PlaintextContent isn't
+        // Double-Ratchet-encrypted at all, so the exact same bytes go to
+        // every device - each one independently decides whether the
+        // embedded ratchet key means anything to its own session state.
+        // Always re-fetch the full device list (fetchAndEstablishSessions
+        // with no device filter) rather than trying the single cached
+        // session first - simpler, and this is an already-rare recovery
+        // path, not a hot one.
+        auto deviceIds = fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId);
 
         // Envelope.Type.PLAINTEXT_CONTENT (proto/SignalService.proto) - not
         // encrypted, see buildDecryptionErrorPlaintextContent()'s doc
         // comment.
         constexpr int kPlaintextContentEnvelopeType = 8;
         json messages = json::array();
-        messages.push_back({{"type", kPlaintextContentEnvelopeType},
-                             {"destinationDeviceId", senderDeviceId},
-                             {"destinationRegistrationId", registrationId},
-                             {"content", base64Encode(plaintextContent)}});
+        {
+            std::lock_guard<std::mutex> lock(stores.mutex());
+            for (int deviceId : deviceIds) {
+                std::string address = senderServiceId + "." + std::to_string(deviceId);
+                uint32_t registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
+                messages.push_back({{"type", kPlaintextContentEnvelopeType},
+                                     {"destinationDeviceId", deviceId},
+                                     {"destinationRegistrationId", registrationId},
+                                     {"content", base64Encode(plaintextContent)}});
+            }
+        }
 
         auto response = putMessages(socket, senderServiceId, messages, /*online=*/false);
-        std::cout << "[daemon] sent DecryptionErrorMessage to " << address << " -> " << response.status << "\n";
+        std::cout << "[daemon] sent DecryptionErrorMessage to " << senderServiceId << " (" << deviceIds.size()
+                   << " device(s)) -> " << response.status;
+        if (response.status / 100 != 2) {
+            std::cout << " (body: " << std::string(response.body.begin(), response.body.end()) << ")";
+        }
+        std::cout << "\n";
     } catch (const std::exception& e) {
         std::cerr << "[daemon] failed to send DecryptionErrorMessage to " << senderServiceId << "." << senderDeviceId
                    << ": " << e.what() << "\n";
