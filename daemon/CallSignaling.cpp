@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <iostream>
-#include <optional>
 
 #include <nlohmann/json.hpp>
 
@@ -24,13 +23,13 @@ int64_t nowMs() {
         .count();
 }
 
-// Same fallback signal_roundtrip_test.cpp uses for regular messages:
-// fetch the peer's prekey bundle and establish a session with every
-// device it reports (or just `onlyDeviceId`, if given - avoids
-// establishing sessions with every linked device of a multi-device
-// account when only one is actually needed, e.g. sendDecryptionErrorReply
-// only ever needs the one device that sent the undecryptable envelope).
-// Returns the resulting device ids.
+// Fetches every device of remoteServiceId's *current* prekey bundle and
+// establishes a session with each - the server requires every
+// /v1/messages PUT to address an account's complete current device list
+// (no partial-address exception, confirmed live - see
+// CallMessageSender::sendCallMessage()'s doc comment), so every caller of
+// this always wants the full list, never a subset. Returns the resulting
+// device ids.
 //
 // Deliberately does its network fetch *before* taking stores.mutex(), and
 // only holds the lock around the actual session-store writes
@@ -39,13 +38,10 @@ int64_t nowMs() {
 // a hypothetical one.
 std::vector<int> fetchAndEstablishSessions(AuthSocket& socket, ProtocolStores& stores,
                                             const std::string& localServiceId, uint32_t localDeviceId,
-                                            const std::string& remoteServiceId,
-                                            std::optional<uint32_t> onlyDeviceId = std::nullopt) {
-    std::string devicePath = onlyDeviceId ? std::to_string(*onlyDeviceId) : "*";
-    auto response = socket.request("GET", "/v2/keys/" + remoteServiceId + "/" + devicePath);
+                                            const std::string& remoteServiceId) {
+    auto response = socket.request("GET", "/v2/keys/" + remoteServiceId + "/*");
     if (response.status != 200) {
-        throw std::runtime_error("GET /v2/keys/" + remoteServiceId + "/" + devicePath + " -> " +
-                                  std::to_string(response.status));
+        throw std::runtime_error("GET /v2/keys/" + remoteServiceId + "/* -> " + std::to_string(response.status));
     }
     json body = json::parse(std::string(response.body.begin(), response.body.end()));
     Bytes identityKey = base64Decode(body.at("identityKey").get<std::string>());
@@ -203,29 +199,54 @@ CallMessageSender::CallMessageSender(AuthSocket& socket, ProtocolStores& stores,
     : socket_(socket), stores_(stores), localServiceId_(std::move(localServiceId)), localDeviceId_(localDeviceId) {}
 
 std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePeerId,
-                                                      const signalservice::CallMessage& callMessage,
-                                                      bool hasReceiverDeviceId, uint32_t receiverDeviceId) {
+                                                      const signalservice::CallMessage& callMessage) {
+    // The server requires every /v1/messages PUT to address every
+    // currently-registered device of the destination account, every
+    // time, with no partial-address exception - found live as a 409
+    // ({"missingDevices":[...]}) when this used to trust
+    // knownDeviceIdsFor()/loadSession() as a "we've already resolved this
+    // peer" signal. That cache could look non-empty for the wrong reason:
+    // decrypting an incoming PreKey-type envelope (e.g. the offer that
+    // starts this whole call) implicitly establishes a *receiving*
+    // session with just that one sender device as a normal Double
+    // Ratchet side effect, which made knownDeviceIdsFor() return that
+    // single device and skip the real fetch - so the very first reply
+    // (the answer) addressed only the device that happened to send the
+    // offer, not the account's other devices, and got rejected.
+    //
+    // But always fetching fresh (no cache at all) has its own real
+    // problem: a single call's signaling is easily 5+ sends (offer,
+    // answer, several ICE candidates, hangup), and hit Signal-Server's
+    // real PRE_KEYS rate limit (6 requests/10min) well before one call
+    // finished. deviceListCache_ is the middle ground: fetch once, reuse
+    // for kDeviceListCacheTtl (device lists rarely change mid-call), and
+    // self-heal by invalidating on a 409/410 from the server itself
+    // (below) rather than guessing at cache validity locally.
+    // deviceListCache_ can be touched from multiple threads (a RingRTC
+    // callback thread calling straight into sendOffer/sendAnswer/etc.,
+    // and the envelope dispatch queue's worker thread indirectly via
+    // handleCallMessage() -> RingRTC -> a synchronous send callback) -
+    // reuse stores_.mutex() (already the general "serialize this
+    // account's signaling-adjacent state" lock) rather than adding a
+    // second one.
     std::vector<int> deviceIds;
-    bool needSessions;
+    bool cacheHit = false;
     {
         std::lock_guard<std::mutex> lock(stores_.mutex());
-        if (hasReceiverDeviceId) {
-            deviceIds.push_back(static_cast<int>(receiverDeviceId));
-            std::string address = remotePeerId + "." + std::to_string(receiverDeviceId);
-            needSessions = !stores_.storage().loadSession(address);
-        } else {
-            deviceIds = stores_.storage().knownDeviceIdsFor(remotePeerId);
-            needSessions = deviceIds.empty();
+        if (auto it = deviceListCache_.find(remotePeerId); it != deviceListCache_.end() &&
+                                                             std::chrono::steady_clock::now() - it->second.second <
+                                                                 kDeviceListCacheTtl) {
+            deviceIds = it->second.first;
+            cacheHit = true;
         }
     }
-    if (needSessions) {
-        // Network I/O - deliberately outside the lock (see
+    if (!cacheHit) {
+        // Network I/O, deliberately outside the lock (see
         // fetchAndEstablishSessions()'s own doc comment); it takes the
         // lock itself, briefly, only around the session-store write.
-        auto established = fetchAndEstablishSessions(socket_, stores_, localServiceId_, localDeviceId_, remotePeerId,
-                                                       hasReceiverDeviceId ? std::optional<uint32_t>(receiverDeviceId)
-                                                                            : std::nullopt);
-        if (!hasReceiverDeviceId) deviceIds = established;
+        deviceIds = fetchAndEstablishSessions(socket_, stores_, localServiceId_, localDeviceId_, remotePeerId);
+        std::lock_guard<std::mutex> lock(stores_.mutex());
+        deviceListCache_[remotePeerId] = {deviceIds, std::chrono::steady_clock::now()};
     }
     if (deviceIds.empty()) return deviceIds;
 
@@ -268,6 +289,13 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
     if (response.status / 100 != 2) {
         std::cerr << "[daemon] PUT /v1/messages/" << remotePeerId << " -> " << response.status << " (body: "
                    << std::string(response.body.begin(), response.body.end()) << ")\n";
+        // Mismatched/stale devices - the cached list (or a device's
+        // registration id within it) is wrong; drop it so the next send
+        // fetches fresh instead of repeating the same failure.
+        if (response.status == 409 || response.status == 410) {
+            std::lock_guard<std::mutex> lock(stores_.mutex());
+            deviceListCache_.erase(remotePeerId);
+        }
     } else {
         std::cout << "[daemon] PUT /v1/messages/" << remotePeerId << " -> " << response.status << " ("
                    << deviceIds.size() << " device(s))\n";
@@ -283,7 +311,7 @@ void CallMessageSender::sendOffer(const std::string& remotePeerId, uint64_t call
     offer->set_type(mediaType == 1 ? signalservice::CallMessage_Offer_Type_OFFER_VIDEO_CALL
                                     : signalservice::CallMessage_Offer_Type_OFFER_AUDIO_CALL);
     offer->set_opaque(opaque, opaqueLen);
-    sendCallMessage(remotePeerId, callMessage, false, 0);
+    sendCallMessage(remotePeerId, callMessage);
 }
 
 void CallMessageSender::sendAnswer(const std::string& remotePeerId, uint64_t callId, const uint8_t* opaque,
@@ -292,7 +320,7 @@ void CallMessageSender::sendAnswer(const std::string& remotePeerId, uint64_t cal
     auto* answer = callMessage.mutable_answer();
     answer->set_id(callId);
     answer->set_opaque(opaque, opaqueLen);
-    sendCallMessage(remotePeerId, callMessage, false, 0);
+    sendCallMessage(remotePeerId, callMessage);
 }
 
 void CallMessageSender::sendIce(const std::string& remotePeerId, uint64_t callId, bool hasReceiverDeviceId,
@@ -301,8 +329,13 @@ void CallMessageSender::sendIce(const std::string& remotePeerId, uint64_t callId
     auto* ice = callMessage.add_iceupdate();
     ice->set_id(callId);
     ice->set_opaque(opaque, opaqueLen);
+    // destinationDeviceId (inside the CallMessage itself, checked by the
+    // receiving device to know whether this candidate is meant for it)
+    // is the only thing hasReceiverDeviceId/receiverDeviceId affect now -
+    // sendCallMessage() always addresses every device at the transport
+    // level regardless (see its own doc comment for why).
     if (hasReceiverDeviceId) callMessage.set_destinationdeviceid(receiverDeviceId);
-    sendCallMessage(remotePeerId, callMessage, hasReceiverDeviceId, receiverDeviceId);
+    sendCallMessage(remotePeerId, callMessage);
 }
 
 void CallMessageSender::sendHangup(const std::string& remotePeerId, uint64_t callId, int32_t hangupType,
@@ -312,7 +345,7 @@ void CallMessageSender::sendHangup(const std::string& remotePeerId, uint64_t cal
     hangup->set_id(callId);
     hangup->set_type(static_cast<signalservice::CallMessage_Hangup_Type>(hangupType));
     hangup->set_deviceid(hangupDeviceId);
-    sendCallMessage(remotePeerId, callMessage, false, 0);
+    sendCallMessage(remotePeerId, callMessage);
 }
 
 void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const std::string& localServiceId,

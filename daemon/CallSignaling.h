@@ -7,8 +7,11 @@
 // protoCallMessageToCallingMessage()/onContent(), now driving the real
 // RingRTC CallManager instead of libringrtc's Node bindings.
 
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "../ringrtc/signal2sip_ringrtc.h"
 #include "../signal/AuthSocket.h"
@@ -56,17 +59,26 @@ public:
     void sendHangup(const std::string& remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId);
 
 private:
-    // Ensures a session exists with every (or one specific, if
-    // hasReceiverDeviceId) device of remotePeerId, fetching+processing a
-    // prekey bundle if needed, then encrypts+sends the given CallMessage
-    // to each resulting device. Returns the device ids actually sent to.
-    std::vector<int> sendCallMessage(const std::string& remotePeerId, const signalservice::CallMessage& callMessage,
-                                      bool hasReceiverDeviceId, uint32_t receiverDeviceId);
+    // Fetches+processes a prekey bundle for every current device of
+    // remotePeerId (the server requires every device to be addressed on
+    // every send - see the .cpp definition's doc comment) and
+    // encrypts+sends the given CallMessage to each. Returns the device
+    // ids actually sent to. Reuses deviceListCache_ within its TTL rather
+    // than re-fetching for every single message of a call (offer, answer,
+    // several ICE candidates, hangup can easily be 5+ sends in one call) -
+    // found live that always fetching fresh, while correct, blew through
+    // Signal-Server's real PRE_KEYS rate limit (6 requests/10min) well
+    // before a single call finished signaling.
+    std::vector<int> sendCallMessage(const std::string& remotePeerId, const signalservice::CallMessage& callMessage);
 
     AuthSocket& socket_;
     ProtocolStores& stores_;
     std::string localServiceId_;
     uint32_t localDeviceId_;
+
+    static constexpr std::chrono::seconds kDeviceListCacheTtl{300};
+    std::unordered_map<std::string, std::pair<std::vector<int>, std::chrono::steady_clock::time_point>>
+        deviceListCache_;
 };
 
 // Real Signal Protocol session-recovery: call this when an incoming
