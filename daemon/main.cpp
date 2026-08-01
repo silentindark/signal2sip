@@ -455,6 +455,12 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
     Bytes plaintext;
     std::string senderServiceId;
     uint32_t senderDeviceId = 0;
+    // Only meaningful for the DOUBLE_RATCHET/PREKEY_MESSAGE branch below -
+    // captured before the decrypt attempt so they're still available in
+    // the catch block to build a DecryptionErrorMessage reply.
+    bool isIdentifiedCiphertext = false;
+    Bytes originalCiphertext;
+    uint8_t originalMessageType = 0;
 
     try {
         // Same lock CallMessageSender::sendCallMessage takes - this runs
@@ -474,18 +480,39 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
                    envelope.type() == signalservice::Envelope_Type_PREKEY_MESSAGE) {
             senderServiceId = resolveServiceId(envelope.sourceserviceidbinary());
             senderDeviceId = envelope.sourcedeviceid();
-            uint8_t messageType = envelope.type() == signalservice::Envelope_Type_PREKEY_MESSAGE
+            isIdentifiedCiphertext = true;
+            originalMessageType = envelope.type() == signalservice::Envelope_Type_PREKEY_MESSAGE
                                         ? SignalCiphertextMessageTypePreKey
                                         : SignalCiphertextMessageTypeWhisper;
-            Bytes ciphertext(envelope.content().begin(), envelope.content().end());
+            originalCiphertext.assign(envelope.content().begin(), envelope.content().end());
             plaintext = decryptCiphertext(*g_state.stores,
                                           Address{g_state.localServiceId, static_cast<uint32_t>(g_state.account.device_id)},
-                                          Address{senderServiceId, senderDeviceId}, messageType, ciphertext);
+                                          Address{senderServiceId, senderDeviceId}, originalMessageType,
+                                          originalCiphertext);
         } else {
             return; // receipt/other envelope type - nothing to decrypt
         }
     } catch (const std::exception& e) {
         std::cerr << "[daemon] failed to decrypt envelope: " << e.what() << "\n";
+        // Real Signal Protocol recovery: tell the sender so its own
+        // client can detect the desync and fall back to a fresh PreKey
+        // handshake, instead of this failing silently forever every time
+        // (see CallSignaling.h's sendDecryptionErrorReply() doc comment -
+        // found live against a real phone's already-desynced session
+        // with no other way to recover it). Only meaningful for
+        // identified (non-sealed-sender) ciphertext, where we know who
+        // sent it and have the raw bytes needed to build the reply; a
+        // sealed-sender envelope whose outer unseal itself failed gives
+        // us neither.
+        if (isIdentifiedCiphertext && !senderServiceId.empty()) {
+            std::thread([senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
+                        clientTimestamp = envelope.clienttimestamp()] {
+                std::lock_guard<std::mutex> lock(g_state.stores->mutex());
+                sendDecryptionErrorReply(*g_state.socket, *g_state.stores, g_state.localServiceId,
+                                         static_cast<uint32_t>(g_state.account.device_id), senderServiceId,
+                                         senderDeviceId, originalCiphertext, originalMessageType, clientTimestamp);
+            }).detach();
+        }
         return;
     }
 

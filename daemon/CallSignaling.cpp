@@ -235,4 +235,61 @@ void CallMessageSender::sendHangup(const std::string& remotePeerId, uint64_t cal
     sendCallMessage(remotePeerId, callMessage, false, 0);
 }
 
+void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const std::string& localServiceId,
+                               uint32_t localDeviceId, const std::string& senderServiceId, uint32_t senderDeviceId,
+                               const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp) {
+    try {
+        Bytes serializedDem =
+            buildDecryptionErrorMessage(originalCiphertext, originalType, originalTimestamp, senderDeviceId);
+
+        signalservice::Content content;
+        content.set_decryptionerrormessage(serializedDem.data(), serializedDem.size());
+        std::string contentBytes;
+        content.SerializeToString(&contentBytes);
+
+        // PlaintextContent's wire format (libsignal's rust/protocol/src/
+        // protocol.rs: PLAINTEXT_CONTEXT_IDENTIFIER_BYTE/
+        // PADDING_BOUNDARY_BYTE) - deliberately not run through
+        // padMessageBody(), this is its own simpler framing, not a normal
+        // encrypted message body.
+        Bytes plaintextContent{0xC0};
+        plaintextContent.insert(plaintextContent.end(), contentBytes.begin(), contentBytes.end());
+        plaintextContent.push_back(0x80);
+
+        std::string address = senderServiceId + "." + std::to_string(senderDeviceId);
+        uint32_t registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
+        if (registrationId == 0) {
+            // No usable local session for this specific device (the
+            // "session not found" half of the problem this whole
+            // mechanism exists for) - fetch fresh, same fallback
+            // CallMessageSender::sendCallMessage() uses, so the server's
+            // own stale-device check doesn't reject this reply itself.
+            fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId);
+            registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
+        }
+
+        // Envelope.Type.PLAINTEXT_CONTENT (proto/SignalService.proto) - not
+        // encrypted, see buildDecryptionErrorPlaintextContent()'s doc
+        // comment.
+        constexpr int kPlaintextContentEnvelopeType = 8;
+        json messages = json::array();
+        messages.push_back({{"type", kPlaintextContentEnvelopeType},
+                             {"destinationDeviceId", senderDeviceId},
+                             {"destinationRegistrationId", registrationId},
+                             {"content", base64Encode(plaintextContent)}});
+
+        json requestBody = {
+            {"destination", senderServiceId}, {"timestamp", nowMs()}, {"messages", messages},
+            {"online", false},                {"urgent", true},
+        };
+        std::string bodyStr = requestBody.dump();
+        Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
+        auto response = socket.request("PUT", "/v1/messages/" + senderServiceId + "?story=false", &bodyBytes);
+        std::cout << "[daemon] sent DecryptionErrorMessage to " << address << " -> " << response.status << "\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] failed to send DecryptionErrorMessage to " << senderServiceId << "." << senderDeviceId
+                   << ": " << e.what() << "\n";
+    }
+}
+
 } // namespace signal2sip

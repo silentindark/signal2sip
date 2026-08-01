@@ -69,4 +69,21 @@ private:
     uint32_t localDeviceId_;
 };
 
+// Real Signal Protocol session-recovery: call this when an incoming
+// identified (DOUBLE_RATCHET/PREKEY_MESSAGE) envelope fails to decrypt -
+// tells the sender via a DecryptionErrorMessage reply so its own client
+// can detect the desync and re-establish a fresh session on its own,
+// instead of failing silently forever (found live: a real phone's
+// session with this daemon had drifted from a stale local test fixture,
+// and there was no way to recover other than this). `originalCiphertext`/
+// `originalType`/`originalTimestamp` must be exactly what came off the
+// wire in the envelope that failed - see
+// Crypto.h's buildDecryptionErrorPlaintextContent() for why. Best-effort:
+// logs and swallows its own failures rather than throwing, since this
+// runs from an already-failed decrypt path and shouldn't take down
+// anything else.
+void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const std::string& localServiceId,
+                               uint32_t localDeviceId, const std::string& senderServiceId, uint32_t senderDeviceId,
+                               const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp);
+
 } // namespace signal2sip

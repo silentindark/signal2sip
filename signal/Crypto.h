@@ -75,4 +75,22 @@ struct SealedSenderResult {
 SealedSenderResult decryptSealedSender(ProtocolStores& stores, const Address& localAddress,
                                        const Bytes& sealedSenderCiphertext, uint64_t serverTimestamp);
 
+// Builds a real Signal Protocol session-recovery message: tells
+// `originalSenderDeviceId` that the message it sent (identified by
+// `originalCiphertext`/`originalType`/`originalTimestamp`, exactly as they
+// arrived in the Envelope we couldn't decrypt) failed, so its own client
+// can detect its session with us is desynced and fall back to a fresh
+// PreKey handshake - the same automatic recovery real Signal clients rely
+// on (this project's daemon previously had no equivalent, meaning a
+// stale/desynced session with a real client just failed silently
+// forever). Pure libsignal, no network/session-store/project-proto
+// access (deliberately doesn't depend on SignalService.pb.h - see
+// CallSignaling.cpp's sendDecryptionErrorReply() for the caller that
+// wraps this into a Content/PlaintextContent and actually sends it):
+// returns the serialized DecryptionErrorMessage only, matching
+// libsignal's signal_decryption_error_message_serialize() output
+// exactly.
+Bytes buildDecryptionErrorMessage(const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp,
+                                   uint32_t originalSenderDeviceId);
+
 } // namespace signal2sip

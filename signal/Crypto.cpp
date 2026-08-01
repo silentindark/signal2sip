@@ -177,4 +177,18 @@ SealedSenderResult decryptSealedSender(ProtocolStores& stores, const Address& lo
     return SealedSenderResult{senderServiceId, senderDeviceId, plaintext};
 }
 
+Bytes buildDecryptionErrorMessage(const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp,
+                                   uint32_t originalSenderDeviceId) {
+    SignalMutPointerDecryptionErrorMessage dem{};
+    checkError(signal_decryption_error_message_for_original_message(
+        &dem, borrow(originalCiphertext), originalType, originalTimestamp, originalSenderDeviceId));
+
+    SignalOwnedBuffer buffer{};
+    checkError(
+        signal_decryption_error_message_serialize(&buffer, SignalConstPointerDecryptionErrorMessage{dem.raw}));
+    Bytes serializedDem = takeOwned(buffer);
+    checkError(signal_decryption_error_message_destroy(dem));
+    return serializedDem;
+}
+
 } // namespace signal2sip
