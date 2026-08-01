@@ -731,8 +731,19 @@ int main(int argc, char** argv) {
 
     // --- PJSIP setup, once at startup - registers immediately so a
     // bridge call can be placed the moment an incoming Signal call needs
-    // one, matching pjsip_ringrtc_echo_test.cpp's proven config exactly
-    // (setNullDev(), no forced codec - see that file's comments for why).
+    // one. setNullDev() matches pjsip_ringrtc_echo_test.cpp's proven
+    // config; ptime/clockRate/forced-L16-mono-codec matches
+    // tg2sip-webrtc's sip.cpp (settings.raw_pcm()) exactly - same
+    // rationale: RingRtcSipBridge's ring-buffer ports are fixed
+    // 48kHz mono, so negotiating raw L16/48000/1 directly (instead of
+    // letting PJSIP/Asterisk pick from the full default codec list -
+    // narrowband PCMU needed a real resample_port conversion, and even
+    // wideband Opus is lossy-compressed and offered as stereo/2ch,
+    // a channel-count mismatch against these mono ports) removes every
+    // remaining source of rate/channel mismatch and codec-level
+    // encode/decode CPU overhead in the whole audio path. Found live:
+    // real degraded audio quality (described as sounding slowed-down)
+    // over PCMU with the resample_port conversion in place.
     pj::Endpoint ep;
     BridgeAccount sipAccount;
     if (!config.sipHost.empty()) {
@@ -741,8 +752,21 @@ int main(int argc, char** argv) {
             pj::EpConfig epConfig;
             epConfig.medConfig.ecTailLen = 0;
             epConfig.medConfig.noVad = true;
+            // 10ms ptime required to keep an uncompressed L16 RTP packet
+            // below the MTU (tg2sip-webrtc/tg2sip/sip.cpp's own comment).
+            epConfig.medConfig.audioFramePtime = 10;
+            epConfig.medConfig.ptime = 10;
+            epConfig.medConfig.clockRate = 48000;
             ep.libInit(epConfig);
             ep.audDevManager().setNullDev();
+
+            // Force L16/48000/1 (raw PCM, mono) as the only codec PJSIP
+            // will ever offer/accept, matching RingRtcSipBridge's fixed
+            // format exactly - same technique as tg2sip-webrtc's
+            // ep.codecSetPriority() loop.
+            for (const auto* codec : ep.codecEnum()) {
+                ep.codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
+            }
 
             pj::TransportConfig tcfg;
             tcfg.port = config.sipPort;
