@@ -361,6 +361,16 @@ void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const 
         {
             std::lock_guard<std::mutex> lock(stores.mutex());
             for (int deviceId : deviceIds) {
+                // Self/sync traffic (the undecryptable envelope came from
+                // one of our own other linked devices, senderServiceId ==
+                // our own account): the server recognizes a PUT whose
+                // destination is the authenticated account itself as a
+                // sync message and automatically excludes the
+                // authenticated (our own) device from the required set -
+                // found live as a 409 ({"extraDevices":[localDeviceId]})
+                // when this loop still tried to address ourselves too.
+                if (senderServiceId == localServiceId && static_cast<uint32_t>(deviceId) == localDeviceId) continue;
+
                 std::string address = senderServiceId + "." + std::to_string(deviceId);
                 uint32_t registrationId = remoteRegistrationIdFromSession(stores.storage(), address);
                 messages.push_back({{"type", kPlaintextContentEnvelopeType},
