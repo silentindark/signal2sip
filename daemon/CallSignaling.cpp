@@ -155,9 +155,33 @@ void handleCallMessage(Signal2sipCallManagerHandle* handle, ProtocolStores& stor
     }
     if (callMessage.has_answer()) {
         const auto& answer = callMessage.answer();
+
+        // Same identity-key requirement and same narrow-lock reasoning as
+        // the offer branch above - senderServiceId here is the callee
+        // (the answer's originator), so the fetch is the same shape.
+        // Found live: this branch used to call
+        // signal2sip_call_received_answer() without these at all (that
+        // overload didn't even exist), and RingRTC's C ABI silently
+        // hardcoded 32 zero bytes on the Rust side - the caller's SRTP
+        // key derived wrong while the callee's (which did get real keys
+        // via the offer branch) was correct, so only the callee ever
+        // reached Connected.
+        Bytes senderIdentityKey(32, 0);
+        Bytes receiverIdentityKey(32, 0);
+        {
+            std::lock_guard<std::mutex> lock(stores.mutex());
+            if (auto stored = stores.storage().loadRemoteIdentity(senderServiceId)) {
+                senderIdentityKey = rawPublicKeyBytes(*stored);
+            }
+            if (auto keypair = stores.storage().loadIdentityKeypair(stores.identity())) {
+                receiverIdentityKey = rawPublicKeyBytes(keypair->public_key);
+            }
+        }
+
         const std::string& opaque = answer.opaque();
         signal2sip_call_received_answer(handle, senderServiceId.c_str(), answer.id(), senderDeviceId,
-                                         reinterpret_cast<const uint8_t*>(opaque.data()), opaque.size());
+                                         reinterpret_cast<const uint8_t*>(opaque.data()), opaque.size(),
+                                         senderIdentityKey.data(), receiverIdentityKey.data());
     }
     for (const auto& ice : callMessage.iceupdate()) {
         const std::string& opaque = ice.opaque();

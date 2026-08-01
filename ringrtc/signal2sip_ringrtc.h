@@ -71,9 +71,18 @@ bool signal2sip_call_received_busy(Signal2sipCallManagerHandle* handle, const ch
                                     uint64_t call_id, uint32_t sender_device_id);
 bool signal2sip_call_accept(Signal2sipCallManagerHandle* handle, uint64_t call_id);
 bool signal2sip_call_proceed(Signal2sipCallManagerHandle* handle, uint64_t call_id);
+// sender_identity_key/receiver_identity_key must each point to exactly 32
+// bytes (raw Curve25519 public key, NOT libsignal's 33-byte serialize()
+// form) - sender = the callee (answer originator), receiver = the caller
+// (us). Same requirement, same silent-wrong-SRTP-key-not-an-error failure
+// mode as signal2sip_call_received_offer's identity key params - this
+// function used to hardcode 32 zero bytes on the Rust side, which is why
+// a real outgoing call's callee could connect while the caller never did
+// (see cpp_ffi.rs's doc comment on this function for the live symptom).
 bool signal2sip_call_received_answer(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
                                       uint64_t call_id, uint32_t sender_device_id, const uint8_t* opaque,
-                                      size_t opaque_len);
+                                      size_t opaque_len, const uint8_t* sender_identity_key,
+                                      const uint8_t* receiver_identity_key);
 bool signal2sip_call_received_ice(Signal2sipCallManagerHandle* handle, const char* remote_peer_id,
                                    uint64_t call_id, uint32_t sender_device_id, const uint8_t* opaque,
                                    size_t opaque_len);

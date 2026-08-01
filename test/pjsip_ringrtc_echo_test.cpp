@@ -173,9 +173,14 @@ void signalingReaderLoop(LocalPeer& self) {
                                                 zeroKey, zeroKey);
                 break;
             }
-            case MsgType::Answer:
-                signal2sip_call_received_answer(self.handle, self.otherName, callId, 1, payload, payloadLen);
+            case MsgType::Answer: {
+                // Same synthetic-same-process zero-key rationale as the
+                // Offer case above.
+                uint8_t zeroKey[32] = {0};
+                signal2sip_call_received_answer(self.handle, self.otherName, callId, 1, payload, payloadLen, zeroKey,
+                                                 zeroKey);
                 break;
+            }
             case MsgType::Ice:
                 signal2sip_call_received_ice(self.handle, self.otherName, callId, 1, payload, payloadLen);
                 break;
