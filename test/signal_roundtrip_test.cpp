@@ -158,12 +158,14 @@ int main(int argc, char** argv) {
         std::cout << "PASS: reusing " << deviceIds.size() << " migrated session(s)\n";
     }
 
-    auto sendOne = [&](const std::string& label, const std::string& body) {
+    auto sendOne = [&](const std::string& label, const std::string& body, bool urgent = true,
+                        int64_t timestampOffsetMs = 0) {
+        int64_t nowMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count();
         signalservice::Content content;
         content.mutable_datamessage()->set_body(body);
-        content.mutable_datamessage()->set_timestamp(
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count());
+        content.mutable_datamessage()->set_timestamp(nowMs);
         std::string contentBytes;
         content.SerializeToString(&contentBytes);
         Bytes contentPlaintext(contentBytes.begin(), contentBytes.end());
@@ -185,12 +187,10 @@ int main(int argc, char** argv) {
                    << " device(s), envelope type=" << firstType << "\n";
 
         json requestBody = {{"destination", destinationServiceId},
-                             {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
-                                               std::chrono::system_clock::now().time_since_epoch())
-                                               .count()},
+                             {"timestamp", nowMs + timestampOffsetMs},
                              {"messages", messages},
                              {"online", true},
-                             {"urgent", true}};
+                             {"urgent", urgent}};
         std::string bodyStr = requestBody.dump();
         Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
         auto sendResponse = socket.request("PUT", "/v1/messages/" + destinationServiceId + "?story=false", &bodyBytes);
@@ -201,9 +201,11 @@ int main(int argc, char** argv) {
     };
 
     bool ok1 = sendOne("first (PreKey, fresh session)", text);
-    bool ok2 = sendOne("second (Whisper, established session)", text + " [second]");
-    std::cout << (ok1 && ok2 ? "PASS" : "FAIL") << ": message send round-trips\n";
+    bool ok2 = sendOne("second (Whisper, established session)", text + " [second]", /*urgent=*/false);
+    bool ok3 = sendOne("third (online:true, timestamp +30s future)", text + " [future-ts]", /*urgent=*/true,
+                        /*timestampOffsetMs=*/30000);
+    std::cout << (ok1 && ok2 && ok3 ? "PASS" : "FAIL") << ": message send round-trips\n";
 
     socket.close();
-    return ok1 && ok2 ? 0 : 1;
+    return ok1 && ok2 && ok3 ? 0 : 1;
 }

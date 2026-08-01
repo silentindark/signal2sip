@@ -449,10 +449,16 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
         return;
     }
 
+    std::cout << "[daemon][diag] decrypted envelope from " << senderServiceId << " device " << senderDeviceId
+               << " (" << plaintext.size() << " bytes plaintext)\n";
+
     signalservice::Content content;
     if (!content.ParseFromArray(plaintext.data(), static_cast<int>(plaintext.size()))) {
         std::cerr << "[daemon] failed to parse decrypted Content\n";
         return;
+    }
+    if (content.has_datamessage()) {
+        std::cout << "[daemon][diag] DataMessage body: " << content.datamessage().body() << "\n";
     }
     if (!content.has_callmessage()) return;
 
