@@ -503,8 +503,27 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
     if (!content.has_callmessage()) return;
 
     std::cout << "[daemon] CallMessage from " << senderServiceId << " device " << senderDeviceId << "\n";
-    handleCallMessage(g_state.handle, *g_state.stores, senderServiceId, senderDeviceId,
-                      static_cast<uint32_t>(g_state.account.device_id), content.callmessage());
+
+    // Must not call handleCallMessage() directly on this thread: it's
+    // AuthSocket's single serviceThread (the one running lws_service()),
+    // and RingRTC can synchronously invoke a send_offer/send_answer/
+    // send_ice callback in reaction to this incoming CallMessage. Those
+    // callbacks block on AuthSocket::request() waiting for a response -
+    // but the response can only ever be delivered by this same thread's
+    // lws_service() loop, which can't run again until this call stack
+    // unwinds. That's a guaranteed self-deadlock (observed live as
+    // "PUT /v1/messages ... timed out waiting for a response" exactly
+    // 30s later, intermittently - only when RingRTC happened to react
+    // synchronously rather than via its own actor thread). Dispatching
+    // to a fresh thread here, same pattern as onCallState's
+    // std::thread(runProbe).detach(), keeps this thread free to keep
+    // servicing the socket.
+    signalservice::CallMessage callMessage = content.callmessage();
+    uint32_t localDeviceId = static_cast<uint32_t>(g_state.account.device_id);
+    std::thread([senderServiceId, senderDeviceId, localDeviceId, callMessage] {
+        handleCallMessage(g_state.handle, *g_state.stores, senderServiceId, senderDeviceId, localDeviceId,
+                          callMessage);
+    }).detach();
 }
 
 std::atomic<bool> g_running{true};
