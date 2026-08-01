@@ -159,6 +159,12 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
     content.SerializeToString(&contentBytes);
     Bytes plaintext(contentBytes.begin(), contentBytes.end());
 
+    // Serialize against every other encrypt/decrypt through this
+    // account's session store (concurrent sends, or a send racing the
+    // websocket thread's decrypt of an incoming envelope, can otherwise
+    // interleave Double Ratchet chain updates - see ProtocolStores::mutex()).
+    std::lock_guard<std::mutex> lock(stores_.mutex());
+
     Address localAddress{localServiceId_, localDeviceId_};
     json messages = json::array();
     for (int deviceId : deviceIds) {

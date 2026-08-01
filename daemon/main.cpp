@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -198,29 +199,57 @@ DaemonState g_state;
 
 // --- RingRTC -> Signal CallMessage (send side) ---
 
+// RingRTC (Rust) invokes these directly and synchronously - a C++
+// exception unwinding out of one of them crosses into Rust stack frames,
+// which Rust cannot handle ("Rust cannot catch foreign exceptions") and
+// hard-aborts the whole process instead of failing just this one call.
+// Found live: a transient send failure (e.g. a rate-limited /v2/keys
+// fetch inside sendCallMessage's session-establishment fallback) took
+// the entire daemon down instead of just that one signaling message.
+// Every callback RingRTC calls into must therefore catch everything
+// itself; on failure, simply not calling signal2sip_call_message_sent()
+// leaves RingRTC to retry/timeout the call on its own, same as if the
+// message had been lost in transit.
+
 void onSendOffer(void*, const char* remotePeerId, uint64_t callId, int32_t mediaType, const uint8_t* opaque,
                    size_t opaqueLen) {
     std::cout << "[daemon] send_offer -> " << remotePeerId << "\n";
-    g_state.sender->sendOffer(remotePeerId, callId, mediaType, opaque, opaqueLen);
-    signal2sip_call_message_sent(g_state.handle, callId);
+    try {
+        g_state.sender->sendOffer(remotePeerId, callId, mediaType, opaque, opaqueLen);
+        signal2sip_call_message_sent(g_state.handle, callId);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] send_offer failed: " << e.what() << "\n";
+    }
 }
 
 void onSendAnswer(void*, const char* remotePeerId, uint64_t callId, const uint8_t* opaque, size_t opaqueLen) {
     std::cout << "[daemon] send_answer -> " << remotePeerId << "\n";
-    g_state.sender->sendAnswer(remotePeerId, callId, opaque, opaqueLen);
-    signal2sip_call_message_sent(g_state.handle, callId);
+    try {
+        g_state.sender->sendAnswer(remotePeerId, callId, opaque, opaqueLen);
+        signal2sip_call_message_sent(g_state.handle, callId);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] send_answer failed: " << e.what() << "\n";
+    }
 }
 
 void onSendIce(void*, const char* remotePeerId, uint64_t callId, bool hasReceiverDeviceId, uint32_t receiverDeviceId,
                 const uint8_t* opaque, size_t opaqueLen) {
-    g_state.sender->sendIce(remotePeerId, callId, hasReceiverDeviceId, receiverDeviceId, opaque, opaqueLen);
-    signal2sip_call_message_sent(g_state.handle, callId);
+    try {
+        g_state.sender->sendIce(remotePeerId, callId, hasReceiverDeviceId, receiverDeviceId, opaque, opaqueLen);
+        signal2sip_call_message_sent(g_state.handle, callId);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] send_ice failed: " << e.what() << "\n";
+    }
 }
 
 void onSendHangup(void*, const char* remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId) {
     std::cout << "[daemon] send_hangup -> " << remotePeerId << "\n";
-    g_state.sender->sendHangup(remotePeerId, callId, hangupType, hangupDeviceId);
-    signal2sip_call_message_sent(g_state.handle, callId);
+    try {
+        g_state.sender->sendHangup(remotePeerId, callId, hangupType, hangupDeviceId);
+        signal2sip_call_message_sent(g_state.handle, callId);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] send_hangup failed: " << e.what() << "\n";
+    }
 }
 
 // --- SIP bridging (mirrors pjsip_ringrtc_echo_test.cpp's BridgeCall) ---
@@ -375,24 +404,30 @@ void onCallState(void*, const char* remotePeerId, uint64_t callId, int32_t state
     g_state.remotePeerId = remotePeerId;
     std::cout << "[daemon] call_state -> " << state << " (peer " << remotePeerId << ")\n";
 
-    if (state == SIGNAL2SIP_CALL_STATE_OUTGOING_AUDIO) {
-        signal2sip_call_proceed(g_state.handle, callId);
-    } else if (state == SIGNAL2SIP_CALL_STATE_INCOMING_AUDIO) {
-        g_state.isCallee = true;
-        signal2sip_call_proceed(g_state.handle, callId);
-    } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && g_state.isCallee.load()) {
-        // See signal2sip_call_accept()'s doc comment - must wait for
-        // Ringing, not accept right after proceed().
-        signal2sip_call_accept(g_state.handle, callId);
-    } else if (state == SIGNAL2SIP_CALL_STATE_CONNECTED) {
-        if (g_state.isCallee.load() && !g_state.config.sipBridgeDestination.empty()) {
-            startSipBridge();
-        } else if (!g_state.isCallee.load() && !g_state.config.outgoingCallTarget.empty()) {
-            std::thread(runProbe).detach();
+    // Called synchronously from RingRTC (Rust) - same FFI-exception-safety
+    // reasoning as the onSend* callbacks above.
+    try {
+        if (state == SIGNAL2SIP_CALL_STATE_OUTGOING_AUDIO) {
+            signal2sip_call_proceed(g_state.handle, callId);
+        } else if (state == SIGNAL2SIP_CALL_STATE_INCOMING_AUDIO) {
+            g_state.isCallee = true;
+            signal2sip_call_proceed(g_state.handle, callId);
+        } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && g_state.isCallee.load()) {
+            // See signal2sip_call_accept()'s doc comment - must wait for
+            // Ringing, not accept right after proceed().
+            signal2sip_call_accept(g_state.handle, callId);
+        } else if (state == SIGNAL2SIP_CALL_STATE_CONNECTED) {
+            if (g_state.isCallee.load() && !g_state.config.sipBridgeDestination.empty()) {
+                startSipBridge();
+            } else if (!g_state.isCallee.load() && !g_state.config.outgoingCallTarget.empty()) {
+                std::thread(runProbe).detach();
+            }
+        } else if (state == SIGNAL2SIP_CALL_STATE_ENDED || state == SIGNAL2SIP_CALL_STATE_CONCLUDED) {
+            stopSipBridge();
+            g_state.isCallee = false;
         }
-    } else if (state == SIGNAL2SIP_CALL_STATE_ENDED || state == SIGNAL2SIP_CALL_STATE_CONCLUDED) {
-        stopSipBridge();
-        g_state.isCallee = false;
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] onCallState(" << state << ") handling failed: " << e.what() << "\n";
     }
 }
 
@@ -422,6 +457,11 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
     uint32_t senderDeviceId = 0;
 
     try {
+        // Same lock CallMessageSender::sendCallMessage takes - this runs
+        // on the websocket read thread, which can otherwise race an
+        // outgoing send's session-store mutation on RingRTC's callback
+        // thread (see ProtocolStores::mutex()).
+        std::lock_guard<std::mutex> lock(g_state.stores->mutex());
         if (envelope.type() == signalservice::Envelope_Type_UNIDENTIFIED_SENDER) {
             Bytes ciphertext(envelope.content().begin(), envelope.content().end());
             SealedSenderResult result =

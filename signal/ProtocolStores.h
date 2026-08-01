@@ -2,6 +2,7 @@
 
 #include <signal_ffi.h>
 
+#include <mutex>
 #include <string>
 
 #include "../storage/Storage.h"
@@ -32,9 +33,25 @@ public:
     Storage& storage() const { return storage_; }
     const std::string& identity() const { return identity_; }
 
+    // Double Ratchet session state (send and receive chains alike) is a
+    // strictly-ordered, mutate-in-place resource - two libsignal calls
+    // touching the same session concurrently (e.g. the daemon's RingRTC
+    // callback thread encrypting an outgoing CallMessage while the
+    // websocket thread decrypts an incoming one, or several outgoing
+    // sends racing each other) can interleave read-modify-write session
+    // updates and corrupt the chain, producing an "invalid Whisper
+    // message: decryption failed" on the other end for an otherwise
+    // perfectly legitimate message. Found live in Milestone G: a real
+    // two-daemon call reliably lost one CallMessage (usually an ICE
+    // candidate, sent in a rapid burst) this way. Every call site that
+    // encrypts or decrypts through this instance must hold this lock for
+    // the duration of that libsignal call.
+    std::mutex& mutex() { return mutex_; }
+
 private:
     Storage& storage_;
     std::string identity_;
+    std::mutex mutex_;
     SignalFfiSessionStoreStruct sessionStoreStruct_{};
     SignalFfiIdentityKeyStoreStruct identityKeyStoreStruct_{};
     SignalFfiPreKeyStoreStruct preKeyStoreStruct_{};
