@@ -404,6 +404,30 @@ void startSipBridge() {
         std::cerr << "[daemon] cannot bridge to SIP: not registered\n";
         return;
     }
+
+    // PJSUA2 requires every thread that calls into it to be registered
+    // with PJLIB first (Endpoint::libRegisterThread()), unless it's the
+    // thread that originally initialized the library (main()'s thread,
+    // which called ep.libCreate()/libInit()/libStart()) or one of
+    // PJSIP's own worker threads. onCallState() (and therefore this
+    // function) runs on whatever thread RingRTC invokes its call_state
+    // callback from - not main()'s thread - so register it here, once
+    // per OS thread. Found live: without this, makeCall() below still
+    // sent a real INVITE (the transport layer tolerated the unregistered
+    // thread fine), but PJSIP's automatic 401-challenge auto-retry -
+    // which relies on the dialog's thread-local auth session state -
+    // never fired, so a real call to DPDZK's *43 got exactly one INVITE,
+    // one 401, and then silently never connected.
+    thread_local bool sipThreadRegistered = false;
+    if (!sipThreadRegistered && g_state.ep) {
+        try {
+            g_state.ep->libRegisterThread("ringrtc-callback");
+        } catch (pj::Error& err) {
+            std::cerr << "[daemon] libRegisterThread failed: " << err.info() << "\n";
+        }
+        sipThreadRegistered = true;
+    }
+
     g_state.bridge = std::make_unique<voip::RingRtcSipBridge>(g_state.handle);
 
     std::string destUri = "sip:" + g_state.config.sipBridgeDestination + "@" + g_state.config.sipHost;
