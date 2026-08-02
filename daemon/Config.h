@@ -9,13 +9,28 @@
 // One process now serves N Signal accounts (each optionally with its own
 // SIP trunk) from a single file, all sharing one database (see
 // GlobalConfig/Storage's own doc comments) - one `[global]` section plus
-// a repeated `[account.<name>]` section per account, `<name>` a free-form
-// human-readable label (no format requirement beyond what INI section
-// names allow - was previously the e164 digits with no `+`, now just a
-// convention/example, not a requirement). Was one account/one file per
-// process (matching tg2sip-webrtc's own model) - deliberately reversed
-// since tg2sip has no real in-process-multi-account precedent to mirror;
-// see the project's memory for that decision.
+// a repeated `[account.<name>]` section per account.
+//
+// `<name>` is a purely arbitrary label you choose - any string valid in
+// an INI section header (letters/digits/hyphen/underscore, no spaces or
+// brackets). It carries no meaning to Signal or SIP; the daemon only uses
+// it as (1) this account's key in its internal accounts map, (2) the
+// prefix on every log line for this account (`[daemon][<name>] ...`),
+// (3) the `account_name` column value scoping this account's rows in the
+// shared database. The account's real identity is `e164=`/its derived
+// ACI, not `<name>` - so `[account.support-line]`, `[account.alice]`, and
+// `[account.123456789004]` are all equally valid, and don't need to
+// relate to the phone number at all. (Historically this project used the
+// e164 digits with no `+` as the label, purely as a convention when this
+// was the only naming idea around - not a requirement, and no longer
+// even the example used in this project's own test configs, which now
+// prefer names like `caller`/`listener` describing each account's role
+// instead.)
+//
+// Was one account/one file per process (matching tg2sip-webrtc's own
+// model) - deliberately reversed since tg2sip has no real
+// in-process-multi-account precedent to mirror; see the project's memory
+// for that decision.
 //
 // argv[1] -> /etc/signal2sip/signal2sip.conf -> ./signal2sip.conf,
 // matching tg2sip/utils.cpp's resolve_config_path() exactly (same
@@ -42,6 +57,13 @@ struct AccountConfig {
     // defaults.
     std::string name;
 
+    // The account's REAL identity, not a label - the actual phone number
+    // this Signal account is registered/linked under, in E.164 format
+    // (leading '+', country code, e.g. "+123456789004"). Unlike `name`
+    // above (an arbitrary label you pick), this value has no freedom:
+    // Signal's own servers identify the account by this number (and its
+    // derived ACI), so it must be the account's genuine registered
+    // number, not a made-up placeholder.
     std::string e164;       // required
     std::string serverUrl;  // empty = production chat.signal.org
 
