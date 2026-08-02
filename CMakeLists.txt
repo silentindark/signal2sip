@@ -139,15 +139,25 @@ target_link_libraries(refresh_prekeys_test PRIVATE signal2sip_signal signal2sip_
 
 # RingRTC's Milestone D/E C ABI (see /home/vlad/.claude/plans/
 # jiggly-mapping-plum.md and this project's memory) - built via `cargo
-# build --features native,prebuilt_webrtc` in the sibling
-# ~/GIT/vladonv/ringrtc checkout, linking its own prebuilt WebRTC static
-# lib (fetched via `bin/fetch-artifact --platform linux-x64`).
+# build --features native --release` (no `prebuilt_webrtc`) in the
+# sibling ~/GIT/vladonv/ringrtc checkout, linking a from-source WebRTC
+# static lib (`bin/gsync-webrtc` + `bin/build-desktop --webrtc-only -r`)
+# with the per-instance AUDIO_TRANSPORT fix baked in
+# (~/GIT/vladonv/webrtc/ringrtc/rffi/src/audio_device.cc - Signal's
+# official prebuilt binary obviously doesn't have this). RELEASE, not
+# debug, purely to match what the original Signal-prebuilt path always
+# used - NOT because debug vs release was ever the cause of the "Failed
+# to setup SRTP crypto parameters" regression (that was tried as a
+# hypothesis and disproven: release reproduced the identical failure).
+# The actual cause was signal2sip-daemon's own link line reintroducing
+# the raw `webrtc` target's vendored libsrtp symbols alongside
+# webrtc_pjsip_safe - see the comment there.
 # native/ringrtc/signal2sip_ringrtc.h is hand-written (that crate has no
 # cbindgen setup) and kept in sync with cpp_ffi.rs manually.
 set(RINGRTC_DIR "$ENV{HOME}/GIT/vladonv/ringrtc" CACHE PATH "Path to the ringrtc checkout")
 add_library(ringrtc STATIC IMPORTED)
 set_target_properties(ringrtc PROPERTIES
-    IMPORTED_LOCATION ${RINGRTC_DIR}/target/debug/libringrtc.a
+    IMPORTED_LOCATION ${RINGRTC_DIR}/target/release/libringrtc.a
 )
 add_library(webrtc STATIC IMPORTED)
 set_target_properties(webrtc PROPERTIES
@@ -162,6 +172,16 @@ target_link_libraries(ringrtc_two_party_test PRIVATE ringrtc webrtc ${CMAKE_DL_L
 # version, --no-eh-frame-hdr does not suppress it) - lld (Chromium's own
 # toolchain's usual linker) handles them fine.
 target_link_options(ringrtc_two_party_test PRIVATE -fuse-ld=lld)
+
+# fancy-swimming-church.md §0: proves two independent CallManagers (and
+# therefore two independent raw-PCM ADMs) can run concurrently in one
+# process without crossing audio - only meaningful once linked against a
+# webrtc.a built with the per-instance AUDIO_TRANSPORT fix, see this
+# file's own top-of-file comment.
+add_executable(two_call_managers_audio_isolation_test test/two_call_managers_audio_isolation_test.cpp)
+target_include_directories(two_call_managers_audio_isolation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(two_call_managers_audio_isolation_test PRIVATE ringrtc webrtc ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
+target_link_options(two_call_managers_audio_isolation_test PRIVATE -fuse-ld=lld)
 
 # Milestone F: bridges the ring-buffer PJSIP ports (ported from
 # tg2sip-webrtc/tg2sip/voip/{ring_buffer,audio_bridge}.h) to RingRTC's
@@ -217,9 +237,24 @@ target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_auth
 
 add_executable(signal2sip-daemon daemon/main.cpp)
 target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Rust_rawPcmRecordedDataIsAvailable/Rust_rawPcmNeedMorePlayData are new
+# symbols defined in ringrtc/rffi/src/audio_device.cc (§0 AUDIO_TRANSPORT
+# fix, fancy-swimming-church.md). audio_device.o is NOT one of the object
+# files isolate_webrtc_srtp_symbols.py touches (it only renames libsrtp's
+# own vendored .o members - see CANDIDATE_NAMES above), so
+# `webrtc_pjsip_safe` already exports these symbols untouched - do NOT
+# also link the raw `webrtc` target here. Doing so once before (plus the
+# --allow-multiple-definition flag below, needed for an unrelated
+# rust_eh_personality clash) silently reintroduced the exact
+# PJSIP/libsrtp collision webrtc_pjsip_safe exists to prevent: real calls
+# failed applying the local answer SDP with "Failed to setup SRTP crypto
+# parameters" (libsrtp err=2/bad_param from srtp_init(), since the raw,
+# non-renamed copy came first on the link line again). Confirmed this was
+# not a debug-vs-release WebRTC issue (both reproduced it identically).
 target_link_libraries(signal2sip-daemon PRIVATE signal2sip_daemon signal2sip_signal signal2sip_authsocket
     signal2sip_proto signal2sip_voip ringrtc webrtc_pjsip_safe PkgConfig::PJSIP
     ${CMAKE_DL_LIBS} pthread m stdc++ pulse nlohmann_json::nlohmann_json)
+target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld)
 # libringrtc.a and libsignal_ffi.a are two INDEPENDENT Rust static libs
 # (separate `cargo build` invocations, separate crates/workspaces) - each
 # embeds its own copy of Rust std's runtime support symbols

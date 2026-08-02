@@ -1,24 +1,33 @@
-// Milestone G: signal2sip-daemon - combines A-F into one process per
-// account (see /home/vlad/.claude/plans/jiggly-mapping-plum.md). No IPC,
-// no Node - real Signal Protocol send/receive (Milestone B), RingRTC
-// calling (D/E), and the PJSIP ring-buffer bridge (F), all driven by
-// real incoming/outgoing Signal calls instead of a synthetic in-process
-// test.
+// signal2sip-daemon: one process serving N Signal accounts at once (each
+// optionally with its own SIP trunk), driven entirely by real
+// incoming/outgoing Signal calls - no IPC, no Node. Real Signal Protocol
+// send/receive, RingRTC calling, and the PJSIP ring-buffer bridge, all
+// per-account.
 //
-// Two roles a running instance can take, inferred from config (not an
-// explicit mode flag - matches how the two accounts in this milestone's
-// live verification are actually configured):
-//   - Incoming Signal call + [sip] bridge_destination configured: answers
-//     automatically and bridges the call's audio to a real SIP call via
-//     RingRtcSipBridge (native/voip/), same pattern
+// Was one process per account (mirroring tg2sip-webrtc's own model) -
+// deliberately reversed to single-process-multi-account; see the
+// project's own memory for that decision and Config.h's doc comment for
+// the resulting config file shape.
+//
+// Two roles a given account can take, inferred from its own config
+// section (not an explicit mode flag):
+//   - Incoming Signal call + [sip.<name>] bridge_destination configured:
+//     answers automatically and bridges the call's audio to a real SIP
+//     call via RingRtcSipBridge (native/voip/), same pattern
 //     pjsip_ringrtc_echo_test.cpp's peerB proved live against DPDZK's *43.
-//   - [other] outgoing_call_target configured: places an outgoing Signal
-//     call and pushes/pulls raw audio directly (no SIP leg) - this
-//     instance is the "test probe" side of the live verification,
-//     measuring RMS to confirm the round trip through the other
-//     instance's SIP bridge actually carried real audio. Mirrors
+//   - [other.<name>] outgoing_call_target configured: places an outgoing
+//     Signal call and pushes/pulls raw audio directly (no SIP leg) - a
+//     test probe, measuring RMS to confirm the round trip through the
+//     other account's SIP bridge actually carried real audio. Mirrors
 //     pjsip_ringrtc_echo_test.cpp's peerA.
+//
+// Concurrent calls across DIFFERENT accounts are fully supported (each
+// account has its own AuthSocket/ProtocolStores/RingRTC CallManager/
+// PJSIP Account) now that ringrtc's AUDIO_TRANSPORT global was made
+// per-instance (see ~/GIT/vladonv/webrtc/ringrtc/rffi/src/audio_device.cc)
+// - two calls on two accounts no longer risk crossing audio.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -28,6 +37,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -181,10 +191,12 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
 // drop the ICE candidate for a call it doesn't know about yet; (2)
 // unbounded thread creation under a burst/flood of envelopes; (3) nothing
 // tracked these threads, so a detached thread could still be running
-// when main() destroyed the objects (g_state.stores/socket/handle) it
-// dereferences, a genuine use-after-free on shutdown. A single worker
-// thread with a FIFO queue fixes all three: one thread total, strict
-// arrival order, and something concrete for shutdown to join.
+// when main() destroyed the objects it dereferences, a genuine
+// use-after-free on shutdown. A single worker thread with a FIFO queue
+// fixes all three: one thread total, strict arrival order, and something
+// concrete for shutdown to join. One instance per account (not shared) -
+// keeps each account's ordering/shutdown guarantees independent, with
+// zero new cross-account interaction to reason about.
 class EnvelopeDispatchQueue {
 public:
     void start() {
@@ -242,17 +254,20 @@ private:
     std::thread worker_;
 };
 
-// Everything the C-ABI callbacks (plain function pointers, no captures)
-// need access to via their void* context.
-struct DaemonState {
-    Config config;
-    Storage* storage;
-    ProtocolStores* stores;
+// Everything one account's C-ABI callbacks (plain function pointers, no
+// captures - RingRTC's Signal2sipCallbacks::context carries the pointer
+// back to the right instance instead) need. One of these per configured
+// account, owned by g_accounts below - replaces what used to be a single
+// global DaemonState (one process = one account, pre-refactor).
+struct AccountState {
+    AccountConfig config;
+    std::unique_ptr<Storage> storage;
+    std::unique_ptr<ProtocolStores> stores;
     AccountRecord account;
     std::string localServiceId; // == account.aci
-    AuthSocket* socket;
-    CallMessageSender* sender;
-    Signal2sipCallManagerHandle* handle;
+    std::unique_ptr<AuthSocket> socket;
+    std::unique_ptr<CallMessageSender> sender;
+    Signal2sipCallManagerHandle* handle = nullptr;
 
     // Set once a call is active - the far end's serviceId, used because
     // RingRTC's callbacks give us remote_peer_id already, but call_state
@@ -262,16 +277,17 @@ struct DaemonState {
     std::string remotePeerId;
 
     // Only ever one of these is non-null at a time (this project's
-    // one-call-at-a-time scope, matching RingRTC's own single-active-call
-    // design).
+    // one-call-at-a-time-per-account scope, matching RingRTC's own
+    // single-active-call-per-CallManager design) - a second account can
+    // still have its own call active concurrently, see this file's
+    // top-of-file comment.
     std::unique_ptr<voip::RingRtcSipBridge> bridge;
     pj::Call* sipCall = nullptr;
 
-    pj::Endpoint* ep = nullptr;
+    EnvelopeDispatchQueue dispatchQueue;
 };
 
-DaemonState g_state;
-EnvelopeDispatchQueue g_dispatchQueue;
+std::map<std::string, std::unique_ptr<AccountState>> g_accounts; // keyed by AccountConfig::name
 
 // --- RingRTC -> Signal CallMessage (send side) ---
 
@@ -300,36 +316,41 @@ void safeCallback(const char* name, F&& f) {
     }
 }
 
-void onSendOffer(void*, const char* remotePeerId, uint64_t callId, int32_t mediaType, const uint8_t* opaque,
+void onSendOffer(void* context, const char* remotePeerId, uint64_t callId, int32_t mediaType, const uint8_t* opaque,
                    size_t opaqueLen) {
-    std::cout << "[daemon] send_offer -> " << remotePeerId << "\n";
+    auto& acct = *static_cast<AccountState*>(context);
+    std::cout << "[daemon][" << acct.config.name << "] send_offer -> " << remotePeerId << "\n";
     safeCallback("send_offer", [&] {
-        g_state.sender->sendOffer(remotePeerId, callId, mediaType, opaque, opaqueLen);
-        signal2sip_call_message_sent(g_state.handle, callId);
+        acct.sender->sendOffer(remotePeerId, callId, mediaType, opaque, opaqueLen);
+        signal2sip_call_message_sent(acct.handle, callId);
     });
 }
 
-void onSendAnswer(void*, const char* remotePeerId, uint64_t callId, const uint8_t* opaque, size_t opaqueLen) {
-    std::cout << "[daemon] send_answer -> " << remotePeerId << "\n";
+void onSendAnswer(void* context, const char* remotePeerId, uint64_t callId, const uint8_t* opaque, size_t opaqueLen) {
+    auto& acct = *static_cast<AccountState*>(context);
+    std::cout << "[daemon][" << acct.config.name << "] send_answer -> " << remotePeerId << "\n";
     safeCallback("send_answer", [&] {
-        g_state.sender->sendAnswer(remotePeerId, callId, opaque, opaqueLen);
-        signal2sip_call_message_sent(g_state.handle, callId);
+        acct.sender->sendAnswer(remotePeerId, callId, opaque, opaqueLen);
+        signal2sip_call_message_sent(acct.handle, callId);
     });
 }
 
-void onSendIce(void*, const char* remotePeerId, uint64_t callId, bool hasReceiverDeviceId, uint32_t receiverDeviceId,
-                const uint8_t* opaque, size_t opaqueLen) {
+void onSendIce(void* context, const char* remotePeerId, uint64_t callId, bool hasReceiverDeviceId,
+                uint32_t receiverDeviceId, const uint8_t* opaque, size_t opaqueLen) {
+    auto& acct = *static_cast<AccountState*>(context);
     safeCallback("send_ice", [&] {
-        g_state.sender->sendIce(remotePeerId, callId, hasReceiverDeviceId, receiverDeviceId, opaque, opaqueLen);
-        signal2sip_call_message_sent(g_state.handle, callId);
+        acct.sender->sendIce(remotePeerId, callId, hasReceiverDeviceId, receiverDeviceId, opaque, opaqueLen);
+        signal2sip_call_message_sent(acct.handle, callId);
     });
 }
 
-void onSendHangup(void*, const char* remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId) {
-    std::cout << "[daemon] send_hangup -> " << remotePeerId << "\n";
+void onSendHangup(void* context, const char* remotePeerId, uint64_t callId, int32_t hangupType,
+                   uint32_t hangupDeviceId) {
+    auto& acct = *static_cast<AccountState*>(context);
+    std::cout << "[daemon][" << acct.config.name << "] send_hangup -> " << remotePeerId << "\n";
     safeCallback("send_hangup", [&] {
-        g_state.sender->sendHangup(remotePeerId, callId, hangupType, hangupDeviceId);
-        signal2sip_call_message_sent(g_state.handle, callId);
+        acct.sender->sendHangup(remotePeerId, callId, hangupType, hangupDeviceId);
+        signal2sip_call_message_sent(acct.handle, callId);
     });
 }
 
@@ -394,16 +415,27 @@ public:
     }
 };
 
-BridgeAccount* g_sipAccount = nullptr;
+// One shared PJSIP Endpoint for the whole process (pjsua2/PJSIP itself is
+// a process-wide singleton - only one Endpoint is possible per process,
+// unlike everything else in this file which is now per-account) - a
+// single UDP transport on it is shared by every account's pj::Account,
+// exactly like a real SIP softphone handling several registered lines
+// over one local port; PJSIP natively supports N accounts per Endpoint,
+// no separate transport-per-account needed. Set once in main(), read
+// (never written) from startSipBridge()'s libRegisterThread() call.
+pj::Endpoint* g_ep = nullptr;
+std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
 
-// Starts bridging the currently-active RingRTC call to a real SIP call
-// dialing config.sipBridgeDestination - called once the Signal call is
-// Accepted (real audio about to flow both ways).
-void startSipBridge() {
-    if (!g_sipAccount || !g_sipAccount->registered) {
-        std::cerr << "[daemon] cannot bridge to SIP: not registered\n";
+// Starts bridging acct's currently-active RingRTC call to a real SIP call
+// dialing acct.config.sipBridgeDestination - called once that Signal call
+// is Accepted (real audio about to flow both ways).
+void startSipBridge(AccountState& acct) {
+    auto it = g_sipAccounts.find(acct.config.name);
+    if (it == g_sipAccounts.end() || !it->second->registered.load()) {
+        std::cerr << "[daemon][" << acct.config.name << "] cannot bridge to SIP: not registered\n";
         return;
     }
+    BridgeAccount& sipAccount = *it->second;
 
     // PJSUA2 requires every thread that calls into it to be registered
     // with PJLIB first (Endpoint::libRegisterThread()), unless it's the
@@ -419,37 +451,37 @@ void startSipBridge() {
     // never fired, so a real call to DPDZK's *43 got exactly one INVITE,
     // one 401, and then silently never connected.
     thread_local bool sipThreadRegistered = false;
-    if (!sipThreadRegistered && g_state.ep) {
+    if (!sipThreadRegistered && g_ep) {
         try {
-            g_state.ep->libRegisterThread("ringrtc-callback");
+            g_ep->libRegisterThread("ringrtc-callback");
         } catch (pj::Error& err) {
             std::cerr << "[daemon] libRegisterThread failed: " << err.info() << "\n";
         }
         sipThreadRegistered = true;
     }
 
-    g_state.bridge = std::make_unique<voip::RingRtcSipBridge>(g_state.handle);
+    acct.bridge = std::make_unique<voip::RingRtcSipBridge>(acct.handle);
 
-    std::string destUri = "sip:" + g_state.config.sipBridgeDestination + "@" + g_state.config.sipHost;
-    std::cout << "[daemon][sip] placing bridge call to " << destUri << "\n";
-    auto* call = new BridgeCall(*g_sipAccount, *g_state.bridge);
-    g_state.sipCall = call;
+    std::string destUri = "sip:" + acct.config.sipBridgeDestination + "@" + acct.config.sipHost;
+    std::cout << "[daemon][" << acct.config.name << "][sip] placing bridge call to " << destUri << "\n";
+    auto* call = new BridgeCall(sipAccount, *acct.bridge);
+    acct.sipCall = call;
     pj::CallOpParam prm(true);
     prm.opt.audioCount = 1;
     prm.opt.videoCount = 0;
     try {
         call->makeCall(destUri, prm);
     } catch (pj::Error& err) {
-        std::cerr << "[daemon] FAIL: makeCall: " << err.info() << "\n";
+        std::cerr << "[daemon][" << acct.config.name << "] FAIL: makeCall: " << err.info() << "\n";
     }
 }
 
-void stopSipBridge() {
-    if (g_state.bridge) {
-        g_state.bridge->Stop();
+void stopSipBridge(AccountState& acct) {
+    if (acct.bridge) {
+        acct.bridge->Stop();
     }
-    if (g_state.sipCall) {
-        auto* call = static_cast<BridgeCall*>(g_state.sipCall);
+    if (acct.sipCall) {
+        auto* call = static_cast<BridgeCall*>(acct.sipCall);
         pj::CallOpParam hprm;
         try {
             call->hangup(hprm);
@@ -459,18 +491,14 @@ void stopSipBridge() {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         delete call;
-        g_state.sipCall = nullptr;
+        acct.sipCall = nullptr;
     }
-    g_state.bridge.reset();
+    acct.bridge.reset();
 }
 
 // --- Outgoing-call test probe (mirrors pjsip_ringrtc_echo_test.cpp's peerA) ---
 
-std::atomic<bool> g_probeRunning{false};
-std::atomic<bool> g_probeCompleted{false};
-
-void runProbe() {
-    g_probeRunning = true;
+void runProbe(AccountState& acct) {
     const int sampleRate = 48000;
     const int toneHz = 440;
     const int totalSamples = sampleRate * 10;
@@ -483,59 +511,61 @@ void runProbe() {
     const int chunk = 480;
     for (int offset = 0; offset < totalSamples; offset += chunk) {
         int n = std::min(chunk, totalSamples - offset);
-        signal2sip_push_recorded_samples(g_state.handle, tone.data() + offset, n);
+        signal2sip_push_recorded_samples(acct.handle, tone.data() + offset, n);
         int16_t buf[chunk];
-        size_t got = signal2sip_pull_playout_samples(g_state.handle, buf, chunk);
+        size_t got = signal2sip_pull_playout_samples(acct.handle, buf, chunk);
         if (got > 0) received.insert(received.end(), buf, buf + got);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    std::cout << "[daemon][probe] pulled " << received.size() << " samples\n";
+    std::cout << "[daemon][" << acct.config.name << "][probe] pulled " << received.size() << " samples\n";
     double sumSquares = 0;
     for (int16_t s : received) sumSquares += static_cast<double>(s) * s;
     double rms = received.empty() ? 0.0 : std::sqrt(sumSquares / received.size());
-    std::cout << "[daemon][probe] RMS of received (echoed) audio: " << rms << "\n";
+    std::cout << "[daemon][" << acct.config.name << "][probe] RMS of received (echoed) audio: " << rms << "\n";
     bool audioFlowed = received.size() > static_cast<size_t>(sampleRate) && rms > 20.0;
-    std::cout << (audioFlowed ? "PASS" : "FAIL") << ": tone round-tripped through the real Signal call + remote's SIP bridge\n";
+    std::cout << "[daemon][" << acct.config.name << "] " << (audioFlowed ? "PASS" : "FAIL")
+               << ": tone round-tripped through the real Signal call + remote's SIP bridge\n";
 
-    signal2sip_call_hangup(g_state.handle);
-    g_probeRunning = false;
-    g_probeCompleted = true;
+    signal2sip_call_hangup(acct.handle);
 }
 
 // --- RingRTC call state machine ---
 
-void onCallState(void*, const char* remotePeerId, uint64_t callId, int32_t state) {
-    g_state.activeCallId = callId;
-    g_state.remotePeerId = remotePeerId;
-    std::cout << "[daemon] call_state -> " << state << " (peer " << remotePeerId << ")\n";
+void onCallState(void* context, const char* remotePeerId, uint64_t callId, int32_t state) {
+    auto& acct = *static_cast<AccountState*>(context);
+    acct.activeCallId = callId;
+    acct.remotePeerId = remotePeerId;
+    std::cout << "[daemon][" << acct.config.name << "] call_state -> " << state << " (peer " << remotePeerId
+               << ")\n";
 
     // Called synchronously from RingRTC (Rust) - same FFI-exception-safety
     // reasoning as the onSend* callbacks above.
     safeCallback("onCallState", [&] {
         if (state == SIGNAL2SIP_CALL_STATE_OUTGOING_AUDIO) {
-            signal2sip_call_proceed(g_state.handle, callId);
+            signal2sip_call_proceed(acct.handle, callId);
         } else if (state == SIGNAL2SIP_CALL_STATE_INCOMING_AUDIO) {
-            g_state.isCallee = true;
-            signal2sip_call_proceed(g_state.handle, callId);
-        } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && g_state.isCallee.load()) {
+            acct.isCallee = true;
+            signal2sip_call_proceed(acct.handle, callId);
+        } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && acct.isCallee.load()) {
             // See signal2sip_call_accept()'s doc comment - must wait for
             // Ringing, not accept right after proceed().
-            signal2sip_call_accept(g_state.handle, callId);
+            signal2sip_call_accept(acct.handle, callId);
         } else if (state == SIGNAL2SIP_CALL_STATE_CONNECTED) {
-            if (g_state.isCallee.load() && !g_state.config.sipBridgeDestination.empty()) {
-                startSipBridge();
-            } else if (!g_state.isCallee.load() && !g_state.config.outgoingCallTarget.empty()) {
-                std::thread(runProbe).detach();
+            if (acct.isCallee.load() && !acct.config.sipBridgeDestination.empty()) {
+                startSipBridge(acct);
+            } else if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
+                std::thread([&acct] { runProbe(acct); }).detach();
             }
         } else if (state == SIGNAL2SIP_CALL_STATE_ENDED || state == SIGNAL2SIP_CALL_STATE_CONCLUDED) {
-            stopSipBridge();
-            g_state.isCallee = false;
+            stopSipBridge(acct);
+            acct.isCallee = false;
         }
     });
 }
 
-Signal2sipCallbacks makeCallbacks() {
+Signal2sipCallbacks makeCallbacks(AccountState& acct) {
     Signal2sipCallbacks cb{};
+    cb.context = &acct;
     cb.send_offer = onSendOffer;
     cb.send_answer = onSendAnswer;
     cb.send_ice = onSendIce;
@@ -546,12 +576,12 @@ Signal2sipCallbacks makeCallbacks() {
 
 // --- Incoming envelope handling ---
 
-void onPush(const std::string& verb, const std::string& path, const Bytes& body) {
+void onPush(AccountState& acct, const std::string& verb, const std::string& path, const Bytes& body) {
     if (verb != "PUT" || path != "/api/v1/message" || body.empty()) return;
 
     signalservice::Envelope envelope;
     if (!envelope.ParseFromArray(body.data(), static_cast<int>(body.size()))) {
-        std::cerr << "[daemon] failed to parse pushed Envelope\n";
+        std::cerr << "[daemon][" << acct.config.name << "] failed to parse pushed Envelope\n";
         return;
     }
 
@@ -570,11 +600,11 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
         // on the websocket read thread, which can otherwise race an
         // outgoing send's session-store mutation on RingRTC's callback
         // thread (see ProtocolStores::mutex()).
-        std::lock_guard<std::mutex> lock(g_state.stores->mutex());
+        std::lock_guard<std::mutex> lock(acct.stores->mutex());
         if (envelope.type() == signalservice::Envelope_Type_UNIDENTIFIED_SENDER) {
             Bytes ciphertext(envelope.content().begin(), envelope.content().end());
             SealedSenderResult result =
-                decryptSealedSender(*g_state.stores, Address{g_state.localServiceId, static_cast<uint32_t>(g_state.account.device_id)},
+                decryptSealedSender(*acct.stores, Address{acct.localServiceId, static_cast<uint32_t>(acct.account.device_id)},
                                     ciphertext, envelope.servertimestamp());
             plaintext = result.plaintext;
             senderServiceId = result.senderServiceId;
@@ -588,15 +618,15 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
                                         ? SignalCiphertextMessageTypePreKey
                                         : SignalCiphertextMessageTypeWhisper;
             originalCiphertext.assign(envelope.content().begin(), envelope.content().end());
-            plaintext = decryptCiphertext(*g_state.stores,
-                                          Address{g_state.localServiceId, static_cast<uint32_t>(g_state.account.device_id)},
+            plaintext = decryptCiphertext(*acct.stores,
+                                          Address{acct.localServiceId, static_cast<uint32_t>(acct.account.device_id)},
                                           Address{senderServiceId, senderDeviceId}, originalMessageType,
                                           originalCiphertext);
         } else {
             return; // receipt/other envelope type - nothing to decrypt
         }
     } catch (const std::exception& e) {
-        std::cerr << "[daemon] failed to decrypt envelope: " << e.what() << "\n";
+        std::cerr << "[daemon][" << acct.config.name << "] failed to decrypt envelope: " << e.what() << "\n";
         // Real Signal Protocol recovery: tell the sender so its own
         // client can detect the desync and fall back to a fresh PreKey
         // handshake, instead of this failing silently forever every time
@@ -611,30 +641,32 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
             // sendDecryptionErrorReply() manages its own (narrow, never
             // held across network I/O) locking internally - see its
             // definition - so no lock is taken here.
-            g_dispatchQueue.push([senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
-                                  clientTimestamp = envelope.clienttimestamp()] {
-                sendDecryptionErrorReply(*g_state.socket, *g_state.stores, *g_state.sender, g_state.localServiceId,
-                                         static_cast<uint32_t>(g_state.account.device_id), senderServiceId,
+            acct.dispatchQueue.push([&acct, senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
+                                     clientTimestamp = envelope.clienttimestamp()] {
+                sendDecryptionErrorReply(*acct.socket, *acct.stores, *acct.sender, acct.localServiceId,
+                                         static_cast<uint32_t>(acct.account.device_id), senderServiceId,
                                          senderDeviceId, originalCiphertext, originalMessageType, clientTimestamp);
             });
         }
         return;
     }
 
-    std::cout << "[daemon][diag] decrypted envelope from " << senderServiceId << " device " << senderDeviceId
-               << " (" << plaintext.size() << " bytes plaintext)\n";
+    std::cout << "[daemon][" << acct.config.name << "][diag] decrypted envelope from " << senderServiceId
+               << " device " << senderDeviceId << " (" << plaintext.size() << " bytes plaintext)\n";
 
     signalservice::Content content;
     if (!content.ParseFromArray(plaintext.data(), static_cast<int>(plaintext.size()))) {
-        std::cerr << "[daemon] failed to parse decrypted Content\n";
+        std::cerr << "[daemon][" << acct.config.name << "] failed to parse decrypted Content\n";
         return;
     }
     if (content.has_datamessage()) {
-        std::cout << "[daemon][diag] DataMessage body: " << content.datamessage().body() << "\n";
+        std::cout << "[daemon][" << acct.config.name << "][diag] DataMessage body: " << content.datamessage().body()
+                   << "\n";
     }
     if (!content.has_callmessage()) return;
 
-    std::cout << "[daemon] CallMessage from " << senderServiceId << " device " << senderDeviceId << "\n";
+    std::cout << "[daemon][" << acct.config.name << "] CallMessage from " << senderServiceId << " device "
+               << senderDeviceId << "\n";
 
     // Must not call handleCallMessage() directly on this thread: it's
     // AuthSocket's single serviceThread (the one running lws_service()),
@@ -651,10 +683,9 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
     // thread free to keep servicing the socket, while still processing
     // envelopes in arrival order and giving shutdown something to join.
     signalservice::CallMessage callMessage = content.callmessage();
-    uint32_t localDeviceId = static_cast<uint32_t>(g_state.account.device_id);
-    g_dispatchQueue.push([senderServiceId, senderDeviceId, localDeviceId, callMessage] {
-        handleCallMessage(g_state.handle, *g_state.stores, senderServiceId, senderDeviceId, localDeviceId,
-                          callMessage);
+    uint32_t localDeviceId = static_cast<uint32_t>(acct.account.device_id);
+    acct.dispatchQueue.push([&acct, senderServiceId, senderDeviceId, localDeviceId, callMessage] {
+        handleCallMessage(acct.handle, *acct.stores, senderServiceId, senderDeviceId, localDeviceId, callMessage);
     });
 }
 
@@ -677,78 +708,41 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, onSignal);
 
     std::string configPath = resolveConfigPath(argc, argv);
-    Config config;
+    DaemonConfig config;
     try {
-        config = Config::load(configPath);
+        config = DaemonConfig::load(configPath);
     } catch (const std::exception& e) {
         std::cerr << "[daemon] config error: " << e.what() << "\n";
         return 1;
     }
-    std::cout << "[daemon] loaded config from " << configPath << " for " << config.e164 << "\n";
+    std::cout << "[daemon] loaded config from " << configPath << " for " << config.accounts.size()
+               << " account(s)\n";
 
-    std::string dbPath = config.accountDataDir + "/" + config.e164 + ".db";
-    Storage storage(dbPath, config.dbKey);
-    if (!storage.hasAccount()) {
-        try {
-            migrateFromNodePrototype(storage, config.e164);
-        } catch (const std::exception& e) {
-            std::cerr << "[daemon] no account in storage and migration failed: " << e.what() << "\n";
-            return 1;
-        }
-    }
+    signal2sip_init_logging(); // process-wide, once, regardless of account count
 
-    AccountRecord account = storage.loadAccount();
-    ProtocolStores stores(storage, "aci");
-
-    g_state.config = config;
-    g_state.storage = &storage;
-    g_state.stores = &stores;
-    g_state.account = account;
-    g_state.localServiceId = account.aci;
-
-    signal2sip_init_logging();
-    g_state.handle = signal2sip_call_manager_create(makeCallbacks());
-    if (!g_state.handle) {
-        std::cerr << "[daemon] FAIL: could not create RingRTC call manager\n";
-        return 1;
-    }
-
-    std::string username = account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
-    AuthSocket socket(username, account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
-                      onPush);
-    g_state.socket = &socket;
-    CallMessageSender sender(socket, stores, account.aci, static_cast<uint32_t>(account.device_id));
-    g_state.sender = &sender;
-
-    // Must be running before connect() - onPush() can start pushing work
-    // onto it as soon as the socket is live.
-    g_dispatchQueue.start();
-
-    socket.connect();
-    std::cout << "[daemon] connected to chat.signal.org as " << account.e164 << "\n";
-
-    refreshPrekeys(storage, socket, account);
-
-    // --- PJSIP setup, once at startup - registers immediately so a
-    // bridge call can be placed the moment an incoming Signal call needs
-    // one. setNullDev() matches pjsip_ringrtc_echo_test.cpp's proven
-    // config; ptime/clockRate/forced-L16-mono-codec matches
-    // tg2sip-webrtc's sip.cpp (settings.raw_pcm()) exactly - same
-    // rationale: RingRtcSipBridge's ring-buffer ports are fixed
-    // 48kHz mono, so negotiating raw L16/48000/1 directly (instead of
-    // letting PJSIP/Asterisk pick from the full default codec list -
-    // narrowband PCMU needed a real resample_port conversion, and even
-    // wideband Opus is lossy-compressed and offered as stereo/2ch,
-    // a channel-count mismatch against these mono ports) removes every
+    // --- Shared PJSIP Endpoint, once, only if at least one account uses
+    // [sip.<name>] - see g_ep's own doc comment for why this is the one
+    // thing that stays a process-wide singleton instead of per-account.
+    // setNullDev() matches pjsip_ringrtc_echo_test.cpp's proven config;
+    // ptime/clockRate/forced-L16-mono-codec matches tg2sip-webrtc's
+    // sip.cpp (settings.raw_pcm()) exactly - same rationale:
+    // RingRtcSipBridge's ring-buffer ports are fixed 48kHz mono, so
+    // negotiating raw L16/48000/1 directly (instead of letting
+    // PJSIP/Asterisk pick from the full default codec list - narrowband
+    // PCMU needed a real resample_port conversion, and even wideband
+    // Opus is lossy-compressed and offered as stereo/2ch, a
+    // channel-count mismatch against these mono ports) removes every
     // remaining source of rate/channel mismatch and codec-level
     // encode/decode CPU overhead in the whole audio path. Found live:
     // real degraded audio quality (described as sounding slowed-down)
     // over PCMU with the resample_port conversion in place.
-    pj::Endpoint ep;
-    BridgeAccount sipAccount;
-    if (!config.sipHost.empty()) {
+    bool anySip = std::any_of(config.accounts.begin(), config.accounts.end(),
+                               [](const AccountConfig& a) { return a.hasSip(); });
+    std::unique_ptr<pj::Endpoint> ep;
+    if (anySip) {
+        ep = std::make_unique<pj::Endpoint>();
         try {
-            ep.libCreate();
+            ep->libCreate();
             pj::EpConfig epConfig;
             epConfig.medConfig.ecTailLen = 0;
             epConfig.medConfig.noVad = true;
@@ -757,77 +751,175 @@ int main(int argc, char** argv) {
             epConfig.medConfig.audioFramePtime = 10;
             epConfig.medConfig.ptime = 10;
             epConfig.medConfig.clockRate = 48000;
-            ep.libInit(epConfig);
-            ep.audDevManager().setNullDev();
+            ep->libInit(epConfig);
+            ep->audDevManager().setNullDev();
 
             // Force L16/48000/1 (raw PCM, mono) as the only codec PJSIP
             // will ever offer/accept, matching RingRtcSipBridge's fixed
             // format exactly - same technique as tg2sip-webrtc's
             // ep.codecSetPriority() loop.
-            for (const auto* codec : ep.codecEnum()) {
-                ep.codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
+            for (const auto* codec : ep->codecEnum()) {
+                ep->codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
             }
 
+            // One shared transport for every account (see g_ep's doc
+            // comment) - bound to the first sip-enabled account's port;
+            // every account's [sip.<name>] port= is otherwise unused now
+            // (kept in AccountConfig for possible future per-account
+            // transport isolation, not needed for this milestone).
+            auto firstSip = std::find_if(config.accounts.begin(), config.accounts.end(),
+                                          [](const AccountConfig& a) { return a.hasSip(); });
             pj::TransportConfig tcfg;
-            tcfg.port = config.sipPort;
-            ep.transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
-            ep.libStart();
-
-            pj::AccountConfig acfg;
-            acfg.idUri = "sip:" + config.sipExtension + "@" + config.sipHost;
-            acfg.regConfig.registrarUri = "sip:" + config.sipHost;
-            pj::AuthCredInfo cred("digest", "*", config.sipExtension, 0, config.sipPassword);
-            acfg.sipConfig.authCreds.push_back(cred);
-            sipAccount.create(acfg);
-            g_sipAccount = &sipAccount;
-            g_state.ep = &ep;
-
-            std::cout << "[daemon] waiting for SIP registration...\n";
-            for (int i = 0; i < 100 && !sipAccount.registered.load(); i++) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            if (sipAccount.registered.load()) {
-                std::cout << "[daemon] SIP registered as " << config.sipExtension << "@" << config.sipHost << "\n";
-            } else {
-                std::cerr << "[daemon] SIP registration did not complete in time\n";
-            }
+            tcfg.port = firstSip->sipPort;
+            ep->transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
+            ep->libStart();
+            g_ep = ep.get();
         } catch (pj::Error& err) {
-            std::cerr << "[daemon] SIP setup failed: " << err.info() << "\n";
+            std::cerr << "[daemon] SIP Endpoint setup failed: " << err.info() << "\n";
+            ep.reset();
+            g_ep = nullptr;
         }
     }
 
-    if (!config.outgoingCallTarget.empty()) {
-        std::cout << "[daemon] placing outgoing call to " << config.outgoingCallTarget << "\n";
-        uint64_t callId = signal2sip_call_start_outgoing(g_state.handle, config.outgoingCallTarget.c_str(),
-                                                          static_cast<uint32_t>(account.device_id));
-        if (callId == 0) {
-            std::cerr << "[daemon] FAIL: signal2sip_call_start_outgoing failed\n";
+    // --- Per-account setup: Signal (storage/protocol stores/websocket/
+    // RingRTC call manager) always, PJSIP registration only if this
+    // account has [sip.<name>] and the shared Endpoint came up. Wrapped
+    // in try/catch per account so one account's bad config/network
+    // failure doesn't take down every other account sharing this
+    // process - a real improvement over the old one-process-per-account
+    // design, where an equivalent failure simply crashed that one
+    // process and nothing else was ever affected.
+    for (const AccountConfig& accountConfig : config.accounts) {
+        try {
+            AccountState& acct = *(g_accounts[accountConfig.name] = std::make_unique<AccountState>());
+            acct.config = accountConfig;
+
+            std::string dbPath = accountConfig.accountDataDir + "/" + accountConfig.e164 + ".db";
+            acct.storage = std::make_unique<Storage>(dbPath, accountConfig.dbKey);
+            if (!acct.storage->hasAccount()) {
+                migrateFromNodePrototype(*acct.storage, accountConfig.e164);
+            }
+
+            acct.account = acct.storage->loadAccount();
+            acct.stores = std::make_unique<ProtocolStores>(*acct.storage, "aci");
+            acct.localServiceId = acct.account.aci;
+            std::cout << "[daemon][" << accountConfig.name << "] own ACI: " << acct.localServiceId << "\n";
+
+            acct.handle = signal2sip_call_manager_create(makeCallbacks(acct));
+            if (!acct.handle) {
+                throw std::runtime_error("could not create RingRTC call manager");
+            }
+
+            std::string username = acct.account.device_id == 1
+                                        ? acct.account.aci
+                                        : (acct.account.aci + "." + std::to_string(acct.account.device_id));
+            acct.socket = std::make_unique<AuthSocket>(
+                username, acct.account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+                [&acct](const std::string& verb, const std::string& path, const Bytes& body) {
+                    onPush(acct, verb, path, body);
+                });
+            acct.sender = std::make_unique<CallMessageSender>(*acct.socket, *acct.stores, acct.account.aci,
+                                                               static_cast<uint32_t>(acct.account.device_id));
+
+            // Must be running before connect() - onPush() can start
+            // pushing work onto it as soon as the socket is live.
+            acct.dispatchQueue.start();
+
+            acct.socket->connect();
+            std::cout << "[daemon][" << accountConfig.name << "] connected to chat.signal.org as "
+                       << acct.account.e164 << "\n";
+
+            refreshPrekeys(*acct.storage, *acct.socket, acct.account);
+
+            if (accountConfig.hasSip() && g_ep) {
+                auto sipAccount = std::make_unique<BridgeAccount>();
+                pj::AccountConfig acfg;
+                acfg.idUri = "sip:" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
+                acfg.regConfig.registrarUri = "sip:" + accountConfig.sipHost;
+                pj::AuthCredInfo cred("digest", "*", accountConfig.sipExtension, 0, accountConfig.sipPassword);
+                acfg.sipConfig.authCreds.push_back(cred);
+                sipAccount->create(acfg);
+
+                std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
+                for (int i = 0; i < 100 && !sipAccount->registered.load(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (sipAccount->registered.load()) {
+                    std::cout << "[daemon][" << accountConfig.name << "] SIP registered as "
+                               << accountConfig.sipExtension << "@" << accountConfig.sipHost << "\n";
+                } else {
+                    std::cerr << "[daemon][" << accountConfig.name << "] SIP registration did not complete in time\n";
+                }
+                g_sipAccounts[accountConfig.name] = std::move(sipAccount);
+            }
+
+            if (!accountConfig.outgoingCallTarget.empty()) {
+                std::cout << "[daemon][" << accountConfig.name << "] placing outgoing call to "
+                           << accountConfig.outgoingCallTarget << "\n";
+                uint64_t callId = signal2sip_call_start_outgoing(acct.handle, accountConfig.outgoingCallTarget.c_str(),
+                                                                  static_cast<uint32_t>(acct.account.device_id));
+                if (callId == 0) {
+                    std::cerr << "[daemon][" << accountConfig.name << "] FAIL: signal2sip_call_start_outgoing failed\n";
+                }
+            } else {
+                std::cout << "[daemon][" << accountConfig.name << "] waiting for incoming calls\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[daemon][" << accountConfig.name << "] account setup failed: " << e.what()
+                       << " - skipping this account, continuing with the rest\n";
+            // If the failure happened after dispatchQueue.start() (e.g.
+            // socket->connect() or SIP registration throwing), its worker
+            // thread is still running - erasing the map entry directly
+            // would destroy a joinable std::thread and call
+            // std::terminate() instead of unwinding cleanly.
+            // stopAndJoin() is always safe to call even if start() was
+            // never reached (EnvelopeDispatchQueue::stopAndJoin() no-ops
+            // on a non-joinable thread).
+            if (auto it = g_accounts.find(accountConfig.name); it != g_accounts.end()) {
+                it->second->dispatchQueue.stopAndJoin();
+                // Same reasoning: if signal2sip_call_manager_create()
+                // already succeeded before the failure, its handle would
+                // otherwise leak (own threads, WebRTC PeerConnectionFactory,
+                // raw-PCM ADM) since it never reaches the normal shutdown
+                // loop below.
+                if (it->second->handle) {
+                    signal2sip_call_manager_destroy(it->second->handle);
+                }
+                if (it->second->socket) {
+                    it->second->socket->close();
+                }
+            }
+            g_accounts.erase(accountConfig.name);
         }
-    } else {
-        std::cout << "[daemon] waiting for incoming calls\n";
+    }
+
+    if (g_accounts.empty()) {
+        std::cerr << "[daemon] no account came up successfully, exiting\n";
+        return 1;
     }
 
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (!g_state.config.outgoingCallTarget.empty() && g_probeCompleted.load()) {
-            // This instance's only job was the outgoing test-probe call,
-            // and runProbe() already measured its result and hung up.
-            break;
-        }
     }
 
-    stopSipBridge();
-
-    // Must happen before anything below: queued work (handleCallMessage/
-    // sendDecryptionErrorReply) dereferences g_state.handle/stores/socket,
-    // and those are about to be destroyed. stopAndJoin() blocks until the
-    // worker thread finishes whatever it's currently running (bounded by
+    // Shutdown, per account: stop any active SIP bridge, then drain and
+    // join that account's dispatch queue (queued work dereferences
+    // acct.handle/stores/socket, so this must happen before any of those
+    // are destroyed - stopAndJoin() blocks until the worker thread
+    // finishes whatever it's currently running, bounded by
     // AuthSocket::request()'s own ~30s timeout in the worst case, if a
-    // network call is in flight) - a bounded shutdown delay is a fine
-    // trade for not risking a use-after-free.
-    g_dispatchQueue.stopAndJoin();
-
-    signal2sip_call_manager_destroy(g_state.handle);
-    socket.close();
+    // network call is in flight - a bounded shutdown delay is a fine
+    // trade for not risking a use-after-free), then tear down RingRTC and
+    // the websocket. unique_ptr members (storage/stores/socket/sender)
+    // clean themselves up once the AccountState itself is erased below.
+    for (auto& [name, acctPtr] : g_accounts) {
+        AccountState& acct = *acctPtr;
+        stopSipBridge(acct);
+        acct.dispatchQueue.stopAndJoin();
+        signal2sip_call_manager_destroy(acct.handle);
+        acct.socket->close();
+    }
+    g_sipAccounts.clear();
+    g_accounts.clear();
     return 0;
 }
