@@ -40,6 +40,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -421,8 +422,11 @@ public:
 // single UDP transport on it is shared by every account's pj::Account,
 // exactly like a real SIP softphone handling several registered lines
 // over one local port; PJSIP natively supports N accounts per Endpoint,
-// no separate transport-per-account needed. Set once in main(), read
-// (never written) from startSipBridge()'s libRegisterThread() call.
+// no separate transport-per-account needed. Created lazily (see
+// ensureSharedEndpoint()) the first time any account needs it - either at
+// startup or via a later SIGHUP reload - and never destroyed until
+// process exit. Read (never written after creation) from
+// startSipBridge()'s libRegisterThread() call.
 pj::Endpoint* g_ep = nullptr;
 std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
 
@@ -692,6 +696,227 @@ void onPush(AccountState& acct, const std::string& verb, const std::string& path
 std::atomic<bool> g_running{true};
 void onSignal(int) { g_running = false; }
 
+// SIGHUP: standard unix "reload config" convention (nginx/postfix etc.) -
+// simplest possible trigger, no new control socket/protocol needed. Just
+// sets a flag; the actual reload happens on the main thread's own loop
+// (reloadConfig() below), never inside the signal handler itself.
+std::atomic<bool> g_reloadRequested{false};
+void onReloadSignal(int) { g_reloadRequested = true; }
+
+std::string g_configPath; // set once in main(), read by reloadConfig()
+
+// Creates the shared Endpoint the first time any account needs it - either
+// during main()'s startup loop, or later via a SIGHUP reload adding the
+// first-ever SIP-enabled account to a daemon that started with none.
+// `epStorage` is function-static (not a main()-local variable) specifically
+// so it survives past the point where main()'s own startup code has
+// finished running, in case this is called again later from reloadConfig().
+void ensureSharedEndpoint(unsigned port) {
+    if (g_ep) return; // already created
+
+    static std::unique_ptr<pj::Endpoint> epStorage;
+    epStorage = std::make_unique<pj::Endpoint>();
+    try {
+        epStorage->libCreate();
+        pj::EpConfig epConfig;
+        epConfig.medConfig.ecTailLen = 0;
+        epConfig.medConfig.noVad = true;
+        // 10ms ptime required to keep an uncompressed L16 RTP packet
+        // below the MTU (tg2sip-webrtc/tg2sip/sip.cpp's own comment).
+        epConfig.medConfig.audioFramePtime = 10;
+        epConfig.medConfig.ptime = 10;
+        epConfig.medConfig.clockRate = 48000;
+        epStorage->libInit(epConfig);
+        epStorage->audDevManager().setNullDev();
+
+        // Force L16/48000/1 (raw PCM, mono) as the only codec PJSIP will
+        // ever offer/accept, matching RingRtcSipBridge's fixed format
+        // exactly - same technique as tg2sip-webrtc's ep.codecSetPriority()
+        // loop.
+        for (const auto* codec : epStorage->codecEnum()) {
+            epStorage->codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
+        }
+
+        pj::TransportConfig tcfg;
+        tcfg.port = port;
+        epStorage->transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
+        epStorage->libStart();
+        g_ep = epStorage.get();
+    } catch (pj::Error& err) {
+        std::cerr << "[daemon] SIP Endpoint setup failed: " << err.info() << "\n";
+        epStorage.reset();
+        g_ep = nullptr;
+    }
+}
+
+// Brings up one account: Signal (storage/protocol stores/websocket/RingRTC
+// call manager) always, PJSIP registration only if this account has
+// [sip.<name>]. Reusable by both main()'s startup loop and reloadConfig()
+// - wrapped in its own try/catch so one account's bad config/network
+// failure never affects any other account sharing this process. Returns
+// false (and leaves no trace in g_accounts) on failure.
+bool setupAccount(const AccountConfig& accountConfig) {
+    try {
+        AccountState& acct = *(g_accounts[accountConfig.name] = std::make_unique<AccountState>());
+        acct.config = accountConfig;
+
+        std::string dbPath = accountConfig.accountDataDir + "/" + accountConfig.e164 + ".db";
+        acct.storage = std::make_unique<Storage>(dbPath, accountConfig.dbKey);
+        if (!acct.storage->hasAccount()) {
+            migrateFromNodePrototype(*acct.storage, accountConfig.e164);
+        }
+
+        acct.account = acct.storage->loadAccount();
+        acct.stores = std::make_unique<ProtocolStores>(*acct.storage, "aci");
+        acct.localServiceId = acct.account.aci;
+        std::cout << "[daemon][" << accountConfig.name << "] own ACI: " << acct.localServiceId << "\n";
+
+        acct.handle = signal2sip_call_manager_create(makeCallbacks(acct));
+        if (!acct.handle) {
+            throw std::runtime_error("could not create RingRTC call manager");
+        }
+
+        std::string username = acct.account.device_id == 1
+                                    ? acct.account.aci
+                                    : (acct.account.aci + "." + std::to_string(acct.account.device_id));
+        acct.socket = std::make_unique<AuthSocket>(
+            username, acct.account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+            [&acct](const std::string& verb, const std::string& path, const Bytes& body) {
+                onPush(acct, verb, path, body);
+            });
+        acct.sender = std::make_unique<CallMessageSender>(*acct.socket, *acct.stores, acct.account.aci,
+                                                           static_cast<uint32_t>(acct.account.device_id));
+
+        // Must be running before connect() - onPush() can start pushing
+        // work onto it as soon as the socket is live.
+        acct.dispatchQueue.start();
+
+        acct.socket->connect();
+        std::cout << "[daemon][" << accountConfig.name << "] connected to chat.signal.org as "
+                   << acct.account.e164 << "\n";
+
+        refreshPrekeys(*acct.storage, *acct.socket, acct.account);
+
+        if (accountConfig.hasSip()) {
+            ensureSharedEndpoint(accountConfig.sipPort); // no-ops if g_ep already exists
+            if (g_ep) {
+                auto sipAccount = std::make_unique<BridgeAccount>();
+                pj::AccountConfig acfg;
+                acfg.idUri = "sip:" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
+                acfg.regConfig.registrarUri = "sip:" + accountConfig.sipHost;
+                pj::AuthCredInfo cred("digest", "*", accountConfig.sipExtension, 0, accountConfig.sipPassword);
+                acfg.sipConfig.authCreds.push_back(cred);
+                sipAccount->create(acfg);
+
+                std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
+                for (int i = 0; i < 100 && !sipAccount->registered.load(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (sipAccount->registered.load()) {
+                    std::cout << "[daemon][" << accountConfig.name << "] SIP registered as "
+                               << accountConfig.sipExtension << "@" << accountConfig.sipHost << "\n";
+                } else {
+                    std::cerr << "[daemon][" << accountConfig.name << "] SIP registration did not complete in time\n";
+                }
+                g_sipAccounts[accountConfig.name] = std::move(sipAccount);
+            }
+        }
+
+        if (!accountConfig.outgoingCallTarget.empty()) {
+            std::cout << "[daemon][" << accountConfig.name << "] placing outgoing call to "
+                       << accountConfig.outgoingCallTarget << "\n";
+            uint64_t callId = signal2sip_call_start_outgoing(acct.handle, accountConfig.outgoingCallTarget.c_str(),
+                                                              static_cast<uint32_t>(acct.account.device_id));
+            if (callId == 0) {
+                std::cerr << "[daemon][" << accountConfig.name << "] FAIL: signal2sip_call_start_outgoing failed\n";
+            }
+        } else {
+            std::cout << "[daemon][" << accountConfig.name << "] waiting for incoming calls\n";
+        }
+        return true;
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon][" << accountConfig.name << "] account setup failed: " << e.what()
+                   << " - skipping this account, continuing with the rest\n";
+        // If the failure happened after dispatchQueue.start() (e.g.
+        // socket->connect() or SIP registration throwing), its worker
+        // thread is still running - erasing the map entry directly would
+        // destroy a joinable std::thread and call std::terminate() instead
+        // of unwinding cleanly. stopAndJoin() is always safe to call even
+        // if start() was never reached (EnvelopeDispatchQueue::stopAndJoin()
+        // no-ops on a non-joinable thread).
+        if (auto it = g_accounts.find(accountConfig.name); it != g_accounts.end()) {
+            it->second->dispatchQueue.stopAndJoin();
+            // Same reasoning: if signal2sip_call_manager_create() already
+            // succeeded before the failure, its handle would otherwise
+            // leak (own threads, WebRTC PeerConnectionFactory, raw-PCM
+            // ADM) since it never reaches the normal shutdown path below.
+            if (it->second->handle) {
+                signal2sip_call_manager_destroy(it->second->handle);
+            }
+            if (it->second->socket) {
+                it->second->socket->close();
+            }
+        }
+        g_accounts.erase(accountConfig.name);
+        return false;
+    }
+}
+
+// Tears down one account: stop any active SIP bridge, drain and join its
+// dispatch queue (queued work dereferences acct.handle/stores/socket, so
+// this must happen before any of those are destroyed), then tear down
+// RingRTC and the websocket. Reusable by both final shutdown and
+// reloadConfig(). No-ops if `name` isn't currently running.
+void teardownAccount(const std::string& name) {
+    auto it = g_accounts.find(name);
+    if (it == g_accounts.end()) return;
+    AccountState& acct = *it->second;
+    stopSipBridge(acct);
+    acct.dispatchQueue.stopAndJoin();
+    signal2sip_call_manager_destroy(acct.handle);
+    acct.socket->close();
+    g_sipAccounts.erase(name);
+    g_accounts.erase(it);
+}
+
+// SIGHUP handler's actual work, run from the main loop (never from the
+// signal handler itself). Diffs the freshly-reread config against
+// g_accounts: accounts no longer present get torn down, accounts not yet
+// present get set up. Accounts present in both are left running untouched
+// - changing an existing account's settings (e.g. a new SIP password) is
+// not supported by a reload; that would need this account removed from
+// the config, reloaded, then re-added in a second reload.
+void reloadConfig(const std::string& configPath) {
+    DaemonConfig newConfig;
+    try {
+        newConfig = DaemonConfig::load(configPath);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon] reload: config error: " << e.what() << " - keeping the previous config running\n";
+        return;
+    }
+
+    std::set<std::string> newNames;
+    for (const auto& accountConfig : newConfig.accounts) newNames.insert(accountConfig.name);
+
+    for (auto it = g_accounts.begin(); it != g_accounts.end(); ) {
+        if (!newNames.count(it->first)) {
+            std::cout << "[daemon] reload: removing account " << it->first << "\n";
+            std::string name = it->first;
+            ++it; // teardownAccount() erases g_accounts[name] itself
+            teardownAccount(name);
+        } else {
+            ++it;
+        }
+    }
+
+    for (const auto& accountConfig : newConfig.accounts) {
+        if (!g_accounts.count(accountConfig.name)) {
+            std::cout << "[daemon] reload: adding account " << accountConfig.name << "\n";
+            setupAccount(accountConfig);
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -706,16 +931,20 @@ int main(int argc, char** argv) {
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
+    // Reload config (add/remove accounts) without restarting - see
+    // reloadConfig()'s own doc comment above for exactly what it does and
+    // does not support.
+    std::signal(SIGHUP, onReloadSignal);
 
-    std::string configPath = resolveConfigPath(argc, argv);
+    g_configPath = resolveConfigPath(argc, argv);
     DaemonConfig config;
     try {
-        config = DaemonConfig::load(configPath);
+        config = DaemonConfig::load(g_configPath);
     } catch (const std::exception& e) {
         std::cerr << "[daemon] config error: " << e.what() << "\n";
         return 1;
     }
-    std::cout << "[daemon] loaded config from " << configPath << " for " << config.accounts.size()
+    std::cout << "[daemon] loaded config from " << g_configPath << " for " << config.accounts.size()
                << " account(s)\n";
 
     signal2sip_init_logging(); // process-wide, once, regardless of account count
@@ -738,159 +967,20 @@ int main(int argc, char** argv) {
     // over PCMU with the resample_port conversion in place.
     bool anySip = std::any_of(config.accounts.begin(), config.accounts.end(),
                                [](const AccountConfig& a) { return a.hasSip(); });
-    std::unique_ptr<pj::Endpoint> ep;
     if (anySip) {
-        ep = std::make_unique<pj::Endpoint>();
-        try {
-            ep->libCreate();
-            pj::EpConfig epConfig;
-            epConfig.medConfig.ecTailLen = 0;
-            epConfig.medConfig.noVad = true;
-            // 10ms ptime required to keep an uncompressed L16 RTP packet
-            // below the MTU (tg2sip-webrtc/tg2sip/sip.cpp's own comment).
-            epConfig.medConfig.audioFramePtime = 10;
-            epConfig.medConfig.ptime = 10;
-            epConfig.medConfig.clockRate = 48000;
-            ep->libInit(epConfig);
-            ep->audDevManager().setNullDev();
-
-            // Force L16/48000/1 (raw PCM, mono) as the only codec PJSIP
-            // will ever offer/accept, matching RingRtcSipBridge's fixed
-            // format exactly - same technique as tg2sip-webrtc's
-            // ep.codecSetPriority() loop.
-            for (const auto* codec : ep->codecEnum()) {
-                ep->codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
-            }
-
-            // One shared transport for every account (see g_ep's doc
-            // comment) - bound to the first sip-enabled account's port;
-            // every account's [sip.<name>] port= is otherwise unused now
-            // (kept in AccountConfig for possible future per-account
-            // transport isolation, not needed for this milestone).
-            auto firstSip = std::find_if(config.accounts.begin(), config.accounts.end(),
-                                          [](const AccountConfig& a) { return a.hasSip(); });
-            pj::TransportConfig tcfg;
-            tcfg.port = firstSip->sipPort;
-            ep->transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
-            ep->libStart();
-            g_ep = ep.get();
-        } catch (pj::Error& err) {
-            std::cerr << "[daemon] SIP Endpoint setup failed: " << err.info() << "\n";
-            ep.reset();
-            g_ep = nullptr;
-        }
+        // One shared transport for every account (see g_ep's doc comment)
+        // - bound to the first sip-enabled account's port; every other
+        // account's [sip.<name>] port= is otherwise unused now (kept in
+        // AccountConfig for possible future per-account transport
+        // isolation, not needed for this milestone).
+        auto firstSip = std::find_if(config.accounts.begin(), config.accounts.end(),
+                                      [](const AccountConfig& a) { return a.hasSip(); });
+        ensureSharedEndpoint(firstSip->sipPort);
     }
 
-    // --- Per-account setup: Signal (storage/protocol stores/websocket/
-    // RingRTC call manager) always, PJSIP registration only if this
-    // account has [sip.<name>] and the shared Endpoint came up. Wrapped
-    // in try/catch per account so one account's bad config/network
-    // failure doesn't take down every other account sharing this
-    // process - a real improvement over the old one-process-per-account
-    // design, where an equivalent failure simply crashed that one
-    // process and nothing else was ever affected.
+    // --- Per-account setup (see setupAccount()'s own doc comment).
     for (const AccountConfig& accountConfig : config.accounts) {
-        try {
-            AccountState& acct = *(g_accounts[accountConfig.name] = std::make_unique<AccountState>());
-            acct.config = accountConfig;
-
-            std::string dbPath = accountConfig.accountDataDir + "/" + accountConfig.e164 + ".db";
-            acct.storage = std::make_unique<Storage>(dbPath, accountConfig.dbKey);
-            if (!acct.storage->hasAccount()) {
-                migrateFromNodePrototype(*acct.storage, accountConfig.e164);
-            }
-
-            acct.account = acct.storage->loadAccount();
-            acct.stores = std::make_unique<ProtocolStores>(*acct.storage, "aci");
-            acct.localServiceId = acct.account.aci;
-            std::cout << "[daemon][" << accountConfig.name << "] own ACI: " << acct.localServiceId << "\n";
-
-            acct.handle = signal2sip_call_manager_create(makeCallbacks(acct));
-            if (!acct.handle) {
-                throw std::runtime_error("could not create RingRTC call manager");
-            }
-
-            std::string username = acct.account.device_id == 1
-                                        ? acct.account.aci
-                                        : (acct.account.aci + "." + std::to_string(acct.account.device_id));
-            acct.socket = std::make_unique<AuthSocket>(
-                username, acct.account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
-                [&acct](const std::string& verb, const std::string& path, const Bytes& body) {
-                    onPush(acct, verb, path, body);
-                });
-            acct.sender = std::make_unique<CallMessageSender>(*acct.socket, *acct.stores, acct.account.aci,
-                                                               static_cast<uint32_t>(acct.account.device_id));
-
-            // Must be running before connect() - onPush() can start
-            // pushing work onto it as soon as the socket is live.
-            acct.dispatchQueue.start();
-
-            acct.socket->connect();
-            std::cout << "[daemon][" << accountConfig.name << "] connected to chat.signal.org as "
-                       << acct.account.e164 << "\n";
-
-            refreshPrekeys(*acct.storage, *acct.socket, acct.account);
-
-            if (accountConfig.hasSip() && g_ep) {
-                auto sipAccount = std::make_unique<BridgeAccount>();
-                pj::AccountConfig acfg;
-                acfg.idUri = "sip:" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
-                acfg.regConfig.registrarUri = "sip:" + accountConfig.sipHost;
-                pj::AuthCredInfo cred("digest", "*", accountConfig.sipExtension, 0, accountConfig.sipPassword);
-                acfg.sipConfig.authCreds.push_back(cred);
-                sipAccount->create(acfg);
-
-                std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
-                for (int i = 0; i < 100 && !sipAccount->registered.load(); i++) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-                if (sipAccount->registered.load()) {
-                    std::cout << "[daemon][" << accountConfig.name << "] SIP registered as "
-                               << accountConfig.sipExtension << "@" << accountConfig.sipHost << "\n";
-                } else {
-                    std::cerr << "[daemon][" << accountConfig.name << "] SIP registration did not complete in time\n";
-                }
-                g_sipAccounts[accountConfig.name] = std::move(sipAccount);
-            }
-
-            if (!accountConfig.outgoingCallTarget.empty()) {
-                std::cout << "[daemon][" << accountConfig.name << "] placing outgoing call to "
-                           << accountConfig.outgoingCallTarget << "\n";
-                uint64_t callId = signal2sip_call_start_outgoing(acct.handle, accountConfig.outgoingCallTarget.c_str(),
-                                                                  static_cast<uint32_t>(acct.account.device_id));
-                if (callId == 0) {
-                    std::cerr << "[daemon][" << accountConfig.name << "] FAIL: signal2sip_call_start_outgoing failed\n";
-                }
-            } else {
-                std::cout << "[daemon][" << accountConfig.name << "] waiting for incoming calls\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[daemon][" << accountConfig.name << "] account setup failed: " << e.what()
-                       << " - skipping this account, continuing with the rest\n";
-            // If the failure happened after dispatchQueue.start() (e.g.
-            // socket->connect() or SIP registration throwing), its worker
-            // thread is still running - erasing the map entry directly
-            // would destroy a joinable std::thread and call
-            // std::terminate() instead of unwinding cleanly.
-            // stopAndJoin() is always safe to call even if start() was
-            // never reached (EnvelopeDispatchQueue::stopAndJoin() no-ops
-            // on a non-joinable thread).
-            if (auto it = g_accounts.find(accountConfig.name); it != g_accounts.end()) {
-                it->second->dispatchQueue.stopAndJoin();
-                // Same reasoning: if signal2sip_call_manager_create()
-                // already succeeded before the failure, its handle would
-                // otherwise leak (own threads, WebRTC PeerConnectionFactory,
-                // raw-PCM ADM) since it never reaches the normal shutdown
-                // loop below.
-                if (it->second->handle) {
-                    signal2sip_call_manager_destroy(it->second->handle);
-                }
-                if (it->second->socket) {
-                    it->second->socket->close();
-                }
-            }
-            g_accounts.erase(accountConfig.name);
-        }
+        setupAccount(accountConfig);
     }
 
     if (g_accounts.empty()) {
@@ -899,27 +989,18 @@ int main(int argc, char** argv) {
     }
 
     while (g_running.load()) {
+        if (g_reloadRequested.exchange(false)) {
+            std::cout << "[daemon] SIGHUP received, reloading config from " << g_configPath << "\n";
+            reloadConfig(g_configPath);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // Shutdown, per account: stop any active SIP bridge, then drain and
-    // join that account's dispatch queue (queued work dereferences
-    // acct.handle/stores/socket, so this must happen before any of those
-    // are destroyed - stopAndJoin() blocks until the worker thread
-    // finishes whatever it's currently running, bounded by
-    // AuthSocket::request()'s own ~30s timeout in the worst case, if a
-    // network call is in flight - a bounded shutdown delay is a fine
-    // trade for not risking a use-after-free), then tear down RingRTC and
-    // the websocket. unique_ptr members (storage/stores/socket/sender)
-    // clean themselves up once the AccountState itself is erased below.
-    for (auto& [name, acctPtr] : g_accounts) {
-        AccountState& acct = *acctPtr;
-        stopSipBridge(acct);
-        acct.dispatchQueue.stopAndJoin();
-        signal2sip_call_manager_destroy(acct.handle);
-        acct.socket->close();
+    // Shutdown, per account (see teardownAccount()'s own doc comment).
+    // unique_ptr members (storage/stores/socket/sender) clean themselves
+    // up once each AccountState itself is erased.
+    while (!g_accounts.empty()) {
+        teardownAccount(g_accounts.begin()->first);
     }
-    g_sipAccounts.clear();
-    g_accounts.clear();
     return 0;
 }
