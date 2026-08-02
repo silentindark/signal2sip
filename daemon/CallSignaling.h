@@ -58,17 +58,24 @@ public:
                  uint32_t receiverDeviceId, const uint8_t* opaque, size_t opaqueLen);
     void sendHangup(const std::string& remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId);
 
-private:
     // Fetches+processes a prekey bundle for every current device of
     // remotePeerId (the server requires every device to be addressed on
-    // every send - see the .cpp definition's doc comment) and
-    // encrypts+sends the given CallMessage to each. Returns the device
-    // ids actually sent to. Reuses deviceListCache_ within its TTL rather
-    // than re-fetching for every single message of a call (offer, answer,
-    // several ICE candidates, hangup can easily be 5+ sends in one call) -
-    // found live that always fetching fresh, while correct, blew through
-    // Signal-Server's real PRE_KEYS rate limit (6 requests/10min) well
-    // before a single call finished signaling.
+    // every send - see the .cpp definition's doc comment) and returns the
+    // resulting device ids. Reuses deviceListCache_ within its TTL rather
+    // than re-fetching on every call - found live that always fetching
+    // fresh, while correct, blew through Signal-Server's real PRE_KEYS
+    // rate limit (6 requests/10min) well before a single call finished
+    // signaling. Public (not just used by sendCallMessage below) so
+    // sendDecryptionErrorReply() - which resolves a device list for the
+    // same kind of peer, often the very same one moments apart during a
+    // burst of undecryptable envelopes - can share this cache instead of
+    // paying its own separate uncached fetch per failure; see that
+    // function's call site in main.cpp.
+    std::vector<int> resolveDeviceList(const std::string& remotePeerId);
+
+private:
+    // Encrypts+sends the given CallMessage to every device resolveDeviceList()
+    // returns. Returns the device ids actually sent to.
     std::vector<int> sendCallMessage(const std::string& remotePeerId, const signalservice::CallMessage& callMessage);
 
     AuthSocket& socket_;
@@ -76,7 +83,15 @@ private:
     std::string localServiceId_;
     uint32_t localDeviceId_;
 
-    static constexpr std::chrono::seconds kDeviceListCacheTtl{300};
+    // Self-heals on a 409/410 from the server (see resolveDeviceList()'s
+    // .cpp definition), so this TTL only bounds staleness in the window
+    // between an out-of-band device-list change (a real client
+    // linking/unlinking a device) and this daemon's next send to that
+    // peer - not a correctness requirement, just how long a stale-but-
+    // undetected cache could theoretically linger. 30 minutes trades that
+    // window for far fewer PRE_KEYS-limited fetches across a testing
+    // session's multiple back-to-back calls.
+    static constexpr std::chrono::seconds kDeviceListCacheTtl{1800};
     std::unordered_map<std::string, std::pair<std::vector<int>, std::chrono::steady_clock::time_point>>
         deviceListCache_;
 };
@@ -93,9 +108,16 @@ private:
 // Crypto.h's buildDecryptionErrorPlaintextContent() for why. Best-effort:
 // logs and swallows its own failures rather than throwing, since this
 // runs from an already-failed decrypt path and shouldn't take down
-// anything else.
-void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const std::string& localServiceId,
-                               uint32_t localDeviceId, const std::string& senderServiceId, uint32_t senderDeviceId,
+// anything else. Resolves senderServiceId's device list via `sender`'s
+// shared cache (CallMessageSender::resolveDeviceList()) rather than its
+// own uncached fetch - found live that a routine burst of undecryptable
+// stale-backlog envelopes on a single daemon connect (5+ in a row,
+// same sender) could each independently pay a full uncached
+// GET /v2/keys, burning through Signal-Server's PRE_KEYS rate limit
+// before any real call signaling got a chance to run.
+void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, CallMessageSender& sender,
+                               const std::string& localServiceId, uint32_t localDeviceId,
+                               const std::string& senderServiceId, uint32_t senderDeviceId,
                                const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp);
 
 } // namespace signal2sip

@@ -613,7 +613,7 @@ void onPush(const std::string& verb, const std::string& path, const Bytes& body)
             // definition - so no lock is taken here.
             g_dispatchQueue.push([senderServiceId, senderDeviceId, originalCiphertext, originalMessageType,
                                   clientTimestamp = envelope.clienttimestamp()] {
-                sendDecryptionErrorReply(*g_state.socket, *g_state.stores, g_state.localServiceId,
+                sendDecryptionErrorReply(*g_state.socket, *g_state.stores, *g_state.sender, g_state.localServiceId,
                                          static_cast<uint32_t>(g_state.account.device_id), senderServiceId,
                                          senderDeviceId, originalCiphertext, originalMessageType, clientTimestamp);
             });

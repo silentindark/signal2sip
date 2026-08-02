@@ -198,8 +198,7 @@ CallMessageSender::CallMessageSender(AuthSocket& socket, ProtocolStores& stores,
                                        uint32_t localDeviceId)
     : socket_(socket), stores_(stores), localServiceId_(std::move(localServiceId)), localDeviceId_(localDeviceId) {}
 
-std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePeerId,
-                                                      const signalservice::CallMessage& callMessage) {
+std::vector<int> CallMessageSender::resolveDeviceList(const std::string& remotePeerId) {
     // The server requires every /v1/messages PUT to address every
     // currently-registered device of the destination account, every
     // time, with no partial-address exception - found live as a 409
@@ -225,10 +224,10 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
     // deviceListCache_ can be touched from multiple threads (a RingRTC
     // callback thread calling straight into sendOffer/sendAnswer/etc.,
     // and the envelope dispatch queue's worker thread indirectly via
-    // handleCallMessage() -> RingRTC -> a synchronous send callback) -
-    // reuse stores_.mutex() (already the general "serialize this
-    // account's signaling-adjacent state" lock) rather than adding a
-    // second one.
+    // handleCallMessage() -> RingRTC -> a synchronous send callback, or
+    // sendDecryptionErrorReply() reacting to a decrypt failure) - reuse
+    // stores_.mutex() (already the general "serialize this account's
+    // signaling-adjacent state" lock) rather than adding a second one.
     std::vector<int> deviceIds;
     bool cacheHit = false;
     {
@@ -248,6 +247,12 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
         std::lock_guard<std::mutex> lock(stores_.mutex());
         deviceListCache_[remotePeerId] = {deviceIds, std::chrono::steady_clock::now()};
     }
+    return deviceIds;
+}
+
+std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePeerId,
+                                                      const signalservice::CallMessage& callMessage) {
+    std::vector<int> deviceIds = resolveDeviceList(remotePeerId);
     if (deviceIds.empty()) return deviceIds;
 
     signalservice::Content content;
@@ -348,8 +353,9 @@ void CallMessageSender::sendHangup(const std::string& remotePeerId, uint64_t cal
     sendCallMessage(remotePeerId, callMessage);
 }
 
-void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const std::string& localServiceId,
-                               uint32_t localDeviceId, const std::string& senderServiceId, uint32_t senderDeviceId,
+void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, CallMessageSender& sender,
+                               const std::string& localServiceId, uint32_t localDeviceId,
+                               const std::string& senderServiceId, uint32_t senderDeviceId,
                                const Bytes& originalCiphertext, uint8_t originalType, uint64_t originalTimestamp) {
     try {
         Bytes serializedDem =
@@ -380,11 +386,14 @@ void sendDecryptionErrorReply(AuthSocket& socket, ProtocolStores& stores, const 
         // Double-Ratchet-encrypted at all, so the exact same bytes go to
         // every device - each one independently decides whether the
         // embedded ratchet key means anything to its own session state.
-        // Always re-fetch the full device list (fetchAndEstablishSessions
-        // with no device filter) rather than trying the single cached
-        // session first - simpler, and this is an already-rare recovery
-        // path, not a hot one.
-        auto deviceIds = fetchAndEstablishSessions(socket, stores, localServiceId, localDeviceId, senderServiceId);
+        // Shared cache with sendCallMessage() (see
+        // CallMessageSender::resolveDeviceList()) - a burst of
+        // undecryptable envelopes from the same sender (the common case:
+        // stale protocol backlog on a fresh daemon connect) would
+        // otherwise each pay their own uncached GET /v2/keys, easily
+        // exhausting Signal-Server's PRE_KEYS rate limit before real call
+        // signaling gets a chance to run at all - found live.
+        auto deviceIds = sender.resolveDeviceList(senderServiceId);
 
         // Envelope.Type.PLAINTEXT_CONTENT (proto/SignalService.proto) - not
         // encrypted, see buildDecryptionErrorPlaintextContent()'s doc
