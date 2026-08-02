@@ -1,0 +1,23 @@
+[Unit]
+Description=signal2sip daemon (Signal <-> SIP bridge, multi-account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# resolveConfigPath() (Config.cpp) already falls back to
+# /etc/signal2sip/signal2sip.conf on its own with no argument - passed
+# explicitly here anyway so the unit is self-documenting.
+ExecStart=/usr/local/bin/signal2sip-daemon /etc/signal2sip/signal2sip.conf
+# `systemctl reload` does nothing on its own - it just runs whatever
+# ExecReload= says. SIGHUP triggers reloadConfig() (main.cpp): re-reads
+# the config file and adds/removes accounts without restarting. Does NOT
+# support changing an already-running account's settings (e.g. a new SIP
+# password) - see reloadConfig()'s own doc comment; remove the account in
+# one reload, re-add it in a second one for that.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
