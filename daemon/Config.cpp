@@ -56,14 +56,10 @@ std::string getOr(const IniMap& ini, const std::string& section, const std::stri
     return it->second;
 }
 
-// Every account's own name, collected from `[signal.<name>]` section
-// headers specifically - `[sip.<name>]`/`[other.<name>]` are looked up
-// per-name below but never define an account on their own (a `[sip.*]`
-// section with no matching `[signal.*]` is just ignored, same as any
-// other unrecognized section - `parseIni()` itself is already fully
-// permissive about unknown sections).
+// Every account's own name, collected from `[account.<name>]` section
+// headers.
 std::vector<std::string> collectAccountNames(const IniMap& ini) {
-    constexpr char kPrefix[] = "signal.";
+    constexpr char kPrefix[] = "account.";
     constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
     std::vector<std::string> names;
     for (const auto& [section, _] : ini) {
@@ -84,37 +80,40 @@ std::string resolveConfigPath(int argc, char** argv) {
 
 DaemonConfig DaemonConfig::load(const std::string& path) {
     IniMap ini = parseIni(path);
-    std::vector<std::string> names = collectAccountNames(ini);
-    if (names.empty()) {
-        throw std::runtime_error("signal2sip.conf: no [signal.<name>] sections found");
-    }
 
     DaemonConfig daemon;
+    daemon.global.dbPath = getOr(ini, "global", "db_path", "");
+    if (daemon.global.dbPath.empty()) {
+        throw std::runtime_error("signal2sip.conf: [global] db_path is required");
+    }
+    daemon.global.dbKey = getOr(ini, "global", "db_key", "");
+    if (daemon.global.dbKey.empty()) {
+        throw std::runtime_error("signal2sip.conf: [global] db_key is required");
+    }
+
+    std::vector<std::string> names = collectAccountNames(ini);
+    if (names.empty()) {
+        throw std::runtime_error("signal2sip.conf: no [account.<name>] sections found");
+    }
+
     for (const std::string& name : names) {
         AccountConfig account;
         account.name = name;
 
-        const std::string signalSection = "signal." + name;
-        account.e164 = getOr(ini, signalSection, "e164", "");
+        const std::string section = "account." + name;
+        account.e164 = getOr(ini, section, "e164", "");
         if (account.e164.empty()) {
-            throw std::runtime_error("signal2sip.conf: [" + signalSection + "] e164 is required");
+            throw std::runtime_error("signal2sip.conf: [" + section + "] e164 is required");
         }
-        account.accountDataDir = getOr(ini, signalSection, "account_data_dir", ".");
-        account.dbKey = getOr(ini, signalSection, "db_key", "");
-        if (account.dbKey.empty()) {
-            throw std::runtime_error("signal2sip.conf: [" + signalSection + "] db_key is required");
-        }
-        account.serverUrl = getOr(ini, signalSection, "server_url", "");
+        account.serverUrl = getOr(ini, section, "server_url", "");
 
-        const std::string sipSection = "sip." + name;
-        account.sipHost = getOr(ini, sipSection, "host", "");
-        account.sipExtension = getOr(ini, sipSection, "extension", "");
-        account.sipPassword = getOr(ini, sipSection, "password", "");
-        account.sipBridgeDestination = getOr(ini, sipSection, "bridge_destination", "");
-        account.sipPort = static_cast<unsigned>(std::stoul(getOr(ini, sipSection, "port", "5063")));
+        account.sipHost = getOr(ini, section, "sip_host", "");
+        account.sipExtension = getOr(ini, section, "sip_extension", "");
+        account.sipPassword = getOr(ini, section, "sip_password", "");
+        account.sipBridgeDestination = getOr(ini, section, "sip_bridge_destination", "");
+        account.sipPort = static_cast<unsigned>(std::stoul(getOr(ini, section, "sip_port", "5063")));
 
-        const std::string otherSection = "other." + name;
-        account.outgoingCallTarget = getOr(ini, otherSection, "outgoing_call_target", "");
+        account.outgoingCallTarget = getOr(ini, section, "outgoing_call_target", "");
 
         daemon.accounts.push_back(std::move(account));
     }

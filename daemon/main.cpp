@@ -704,6 +704,7 @@ std::atomic<bool> g_reloadRequested{false};
 void onReloadSignal(int) { g_reloadRequested = true; }
 
 std::string g_configPath; // set once in main(), read by reloadConfig()
+GlobalConfig g_global;    // set once in main() from config.global, read by setupAccount()
 
 // Creates the shared Endpoint the first time any account needs it - either
 // during main()'s startup loop, or later via a SIGHUP reload adding the
@@ -760,8 +761,7 @@ bool setupAccount(const AccountConfig& accountConfig) {
         AccountState& acct = *(g_accounts[accountConfig.name] = std::make_unique<AccountState>());
         acct.config = accountConfig;
 
-        std::string dbPath = accountConfig.accountDataDir + "/" + accountConfig.e164 + ".db";
-        acct.storage = std::make_unique<Storage>(dbPath, accountConfig.dbKey);
+        acct.storage = std::make_unique<Storage>(g_global.dbPath, g_global.dbKey, accountConfig.name);
         if (!acct.storage->hasAccount()) {
             migrateFromNodePrototype(*acct.storage, accountConfig.e164);
         }
@@ -895,6 +895,13 @@ void reloadConfig(const std::string& configPath) {
         return;
     }
 
+    // Accounts already running were constructed against the *old* g_global
+    // (captured by value at construction time inside their own Storage),
+    // so updating this doesn't retroactively change them - only new
+    // accounts brought up below see the new value. Consistent with
+    // "changing settings isn't supported by a reload" above.
+    g_global = newConfig.global;
+
     std::set<std::string> newNames;
     for (const auto& accountConfig : newConfig.accounts) newNames.insert(accountConfig.name);
 
@@ -946,6 +953,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "[daemon] loaded config from " << g_configPath << " for " << config.accounts.size()
                << " account(s)\n";
+    g_global = config.global;
 
     signal2sip_init_logging(); // process-wide, once, regardless of account count
 

@@ -7,17 +7,15 @@
 // extraction). Section-and-key-value only, `;`/`#` comments.
 //
 // One process now serves N Signal accounts (each optionally with its own
-// SIP trunk) from a single file - repeated `[signal.<name>]`/
-// `[sip.<name>]`/`[other.<name>]` section groups, one group per account,
-// `<name>` an arbitrary label shared across all three sections for the
-// same account (this project's own convention: the e164 digits with no
-// `+`, since INI section names can't safely hold arbitrary punctuation
-// and this avoids inventing a separate label concept to keep in sync with
-// `e164=` inside the block - not an INI syntax requirement, just this
-// project's convention). Was one account/one file per process (matching
-// tg2sip-webrtc's own model) - deliberately reversed since tg2sip has no
-// real in-process-multi-account precedent to mirror; see the project's
-// memory for that decision).
+// SIP trunk) from a single file, all sharing one database (see
+// GlobalConfig/Storage's own doc comments) - one `[global]` section plus
+// a repeated `[account.<name>]` section per account, `<name>` a free-form
+// human-readable label (no format requirement beyond what INI section
+// names allow - was previously the e164 digits with no `+`, now just a
+// convention/example, not a requirement). Was one account/one file per
+// process (matching tg2sip-webrtc's own model) - deliberately reversed
+// since tg2sip has no real in-process-multi-account precedent to mirror;
+// see the project's memory for that decision.
 //
 // argv[1] -> /etc/signal2sip/signal2sip.conf -> ./signal2sip.conf,
 // matching tg2sip/utils.cpp's resolve_config_path() exactly (same
@@ -31,20 +29,24 @@ namespace signal2sip {
 
 std::string resolveConfigPath(int argc, char** argv);
 
+// [global] - one per file, shared by every account.
+struct GlobalConfig {
+    std::string dbPath;  // required - one SQLCipher file shared by all accounts
+    std::string dbKey;   // required - SQLCipher passphrase
+};
+
 struct AccountConfig {
-    // The "<name>" in [signal.<name>]/[sip.<name>]/[other.<name>] - used
-    // as this account's key everywhere in the daemon (the accounts map,
-    // log-line prefixes) and to derive PJSIP transport port defaults.
+    // The "<name>" in [account.<name>] - used as this account's key
+    // everywhere in the daemon (the accounts map, log-line prefixes,
+    // Storage's account_name scoping) and to derive PJSIP transport port
+    // defaults.
     std::string name;
 
-    // [signal.<name>]
-    std::string e164;                 // required
-    std::string accountDataDir = ".";  // where <e164>.db lives
-    std::string dbKey;                 // SQLCipher passphrase, required
-    std::string serverUrl;             // empty = production chat.signal.org
+    std::string e164;       // required
+    std::string serverUrl;  // empty = production chat.signal.org
 
-    // [sip.<name>] - entirely optional; an account with no [sip.<name>]
-    // section never touches PJSIP at all (Signal-only account).
+    // Entirely optional; an account with no sip_host never touches PJSIP
+    // at all (Signal-only account).
     std::string sipHost;
     std::string sipExtension;
     std::string sipPassword;
@@ -53,17 +55,19 @@ struct AccountConfig {
     std::string sipBridgeDestination;
     unsigned sipPort = 5063;
 
-    // [other.<name>]
-    // The other account to place a test outgoing call to, if set -
-    // matches this milestone's live-verification step (a real Signal
-    // call from one signal2sip-daemon account to another's ACI). Empty
-    // means this account only answers incoming calls.
+    // The other account to place a test outgoing call to, if set - must
+    // be the target's ACI/UUID, not its e164 (GET /v2/keys/{e164}/* 404s
+    // on the current Signal server; own ACI is logged at startup).
+    // Matches this milestone's live-verification step (a real Signal call
+    // from one signal2sip-daemon account to another's ACI). Empty means
+    // this account only answers incoming calls.
     std::string outgoingCallTarget;
 
     bool hasSip() const { return !sipHost.empty(); }
 };
 
 struct DaemonConfig {
+    GlobalConfig global;
     std::vector<AccountConfig> accounts;
 
     static DaemonConfig load(const std::string& path);

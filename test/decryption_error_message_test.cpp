@@ -127,8 +127,8 @@ int main() {
     std::remove(aliceDbPath.c_str());
     std::remove(bobDbPath.c_str());
 
-    Storage aliceStorage(aliceDbPath, "dem-test-key-alice");
-    Storage bobStorage(bobDbPath, "dem-test-key-bob");
+    Storage aliceStorage(aliceDbPath, "dem-test-key-alice", "alice");
+    Storage bobStorage(bobDbPath, "dem-test-key-bob", "bob");
 
     GeneratedIdentity aliceIdentity = generateIdentity();
     GeneratedIdentity bobIdentity = generateIdentity();

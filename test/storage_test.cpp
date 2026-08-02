@@ -43,7 +43,7 @@ int main() {
 
     // --- round-trip every table ---
     {
-        Storage storage(dbPath, key);
+        Storage storage(dbPath, key, "test");
 
         check(!storage.hasAccount(), "fresh database has no account row");
 
@@ -113,7 +113,7 @@ int main() {
 
     // --- reopening with the correct key must see the same data ---
     {
-        Storage storage(dbPath, key);
+        Storage storage(dbPath, key, "test");
         check(storage.hasAccount(), "data survives close+reopen with correct key");
         check(storage.loadAccount().password == "changed", "data is unchanged after reopen");
     }
@@ -131,7 +131,7 @@ int main() {
     {
         bool threw = false;
         try {
-            Storage wrongKeyStorage(dbPath, "wrong-passphrase");
+            Storage wrongKeyStorage(dbPath, "wrong-passphrase", "test");
             wrongKeyStorage.hasAccount(); // forces first real table access
         } catch (const std::exception&) {
             threw = true;

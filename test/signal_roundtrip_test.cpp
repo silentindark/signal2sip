@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
 
     std::string dbPath = "/tmp/signal2sip_roundtrip_test.db";
     std::remove(dbPath.c_str());
-    Storage storage(dbPath, "roundtrip-test-key");
+    Storage storage(dbPath, "roundtrip-test-key", "test");
     migrateAccount(storage, accountJsonPath, sessionsJsonPath);
     std::cout << "PASS: migrated account into SQLCipher storage\n";
 
