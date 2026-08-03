@@ -51,8 +51,15 @@ export PATH="$GIT_ROOT/depot_tools:$PATH"
 ( cd depot_tools && ./ensure_bootstrap )
 
 echo "=== [1/6] System packages ==="
-sudo apt-get update -y
-sudo apt-get install -y \
+# Root doesn't need sudo, and some minimal containers/VMs (found live on
+# .82) don't even have the sudo package installed - only shell out to it
+# when actually running as a non-root user.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+    SUDO="sudo"
+fi
+$SUDO apt-get update -y
+$SUDO apt-get install -y \
     build-essential cmake git curl pkg-config python3 lld \
     libssl-dev libcurl4-openssl-dev libqrencode-dev \
     libwebsockets-dev nlohmann-json3-dev \
