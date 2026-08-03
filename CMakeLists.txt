@@ -4,6 +4,18 @@ project(signal2sip-native CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default to Release if the caller didn't ask for anything else - found
+# live that signal2sip-daemon/signal2sip-gendb were previously coming out
+# at 400-500MB, ~82% of that unstripped debug info (WebRTC/RingRTC/PJSIP's
+# own static libs all carry their own debug sections, none of which get
+# trimmed just by our own code being small) - stripped to ~85-90MB with
+# nothing else changed. See the `-s` link option on the two real
+# executables below, scoped to Release only (test binaries keep their
+# symbols, since those are for debugging failures locally, not deploying).
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
 pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
@@ -146,9 +158,15 @@ string(REPLACE "enum SignalSvr2CredentialsResult {" "enum SignalSvr2CredentialsR
 set(SIGNAL_FFI_H_CONTENT "#ifdef __cplusplus\nextern \"C\" {\n#endif\n${SIGNAL_FFI_H_CONTENT}\n#ifdef __cplusplus\n}\n#endif\n")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/signal_ffi_cxx/signal_ffi.h "${SIGNAL_FFI_H_CONTENT}")
 
+# target/release, not target/debug (`cargo build --release -p
+# libsignal-ffi`) - found live 08-03 that the debug archive is 1.2GB vs
+# release's 192MB, and directly inflates both signal2sip-daemon and
+# signal2sip-gendb's final size (gendb links almost nothing else
+# statically, so its whole ~66MB was essentially this). Matches
+# RINGRTC_DIR's own target/release convention just below.
 add_library(libsignal_ffi STATIC IMPORTED)
 set_target_properties(libsignal_ffi PROPERTIES
-    IMPORTED_LOCATION ${LIBSIGNAL_DIR}/target/debug/libsignal_ffi.a
+    IMPORTED_LOCATION ${LIBSIGNAL_DIR}/target/release/libsignal_ffi.a
     INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_BINARY_DIR}/generated/signal_ffi_cxx
 )
 
@@ -311,6 +329,11 @@ target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld)
 # linker refuses to pick between). Safe to just take either copy here -
 # same host triple, same ABI, purely a runtime personality routine.
 target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld -Wl,--allow-multiple-definition)
+# Strips ~415MB of unstripped debug info WebRTC/RingRTC/PJSIP's own static
+# libs carry (503MB -> ~88MB, measured directly) - Release only, so a
+# Debug build (cmake -DCMAKE_BUILD_TYPE=Debug) still keeps symbols for
+# local debugging.
+target_link_options(signal2sip-daemon PRIVATE $<$<CONFIG:Release>:-s>)
 
 # signal2sip-gendb: standalone companion binary creating a brand-new
 # account (Flow A registration or Flow B device-linking) - see
@@ -334,3 +357,5 @@ target_include_directories(signal2sip-gendb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_config signal2sip_signal
     signal2sip_storage signal2sip_proto CURL::libcurl OpenSSL::Crypto PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE
     nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
+# See signal2sip-daemon's own -s comment above - same deal here.
+target_link_options(signal2sip-gendb PRIVATE $<$<CONFIG:Release>:-s>)
