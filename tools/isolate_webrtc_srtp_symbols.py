@@ -188,6 +188,24 @@ def main():
         pos = data_start + size + (size % 2)
 
     out_path.write_bytes(out)
+
+    # The renamed members are longer than their originals (longer symbol
+    # names in the .o's own symtab/strtab), which shifts every later
+    # member's byte offset - but the archive's own symbol index (built by
+    # whatever tool produced the original libwebrtc.a) still points at the
+    # OLD offsets. ld.lld's index-based symbol lookup then reads garbage
+    # for any symbol in a member positioned after the first resized one.
+    # Found live: this "worked" on lld 19.1.7 (Debian 13) but broke on lld
+    # 14.0.6 (Debian 12) with "truncated or malformed archive" - not a
+    # platform quirk, a real staleness bug that newer lld apparently
+    # tolerates better. Regenerate the index in place, same as running
+    # ranlib after hand-editing any archive - `llvm-ranlib-19` was tried
+    # first but is a silent no-op on this archive (confirmed live:
+    # identical md5sum/mtime before and after); GNU binutils `ar s`
+    # actually rewrites it (confirmed live: size changed by the expected
+    # few KB) and is already a build-essential dependency, so use that.
+    subprocess.run(["ar", "s", str(out_path)], check=True)
+
     print(f"Wrote {out_path} ({len(out)} bytes, {len(replacements)} members renamed, "
           f"{len(target_syms)} symbols isolated)")
 
