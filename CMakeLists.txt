@@ -7,14 +7,52 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
 pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
-# Same shared /usr/local install tg2sip-webrtc itself links against (built
-# with --disable-sound - fine here too, since the whole point of Milestone
-# F's ring-buffer bridge is to never touch PJSIP's own sound-device layer;
-# it registers custom virtual pjmedia_port objects via registerMediaPort()
-# instead, same proven pattern tg2sip-webrtc uses for its own calls).
+# Was the same shared /usr/local install tg2sip-webrtc itself links
+# against (PJSIP 2.9, built with --disable-sound - fine for us too, since
+# the whole point of Milestone F's ring-buffer bridge is to never touch
+# PJSIP's own sound-device layer; it registers custom virtual pjmedia_port
+# objects via registerMediaPort() instead, same proven pattern
+# tg2sip-webrtc uses for its own calls) - until 08-03, when
+# sip_transport=tls (native/daemon/main.cpp) turned out to SEGV the whole
+# daemon on any real TLS connection: PJSIP 2.9's OpenSSL glue
+# (pjlib/src/pj/ssl_sock_ossl.c) predates upstream's OpenSSL 3 support
+# (commit 914ce755a, first shipped in tag 2.14), and this box's system
+# OpenSSL is 3.x. Rather than upgrade the SHARED /usr/local install
+# in-place (real risk to tg2sip-webrtc, a separately-deployed production
+# service depending on that exact 2.9 build), this points ONLY
+# signal2sip's own build at a second, independent PJSIP checkout - same
+# --disable-sound flags, just a newer, OpenSSL-3-safe tag (2.14.1,
+# deliberately the earliest tag with the fix rather than the latest
+# release, to minimize unrelated behavior drift from the already-proven
+# 2.9 codepaths this project depends on elsewhere). /usr/local and
+# tg2sip-webrtc's own build are never touched by this.
+set(PJPROJECT_DIR "$ENV{HOME}/GIT/vladonv/pjproject-tls/local-install" CACHE PATH
+    "Dedicated PJSIP 2.14.1+ install with OpenSSL 3 support - NOT /usr/local, which stays on 2.9 for tg2sip-webrtc")
+set(ENV{PKG_CONFIG_PATH} "${PJPROJECT_DIR}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 pkg_check_modules(PJSIP REQUIRED IMPORTED_TARGET libpjproject)
+# 2.14.1's libpjproject.pc properly splits public Libs: (just the pj*
+# archives themselves) from Libs.private: (their own transitive deps -
+# uuid, srtp, resample, the codec libs, PJSIP's own vendored echo-canceller
+# "webrtc" module, opus/ssl/crypto/vpx/av*) - the OLD 2.9 .pc file dumped
+# everything into one public Libs: line instead (a packaging-metadata
+# change upstream, confirmed by diffing both .pc files - not a new
+# dependency we didn't already have), so PkgConfig::PJSIP's default
+# (public-only) link libraries used to be complete by accident. CMake's
+# pkg_check_modules(... IMPORTED_TARGET ...) only wires up the public set
+# automatically; add the private set explicitly since we link PJSIP
+# statically. (PJSIP's own "-lwebrtc-*" here is its unrelated, vendored
+# echo-canceller module, not RingRTC's real WebRTC - the old build already
+# linked it the same way with no symbol collision against the `webrtc`
+# CMake target below, so this isn't new risk.)
+target_link_libraries(PkgConfig::PJSIP INTERFACE ${PJSIP_STATIC_LDFLAGS})
 find_package(Protobuf REQUIRED)
 find_package(nlohmann_json REQUIRED)
+# gendb-only deps (see native/gendb/): plain HTTPS for Flow A (RegistrationClient),
+# AES-256-CBC/HMAC-SHA256 for the provisioning cipher (Flow B), ASCII QR
+# rendering for Flow B's linking URL.
+find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+pkg_check_modules(QRENCODE REQUIRED IMPORTED_TARGET libqrencode)
 
 # Signal's on-the-wire message shapes, unchanged from the Node prototype -
 # same .proto sources (pulled from signalapp/Signal-Android, see
@@ -225,15 +263,23 @@ target_include_directories(pjsip_ringrtc_echo_test PRIVATE ${CMAKE_CURRENT_SOURC
 target_link_libraries(pjsip_ringrtc_echo_test PRIVATE signal2sip_voip ringrtc webrtc_pjsip_safe ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
 target_link_options(pjsip_ringrtc_echo_test PRIVATE -fuse-ld=lld)
 
+# signal2sip.conf parsing - its own tiny target (not folded into
+# signal2sip_daemon below) so gendb (native/gendb/) can read the same
+# config/account sections without pulling in RingRTC/WebRTC/PJSIP, none of
+# which gendb needs.
+add_library(signal2sip_config STATIC
+    daemon/Config.cpp
+)
+target_include_directories(signal2sip_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Milestone G: bidirectional bridge between real Signal CallMessage
 # protobufs and RingRTC's C ABI - see native/daemon/CallSignaling.h.
 add_library(signal2sip_daemon STATIC
     daemon/CallSignaling.cpp
-    daemon/Config.cpp
 )
 target_include_directories(signal2sip_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_authsocket signal2sip_proto
-    signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json)
+    signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json signal2sip_config)
 
 add_executable(signal2sip-daemon daemon/main.cpp)
 target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -265,3 +311,26 @@ target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld)
 # linker refuses to pick between). Safe to just take either copy here -
 # same host triple, same ABI, purely a runtime personality routine.
 target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld -Wl,--allow-multiple-definition)
+
+# signal2sip-gendb: standalone companion binary creating a brand-new
+# account (Flow A registration or Flow B device-linking) - see
+# native/gendb/main.cpp and /home/vlad/.claude/plans/piped-mixing-summit.md.
+# Deliberately does NOT link signal2sip_daemon/ringrtc/webrtc/PJSIP - none
+# of Milestone C's account-creation flows touch calling or SIP, so this
+# stays a small, fast-to-build binary with none of signal2sip-daemon's
+# link-line workarounds.
+add_library(signal2sip_gendb STATIC
+    gendb/RegistrationClient.cpp
+    gendb/ProvisioningCipher.cpp
+    gendb/ProvisioningClient.cpp
+    gendb/AccountFinisher.cpp
+)
+target_include_directories(signal2sip_gendb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip_gendb PUBLIC signal2sip_signal signal2sip_storage signal2sip_proto
+    signal2sip_config PkgConfig::LIBWEBSOCKETS CURL::libcurl OpenSSL::Crypto PkgConfig::QRENCODE)
+
+add_executable(signal2sip-gendb gendb/main.cpp)
+target_include_directories(signal2sip-gendb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_config signal2sip_signal
+    signal2sip_storage signal2sip_proto CURL::libcurl OpenSSL::Crypto PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE
+    nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)

@@ -733,9 +733,13 @@ void ensureSharedEndpoint(unsigned port) {
         // Force L16/48000/1 (raw PCM, mono) as the only codec PJSIP will
         // ever offer/accept, matching RingRtcSipBridge's fixed format
         // exactly - same technique as tg2sip-webrtc's ep.codecSetPriority()
-        // loop.
-        for (const auto* codec : epStorage->codecEnum()) {
-            epStorage->codecSetPriority(codec->codecId, codec->codecId == "L16/48000/1" ? 255 : 0);
+        // loop. codecEnum() (returning CodecInfoVector, a vector of
+        // pointers) is gone in this PJSIP version - only codecEnum2()
+        // (CodecInfoVector2, a vector of values) remains; see
+        // native/CMakeLists.txt's PJPROJECT_DIR comment for why this
+        // project moved off PJSIP 2.9.
+        for (const auto& codec : epStorage->codecEnum2()) {
+            epStorage->codecSetPriority(codec.codecId, codec.codecId == "L16/48000/1" ? 255 : 0);
         }
 
         pj::TransportConfig tcfg;
@@ -747,6 +751,49 @@ void ensureSharedEndpoint(unsigned port) {
         std::cerr << "[daemon] SIP Endpoint setup failed: " << err.info() << "\n";
         epStorage.reset();
         g_ep = nullptr;
+    }
+}
+
+// Creates a TLS (SIPS) transport dedicated to ONE account - unlike the
+// shared UDP transport (see g_ep's own doc comment), PJSIP's TLS trust
+// settings (CaListFile/verifyServer) are configured once per transport
+// factory and apply to every connection made through it, so two accounts
+// pointing at two different Asterisk hosts with two different
+// (self-signed) certificates genuinely need their own transport each -
+// see AccountConfig::sipTlsCaFile's own doc comment. Local port 0 (OS
+// picks any free port) is fine here - TLS/TCP is connection-oriented, so
+// Asterisk calls back over the same persistent connection this process
+// already opened for registration, unlike UDP where a specific advertised
+// port matters. Requires g_ep to already exist (ensureSharedEndpoint()
+// must run first).
+void createAccountTlsTransport(const AccountConfig& accountConfig) {
+    if (!g_ep) return;
+
+    try {
+        pj::TransportConfig tcfg;
+        tcfg.port = 0;
+        // PJSIP's own default TLS method is the ancient PJSIP_TLSV1_METHOD
+        // (TLS 1.0) - found live that Asterisk's transport-tls rejects
+        // that outright (TLSV1_ALERT_PROTOCOL_VERSION). Restrict to modern
+        // versions explicitly instead of relying on the default.
+        tcfg.tlsConfig.proto = PJ_SSL_SOCK_PROTO_TLS1_2 | PJ_SSL_SOCK_PROTO_TLS1_3;
+        if (!accountConfig.sipTlsCaFile.empty()) {
+            tcfg.tlsConfig.CaListFile = accountConfig.sipTlsCaFile;
+            tcfg.tlsConfig.verifyServer = true;
+        } else {
+            // Config::load() already refuses sip_transport=tls with
+            // neither sip_tls_ca_file nor sip_tls_insecure=yes set, so
+            // reaching here with an empty CaListFile means the operator
+            // explicitly opted into this.
+            tcfg.tlsConfig.verifyServer = false;
+        }
+        g_ep->transportCreate(PJSIP_TRANSPORT_TLS, tcfg);
+        std::cout << "[daemon][" << accountConfig.name << "] TLS transport created"
+                   << (accountConfig.sipTlsCaFile.empty() ? " (server cert verification DISABLED - sip_tls_insecure=yes)"
+                                                          : " (pinned to " + accountConfig.sipTlsCaFile + ")")
+                   << "\n";
+    } catch (pj::Error& err) {
+        std::cerr << "[daemon][" << accountConfig.name << "] TLS transport setup failed: " << err.info() << "\n";
     }
 }
 
@@ -798,14 +845,40 @@ bool setupAccount(const AccountConfig& accountConfig) {
         refreshPrekeys(*acct.storage, *acct.socket, acct.account);
 
         if (accountConfig.hasSip()) {
-            ensureSharedEndpoint(accountConfig.sipPort); // no-ops if g_ep already exists
+            ensureSharedEndpoint(g_global.sipPort); // no-ops if g_ep already exists
+            if (accountConfig.sipTransport == "tls") createAccountTlsTransport(accountConfig);
             if (g_ep) {
                 auto sipAccount = std::make_unique<BridgeAccount>();
                 pj::AccountConfig acfg;
-                acfg.idUri = "sip:" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
-                acfg.regConfig.registrarUri = "sip:" + accountConfig.sipHost;
+                // sips: (not sip:) is what actually routes this account's
+                // registration/calls over the shared TLS transport instead
+                // of the shared UDP one - see AccountConfig::sipTransport's
+                // own doc comment, including the "sip_host's port usually
+                // needs updating too" gotcha.
+                std::string scheme = accountConfig.sipTransport == "tls" ? "sips" : "sip";
+                acfg.idUri = scheme + ":" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
+                acfg.regConfig.registrarUri = scheme + ":" + accountConfig.sipHost;
                 pj::AuthCredInfo cred("digest", "*", accountConfig.sipExtension, 0, accountConfig.sipPassword);
                 acfg.sipConfig.authCreds.push_back(cred);
+
+                // See AccountConfig::sipSrtp's own doc comment (Config.h) -
+                // "disabled" (default) leaves PJSIP's own default (plain
+                // RTP) untouched.
+                if (accountConfig.sipSrtp == "optional") {
+                    acfg.mediaConfig.srtpUse = PJMEDIA_SRTP_OPTIONAL;
+                } else if (accountConfig.sipSrtp == "mandatory") {
+                    acfg.mediaConfig.srtpUse = PJMEDIA_SRTP_MANDATORY;
+                }
+                // srtpSecureSignaling's PJSIP default (1) REQUIRES a
+                // secure/TLS transport for SRTP to negotiate at all - only
+                // relax it to 0 for a plain UDP account (matches this
+                // project's original SRTP verification, done over UDP);
+                // a tls account leaves the default, which is now
+                // genuinely satisfied instead of just working around it.
+                if (accountConfig.sipSrtp != "disabled" && accountConfig.sipTransport != "tls") {
+                    acfg.mediaConfig.srtpSecureSignaling = 0;
+                }
+
                 sipAccount->create(acfg);
 
                 std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
@@ -976,14 +1049,14 @@ int main(int argc, char** argv) {
     bool anySip = std::any_of(config.accounts.begin(), config.accounts.end(),
                                [](const AccountConfig& a) { return a.hasSip(); });
     if (anySip) {
-        // One shared transport for every account (see g_ep's doc comment)
-        // - bound to the first sip-enabled account's port; every other
-        // account's [sip.<name>] port= is otherwise unused now (kept in
-        // AccountConfig for possible future per-account transport
-        // isolation, not needed for this milestone).
-        auto firstSip = std::find_if(config.accounts.begin(), config.accounts.end(),
-                                      [](const AccountConfig& a) { return a.hasSip(); });
-        ensureSharedEndpoint(firstSip->sipPort);
+        // One shared transport for every account (see g_ep's doc comment),
+        // bound to [global]'s sip_port - genuinely process-wide, not
+        // per-account (see GlobalConfig::sipPort's own doc comment). Any
+        // tls-transport accounts get their own dedicated TLS transport
+        // instead, created later in the per-account loop below (see
+        // createAccountTlsTransport()'s own doc comment for why that one
+        // isn't shared).
+        ensureSharedEndpoint(g_global.sipPort);
     }
 
     // --- Per-account setup (see setupAccount()'s own doc comment).

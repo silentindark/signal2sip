@@ -81,6 +81,30 @@ inline std::string addressKeyAndDestroy(SignalMutPointerProtocolAddress address)
     return result;
 }
 
+struct KeyPair {
+    Bytes privateKey;
+    Bytes publicKey;
+};
+
+// Generates a fresh X25519 keypair - a new account's identity keys (Flow
+// A/B in gendb), or an ephemeral keypair for the provisioning cipher's
+// ECDH step (Flow B) - same signal_privatekey_generate/get_public_key/
+// serialize sequence PreKeys.cpp already uses for prekey generation.
+inline KeyPair generateKeyPair() {
+    SignalMutPointerPrivateKey priv{};
+    checkError(signal_privatekey_generate(&priv));
+    SignalOwnedBuffer privBuffer{};
+    checkError(signal_privatekey_serialize(&privBuffer, SignalConstPointerPrivateKey{priv.raw}));
+    Bytes privBytes = takeOwned(privBuffer);
+
+    SignalMutPointerPublicKey pub{};
+    checkError(signal_privatekey_get_public_key(&pub, SignalConstPointerPrivateKey{priv.raw}));
+    Bytes pubBytes = publicKeySerializeAndDestroy(pub);
+
+    checkError(signal_privatekey_destroy(priv));
+    return KeyPair{privBytes, pubBytes};
+}
+
 inline SignalMutPointerProtocolAddress addressNew(const std::string& serviceId, uint32_t deviceId) {
     SignalMutPointerProtocolAddress addr{};
     checkError(signal_address_new(&addr, reinterpret_cast<const int8_t*>(serviceId.c_str()), deviceId));
