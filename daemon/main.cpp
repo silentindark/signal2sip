@@ -412,7 +412,15 @@ public:
     void onRegState(pj::OnRegStateParam&) override {
         pj::AccountInfo ai = getInfo();
         std::cout << "[daemon][sip] reg state active=" << ai.regIsActive << "\n";
-        if (ai.regIsActive) registered = true;
+        // Must mirror regIsActive both ways - PJSIP's own regc retries
+        // registration automatically (default 300s interval) after a
+        // failure/outage, but until that retry succeeds this flag is
+        // startSipBridge()'s only signal that the account isn't actually
+        // usable right now. Only ever setting it true (never back to
+        // false) meant a Signal call arriving mid-outage would still
+        // attempt a real INVITE through a dead registration instead of
+        // failing cleanly.
+        registered = ai.regIsActive;
     }
 };
 
