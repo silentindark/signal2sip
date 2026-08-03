@@ -78,7 +78,7 @@ std::string readFile(const std::string& path) {
 Bytes b64(const json& j, const char* key) { return base64Decode(j.at(key).get<std::string>()); }
 
 // One-time fallback for this milestone's two already-registered accounts
-// (+123456789004, +123456789002) - imports the Node prototype's JSON
+// (+380000000001, +380000000002) - imports the Node prototype's JSON
 // files the exact same way signal_roundtrip_test.cpp's migrateAccount()
 // already proved correct. Real gendb-created accounts (Milestone C,
 // still not implemented) will never hit this - storage.hasAccount() is

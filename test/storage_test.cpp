@@ -48,7 +48,7 @@ int main() {
         check(!storage.hasAccount(), "fresh database has no account row");
 
         AccountRecord account;
-        account.e164 = "+123456789004";
+        account.e164 = "+380000000001";
         account.aci = "11111111-1111-1111-1111-111111111111";
         account.pni = "22222222-2222-2222-2222-222222222222";
         account.device_id = 1;

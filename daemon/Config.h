@@ -25,7 +25,7 @@
 // (3) the `account_name` column value scoping this account's rows in the
 // shared database. The account's real identity is `e164=`/its derived
 // ACI, not `<name>` - so `[account.support-line]`, `[account.alice]`, and
-// `[account.123456789004]` are all equally valid, and don't need to
+// `[account.380000000001]` are all equally valid, and don't need to
 // relate to the phone number at all. (Historically this project used the
 // e164 digits with no `+` as the label, purely as a convention when this
 // was the only naming idea around - not a requirement, and no longer
@@ -76,7 +76,7 @@ struct AccountConfig {
 
     // The account's REAL identity, not a label - the actual phone number
     // this Signal account is registered/linked under, in E.164 format
-    // (leading '+', country code, e.g. "+123456789004"). Unlike `name`
+    // (leading '+', country code, e.g. "+380000000001"). Unlike `name`
     // above (an arbitrary label you pick), this value has no freedom:
     // Signal's own servers identify the account by this number (and its
     // derived ACI), so it must be the account's genuine registered

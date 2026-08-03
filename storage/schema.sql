@@ -3,7 +3,7 @@
 -- Mirrors the field set of the Node prototype's per-account JSON files
 -- (layer1/accountStore.js's saveAccount()/loadAccount(), confirmed against
 -- the two real accounts already registered/linked this project:
--- +123456789004 standalone-registered, +123456789002 linked-as-device) and
+-- +380000000001 standalone-registered, +380000000002 linked-as-device) and
 -- protocolStores.js's sessions/identities file, byte-for-byte compatible in
 -- meaning so existing accounts can be migrated in with a one-time import
 -- script rather than re-registering.

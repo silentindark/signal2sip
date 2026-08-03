@@ -1,8 +1,8 @@
-// Live Milestone B verification: migrates the existing +123456789004
+// Live Milestone B verification: migrates the existing +380000000001
 // account (already registered by the Node prototype this session, its
 // JSON files are the proven-correct reference) into a fresh SQLCipher
 // Storage, then uses the pure-C++ signal2sip_signal + signal2sip_authsocket
-// stack to fetch a real prekey bundle for +123456789002's ACI, establish a
+// stack to fetch a real prekey bundle for +380000000002's ACI, establish a
 // session, encrypt a real Content message, and send it via the real
 // PUT /v1/messages endpoint - the same operation this session's
 // layer1/sendMessage.js already proved correct, now fully re-implemented
