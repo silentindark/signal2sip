@@ -65,6 +65,18 @@ struct GlobalConfig {
     // 08-03; only the first SIP-enabled account's value ever took effect
     // in practice, which is why it moved here.
     unsigned sipPort = 5063;
+
+    // How long (seconds) a SIP account may sit unregistered before the
+    // daemon forces a fresh registration attempt itself, regardless of
+    // what PJSIP's own auto-retry would do. Needed because PJSIP only
+    // auto-retries a short allowlist of "temporary" failure codes (408,
+    // 500, 502, 503, 504, 480, 6xx - see pjsua_acc.c's regc_cb) - a 403
+    // Forbidden (e.g. from a transient max_contacts collision after an
+    // unclean process kill, confirmed live 08-04) is NOT on that list, so
+    // without this watchdog the account would stay unregistered forever
+    // until the whole daemon is restarted, which needlessly disrupts
+    // every other account too. See main.cpp's registration-watchdog loop.
+    unsigned sipRegWatchdogSec = 60;
 };
 
 struct AccountConfig {

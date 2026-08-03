@@ -409,6 +409,19 @@ private:
 class BridgeAccount : public pj::Account {
 public:
     std::atomic<bool> registered{false};
+
+    // Epoch-ms timestamp of the most recent transition into "not
+    // registered" (0 while currently registered) - read by the
+    // registration watchdog in main()'s loop to decide when PJSIP's own
+    // retry has had enough time and it's worth forcing another attempt
+    // ourselves. Not just a bool: PJSIP only auto-retries a short
+    // allowlist of "temporary" failure codes (see pjsua_acc.c's regc_cb -
+    // 408/500/502/503/504/480/6xx); a 403 Forbidden is not on that list
+    // and would otherwise never retry again on its own, confirmed live
+    // 08-04 (a stale-contact 403 during testing left the account dead
+    // until the whole process was restarted).
+    std::atomic<int64_t> unregisteredSinceMs{0};
+
     void onRegState(pj::OnRegStateParam&) override {
         pj::AccountInfo ai = getInfo();
         std::cout << "[daemon][sip] reg state active=" << ai.regIsActive << "\n";
@@ -421,6 +434,13 @@ public:
         // attempt a real INVITE through a dead registration instead of
         // failing cleanly.
         registered = ai.regIsActive;
+        if (ai.regIsActive) {
+            unregisteredSinceMs = 0;
+        } else if (unregisteredSinceMs.load() == 0) {
+            unregisteredSinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count();
+        }
     }
 };
 
@@ -1082,6 +1102,37 @@ int main(int argc, char** argv) {
             std::cout << "[daemon] SIGHUP received, reloading config from " << g_configPath << "\n";
             reloadConfig(g_configPath);
         }
+
+        // Registration watchdog - see BridgeAccount::unregisteredSinceMs's
+        // own doc comment for why this exists (PJSIP silently gives up
+        // forever on failure codes like 403, outside its own small
+        // auto-retry allowlist). setRegistration(true) just sends a fresh
+        // REGISTER through the same account/transport - it's the same
+        // call PJSIP's own auto-retry would have made, so this is a
+        // no-op on the (common) case where the account is fine or PJSIP
+        // is already handling the retry itself; it only matters for the
+        // stuck case.
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+        for (auto& [name, sipAccount] : g_sipAccounts) {
+            int64_t since = sipAccount->unregisteredSinceMs.load();
+            if (since != 0 && nowMs - since >= static_cast<int64_t>(g_global.sipRegWatchdogSec) * 1000) {
+                std::cerr << "[daemon][" << name << "] registration watchdog: still unregistered after "
+                           << g_global.sipRegWatchdogSec << "s, forcing a fresh attempt\n";
+                try {
+                    sipAccount->setRegistration(true);
+                } catch (pj::Error& err) {
+                    std::cerr << "[daemon][" << name << "] watchdog re-registration attempt failed: " << err.info()
+                               << "\n";
+                }
+                // Reset the clock regardless of outcome - if it's still
+                // down next tick, we'll try again after another full
+                // watchdog interval rather than spamming every 200ms.
+                sipAccount->unregisteredSinceMs = nowMs;
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
