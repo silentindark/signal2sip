@@ -31,6 +31,16 @@ LIBSIGNAL_COMMIT="97801d22dcf9f5bf714f7b8fa3212cdc973ae1c8"
 WEBRTC_PATCH_COMMIT="0afdc03505cde0fcf72a545df51fcb4b7b6c5931"
 PJPROJECT_TAG="2.14.1"
 
+# depot_tools (gclient/gn/ninja) - required by ringrtc's own
+# bin/gsync-webrtc / bin/build-desktop for the WebRTC step below. Found
+# live that a fresh shell has no idea where this is even once cloned, so
+# export it explicitly rather than relying on the caller's own PATH/rc
+# files having it (this script runs non-interactively).
+if [ ! -d depot_tools ]; then
+    git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+fi
+export PATH="$GIT_ROOT/depot_tools:$PATH"
+
 echo "=== [1/6] System packages ==="
 sudo apt-get update -y
 sudo apt-get install -y \
