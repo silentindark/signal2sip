@@ -57,7 +57,7 @@ sudo apt-get install -y \
     libssl-dev libcurl4-openssl-dev libqrencode-dev \
     libwebsockets-dev nlohmann-json3-dev \
     protobuf-compiler libprotobuf-dev libsqlcipher-dev \
-    libclang-dev clang
+    libclang-dev clang libpulse-dev
 
 echo "=== [2/6] Rust toolchains (nightly for libsignal, 1.91.1 for ringrtc) ==="
 if ! command -v rustup >/dev/null 2>&1; then
