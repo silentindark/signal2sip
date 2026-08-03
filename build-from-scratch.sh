@@ -63,6 +63,10 @@ fi
 git -C ringrtc fetch origin
 git -C ringrtc checkout main
 git -C ringrtc reset --hard origin/main
+# gsync-webrtc writes webrtc-version.env into $OUTPUT_DIR (ringrtc/out by
+# default) but never creates that directory itself - found live, nothing
+# else in this pipeline creates it first either.
+mkdir -p ringrtc/out
 ( cd ringrtc && bin/gsync-webrtc )
 # gsync-webrtc always checks out whatever upstream release branch-head
 # config/version.sh pins (see env.sh's WEBRTC_REVISION) - our own patch
