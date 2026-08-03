@@ -40,6 +40,10 @@ if [ ! -d depot_tools ]; then
     git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
 fi
 export PATH="$GIT_ROOT/depot_tools:$PATH"
+# A freshly-cloned depot_tools hasn't bootstrapped itself yet
+# (python3_bin_reldir.txt and friends don't exist until its first real
+# invocation) - found live that gclient sync fails outright without this.
+gclient --version >/dev/null
 
 echo "=== [1/6] System packages ==="
 sudo apt-get update -y
