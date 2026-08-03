@@ -43,7 +43,13 @@ export PATH="$GIT_ROOT/depot_tools:$PATH"
 # A freshly-cloned depot_tools hasn't bootstrapped itself yet
 # (python3_bin_reldir.txt and friends don't exist until its first real
 # invocation) - found live that gclient sync fails outright without this.
-gclient --version >/dev/null
+# `gclient --version` alone turned out NOT to be enough - gclient sync
+# itself ran fine after it, but a later step during bin/build-desktop
+# (invoking depot_tools' plain shell wrappers rather than whatever gclient
+# sync's vpython path used) hit the exact same "python3_bin_reldir.txt not
+# found" error again. update_depot_tools is depot_tools' own real
+# bootstrap/self-update entry point - more thorough.
+update_depot_tools
 
 echo "=== [1/6] System packages ==="
 sudo apt-get update -y
