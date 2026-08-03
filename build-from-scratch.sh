@@ -40,16 +40,15 @@ if [ ! -d depot_tools ]; then
     git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
 fi
 export PATH="$GIT_ROOT/depot_tools:$PATH"
-# A freshly-cloned depot_tools hasn't bootstrapped itself yet
-# (python3_bin_reldir.txt and friends don't exist until its first real
-# invocation) - found live that gclient sync fails outright without this.
-# `gclient --version` alone turned out NOT to be enough - gclient sync
-# itself ran fine after it, but a later step during bin/build-desktop
-# (invoking depot_tools' plain shell wrappers rather than whatever gclient
-# sync's vpython path used) hit the exact same "python3_bin_reldir.txt not
-# found" error again. update_depot_tools is depot_tools' own real
-# bootstrap/self-update entry point - more thorough.
-update_depot_tools
+# A freshly-cloned depot_tools hasn't bootstrapped itself yet - the
+# python-bin/python3 wrapper build-desktop's own tooling calls refuses to
+# run until depot_tools/python3_bin_reldir.txt exists. Neither
+# `gclient --version` nor `update_depot_tools` actually create that file
+# on Linux (found live: gclient sync ran fine without it, using its own
+# vpython path, then build-desktop's separate wrapper failed on the exact
+# same missing-file error regardless) - `ensure_bootstrap` is the one that
+# actually writes it (see depot_tools/bootstrap/bootstrap.py).
+( cd depot_tools && ./ensure_bootstrap )
 
 echo "=== [1/6] System packages ==="
 sudo apt-get update -y
