@@ -37,7 +37,8 @@ sudo apt-get install -y \
     build-essential cmake git curl pkg-config python3 lld \
     libssl-dev libcurl4-openssl-dev libqrencode-dev \
     libwebsockets-dev nlohmann-json3-dev \
-    protobuf-compiler libprotobuf-dev libsqlcipher-dev
+    protobuf-compiler libprotobuf-dev libsqlcipher-dev \
+    libclang-dev clang
 
 echo "=== [2/6] Rust toolchains (nightly for libsignal, 1.91.1 for ringrtc) ==="
 if ! command -v rustup >/dev/null 2>&1; then
