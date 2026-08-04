@@ -633,10 +633,27 @@ ParsedArgs parseArgs(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            printUsage();
+            return 0;
+        }
+    }
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int exitCode = 0;
+    ParsedArgs args;
     try {
-        ParsedArgs args = parseArgs(argc, argv);
+        args = parseArgs(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "[gendb] error: " << e.what() << "\n";
+        printUsage();
+        curl_global_cleanup();
+        return 1;
+    }
+
+    try {
         std::string configPath = resolveGendbConfigPath(args.configPath);
         bootstrapGlobalConfigIfNeeded(configPath);
         DaemonConfig config = DaemonConfig::load(configPath);

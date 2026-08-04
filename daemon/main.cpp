@@ -1025,9 +1025,27 @@ void reloadConfig(const std::string& configPath) {
     }
 }
 
+void printUsage() {
+    std::cerr
+        << "usage: signal2sip-daemon [config-path]\n"
+          "\n"
+          "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf) when no\n"
+          "path is given - see signal2sip-gendb --help to create one. Send SIGHUP to reload\n"
+          "[account.<name>] additions/removals without restarting; existing accounts' own settings are\n"
+          "not re-read on a reload, see reloadConfig()'s doc comment above.\n";
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            printUsage();
+            return 0;
+        }
+    }
+
     // A redirected (non-tty) stdout is fully buffered by default - a
     // long-running daemon's log output would otherwise sit invisible in
     // an in-process buffer for a long time (or vanish entirely on a
