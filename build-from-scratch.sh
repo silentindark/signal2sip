@@ -59,8 +59,31 @@ if [ "$(id -u)" -ne 0 ]; then
     SUDO="sudo"
 fi
 $SUDO apt-get update -y
+
+# lld-21 specifically, NOT the plain distro `lld` package: its version
+# varies by Debian release, and bookworm's own (14.0.6) mislinks
+# signal2sip-daemon into a pre-main() segfault - see native/CMakeLists.txt's
+# PIN_LLD21 comment and project_signal2sip_debian12_daemon_crash memory.
+# apt.llvm.org ships the same Clang/LLVM 21 packages on every Debian
+# release, same approach tg2sip-webrtc's own CI already uses for its
+# toolchain pin - added unconditionally (idempotent: apt-get install on an
+# already-installed package is a silent no-op) rather than only on
+# bookworm, so a from-scratch build stays identical everywhere instead of
+# depending on whichever version a given release's own repos happen to
+# carry (trixie's own trixie-backports has lld-21 too, but backports isn't
+# guaranteed enabled on a fresh box, and relying on it instead of a pinned
+# source would silently drift out of sync with what bookworm needs).
+if ! apt-cache policy lld-21 2>/dev/null | grep -q "Candidate:.*[0-9]"; then
+    $SUDO apt-get install -y wget gnupg
+    CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | $SUDO gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+    echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-21 main" | \
+        $SUDO tee /etc/apt/sources.list.d/llvm.list >/dev/null
+    $SUDO apt-get update -y
+fi
+
 $SUDO apt-get install -y \
-    build-essential cmake git curl pkg-config python3 lld \
+    build-essential cmake git curl pkg-config python3 lld-21 \
     libssl-dev libcurl4-openssl-dev libqrencode-dev \
     libwebsockets-dev nlohmann-json3-dev \
     protobuf-compiler libprotobuf-dev libsqlcipher-dev \

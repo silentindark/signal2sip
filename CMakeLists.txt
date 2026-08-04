@@ -16,6 +16,30 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+# Debian 12 bookworm's default lld (14.0.6, the plain `lld` apt package)
+# mislinks any binary pulling in two independent Rust static libs at once
+# (libsignal_ffi.a + libringrtc.a - only signal2sip-daemon does both, see
+# the --allow-multiple-definition comment below) - confirmed live on .82:
+# signal2sip-daemon segfaulted before main() even ran, inside
+# libprotobuf's own ELF constructor (InitProtobufDefaultsSlow), rip
+# landing at address 0x1. Debian 13 trixie's default lld (19.1.7, this
+# project's main dev machine) links the exact same sources fine - the bug
+# is specific to bookworm's older lld picking the wrong copy of a
+# duplicate symbol. Pin an explicit newer lld everywhere instead of
+# trusting whatever a given Debian release's plain `lld` package happens
+# to default to, same reasoning tg2sip-webrtc's debian/rules already
+# applies to its own Clang/LLVM version pin.
+# GCC (this project's compiler; no CMAKE_CXX_COMPILER override anywhere
+# in this file) doesn't understand Clang's -fuse-ld=lld-21 suffix
+# spelling ("unrecognized command-line option '-fuse-ld=lld-21'; did you
+# mean '-fuse-ld=lld'?", confirmed live) - -B<dir> instead adds LLVM 21's
+# own bin/ to GCC's linker search path, so the plain -fuse-ld=lld below
+# resolves collect2's "ld.lld" lookup to that directory's copy rather
+# than /usr/bin/ld.lld's distro-default symlink.
+set(LLD21_BINDIR "/usr/lib/llvm-21/bin" CACHE PATH
+    "LLVM 21's own bin/ dir (apt.llvm.org on bookworm, trixie-backports locally) - see PIN_LLD21 below")
+set(PIN_LLD21 -B${LLD21_BINDIR} -fuse-ld=lld)
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
 pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
@@ -227,7 +251,7 @@ target_link_libraries(ringrtc_two_party_test PRIVATE ringrtc webrtc ${CMAKE_DL_L
 # (hundreds of "table will not be created" errors, fatal in this ld
 # version, --no-eh-frame-hdr does not suppress it) - lld (Chromium's own
 # toolchain's usual linker) handles them fine.
-target_link_options(ringrtc_two_party_test PRIVATE -fuse-ld=lld)
+target_link_options(ringrtc_two_party_test PRIVATE ${PIN_LLD21})
 
 # fancy-swimming-church.md §0: proves two independent CallManagers (and
 # therefore two independent raw-PCM ADMs) can run concurrently in one
@@ -237,7 +261,7 @@ target_link_options(ringrtc_two_party_test PRIVATE -fuse-ld=lld)
 add_executable(two_call_managers_audio_isolation_test test/two_call_managers_audio_isolation_test.cpp)
 target_include_directories(two_call_managers_audio_isolation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(two_call_managers_audio_isolation_test PRIVATE ringrtc webrtc ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
-target_link_options(two_call_managers_audio_isolation_test PRIVATE -fuse-ld=lld)
+target_link_options(two_call_managers_audio_isolation_test PRIVATE ${PIN_LLD21})
 
 # Milestone F: bridges the ring-buffer PJSIP ports (ported from
 # tg2sip-webrtc/tg2sip/voip/{ring_buffer,audio_bridge}.h) to RingRTC's
@@ -279,7 +303,7 @@ target_link_libraries(signal2sip_voip PUBLIC PkgConfig::PJSIP ringrtc webrtc_pjs
 add_executable(pjsip_ringrtc_echo_test test/pjsip_ringrtc_echo_test.cpp)
 target_include_directories(pjsip_ringrtc_echo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(pjsip_ringrtc_echo_test PRIVATE signal2sip_voip ringrtc webrtc_pjsip_safe ${CMAKE_DL_LIBS} pthread m stdc++ pulse)
-target_link_options(pjsip_ringrtc_echo_test PRIVATE -fuse-ld=lld)
+target_link_options(pjsip_ringrtc_echo_test PRIVATE ${PIN_LLD21})
 
 # signal2sip.conf parsing - its own tiny target (not folded into
 # signal2sip_daemon below) so gendb (native/gendb/) can read the same
@@ -318,7 +342,7 @@ target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_libraries(signal2sip-daemon PRIVATE signal2sip_daemon signal2sip_signal signal2sip_authsocket
     signal2sip_proto signal2sip_voip ringrtc webrtc_pjsip_safe PkgConfig::PJSIP
     ${CMAKE_DL_LIBS} pthread m stdc++ pulse nlohmann_json::nlohmann_json)
-target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld)
+target_link_options(signal2sip-daemon PRIVATE ${PIN_LLD21})
 # libringrtc.a and libsignal_ffi.a are two INDEPENDENT Rust static libs
 # (separate `cargo build` invocations, separate crates/workspaces) - each
 # embeds its own copy of Rust std's runtime support symbols
@@ -326,9 +350,15 @@ target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld)
 # link errors when both land in one binary (unlike the libwebrtc/libsrtp
 # collision fixed above, which was a silent wrong-symbol-wins problem -
 # this is the opposite: a byte-identical-in-effect symbol that the
-# linker refuses to pick between). Safe to just take either copy here -
-# same host triple, same ABI, purely a runtime personality routine.
-target_link_options(signal2sip-daemon PRIVATE -fuse-ld=lld -Wl,--allow-multiple-definition)
+# linker refuses to pick between). Turned out NOT safe to just take
+# whichever copy lld happens to pick, contrary to what this comment used
+# to claim: Debian 12 bookworm's lld 14.0.6 picks a copy that corrupts
+# something global before libprotobuf.so's own ELF constructor runs,
+# crashing signal2sip-daemon before main() (see PIN_LLD21 above and
+# project memory project_signal2sip_debian12_daemon_crash) - lld 19+
+# (this project's dev machine, and now the explicit PIN_LLD21 pin) picks
+# a working copy instead.
+target_link_options(signal2sip-daemon PRIVATE ${PIN_LLD21} -Wl,--allow-multiple-definition)
 # Strips ~415MB of unstripped debug info WebRTC/RingRTC/PJSIP's own static
 # libs carry (503MB -> ~88MB, measured directly) - Release only, so a
 # Debug build (cmake -DCMAKE_BUILD_TYPE=Debug) still keeps symbols for
