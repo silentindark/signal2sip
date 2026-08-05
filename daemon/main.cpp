@@ -51,6 +51,7 @@
 
 #include "CallSignaling.h"
 #include "Config.h"
+#include "ContactResolver.h"
 #include "../ringrtc/signal2sip_ringrtc.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/Crypto.h"
@@ -458,9 +459,34 @@ public:
 pj::Endpoint* g_ep = nullptr;
 std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
 
+// sipBridgeDid wins if both are somehow set - see AccountConfig's own doc
+// comment for why that shouldn't realistically happen (the matching
+// Asterisk endpoint only ever has one context, from-internal or
+// from-pstn, never both). Empty means this account doesn't bridge
+// incoming calls to SIP at all.
+const std::string& bridgeTarget(const AccountConfig& config) {
+    return config.sipBridgeDid.empty() ? config.sipBridgeDestination : config.sipBridgeDid;
+}
+
+// True only if this account both has a bridge target configured AND its
+// SIP registration is actually up right now - checked here, BEFORE ever
+// answering on the Signal side (see onCallState's INCOMING_AUDIO
+// handler), not just inside startSipBridge() itself. Confirmed live
+// 08-04 that the earlier version of this check (target configured, full
+// stop) still steals the Accept from this account's other real devices
+// even when Asterisk/the SIP registration is unreachable - the call gets
+// answered here, then startSipBridge() discovers it can't actually bridge
+// and just logs an error, by which point the real devices have already
+// lost the race for nothing.
+bool canBridgeToSip(const AccountConfig& config) {
+    if (bridgeTarget(config).empty()) return false;
+    auto it = g_sipAccounts.find(config.name);
+    return it != g_sipAccounts.end() && it->second->registered.load();
+}
+
 // Starts bridging acct's currently-active RingRTC call to a real SIP call
-// dialing acct.config.sipBridgeDestination - called once that Signal call
-// is Accepted (real audio about to flow both ways).
+// dialing bridgeTarget(acct.config) - called once that Signal call is
+// Accepted (real audio about to flow both ways).
 void startSipBridge(AccountState& acct) {
     auto it = g_sipAccounts.find(acct.config.name);
     if (it == g_sipAccounts.end() || !it->second->registered.load()) {
@@ -494,7 +520,17 @@ void startSipBridge(AccountState& acct) {
 
     acct.bridge = std::make_unique<voip::RingRtcSipBridge>(acct.handle);
 
-    std::string destUri = "sip:" + acct.config.sipBridgeDestination + "@" + acct.config.sipHost;
+    // Real, pre-existing bug found live 08-04: this always used "sip:"
+    // regardless of transport, unlike acfg.idUri/regConfig.registrarUri
+    // above (built with the correct sips:-for-tls scheme) - a plain
+    // "sip:" request URI tells PJSIP this call's security_level is 0,
+    // which PJSIP_ESESSIONINSECURE's own check (pjsua_media.c:
+    // "security_level < acc->cfg.srtp_secure_signaling") then correctly
+    // rejects for any account that left srtp_secure_signaling at its
+    // real default of 1 (every sip_transport=tls account here, since
+    // main.cpp only ever relaxes that default for non-tls accounts).
+    std::string scheme = acct.config.sipTransport == "tls" ? "sips" : "sip";
+    std::string destUri = scheme + ":" + bridgeTarget(acct.config) + "@" + acct.config.sipHost;
     std::cout << "[daemon][" << acct.config.name << "][sip] placing bridge call to " << destUri << "\n";
     auto* call = new BridgeCall(sipAccount, *acct.bridge);
     acct.sipCall = call;
@@ -576,14 +612,33 @@ void onCallState(void* context, const char* remotePeerId, uint64_t callId, int32
         if (state == SIGNAL2SIP_CALL_STATE_OUTGOING_AUDIO) {
             signal2sip_call_proceed(acct.handle, callId);
         } else if (state == SIGNAL2SIP_CALL_STATE_INCOMING_AUDIO) {
-            acct.isCallee = true;
-            signal2sip_call_proceed(acct.handle, callId);
+            // Only proceed (which answers the call, on THIS device, right
+            // now) if there's an actual, currently-reachable SIP
+            // destination to bridge it to (see canBridgeToSip's own doc
+            // comment) - proceeding otherwise just steals the Accept from
+            // this account's other real devices (a linked phone, Signal
+            // Desktop, ...) before they even get a chance to ring, for a
+            // bridge that either doesn't exist or was never going to work
+            // anyway. Confirmed live 08-04: an account with neither bridge
+            // field set auto-accepted every incoming call into a null
+            // audio device, and the user's own real phone (a linked
+            // device on the same account) got "AcceptedOnAnotherDevice" -
+            // this device had already answered first. Leaving state
+            // untouched here means this device simply never answers, same
+            // as never having this account open at all - the call rings
+            // through to the account's other devices normally, exactly
+            // like any other idle Signal client that never calls
+            // proceed()/accept().
+            if (canBridgeToSip(acct.config)) {
+                acct.isCallee = true;
+                signal2sip_call_proceed(acct.handle, callId);
+            }
         } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && acct.isCallee.load()) {
             // See signal2sip_call_accept()'s doc comment - must wait for
             // Ringing, not accept right after proceed().
             signal2sip_call_accept(acct.handle, callId);
         } else if (state == SIGNAL2SIP_CALL_STATE_CONNECTED) {
-            if (acct.isCallee.load() && !acct.config.sipBridgeDestination.empty()) {
+            if (acct.isCallee.load() && canBridgeToSip(acct.config)) {
                 startSipBridge(acct);
             } else if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
                 std::thread([&acct] { runProbe(acct); }).detach();
@@ -924,12 +979,29 @@ bool setupAccount(const AccountConfig& accountConfig) {
         }
 
         if (!accountConfig.outgoingCallTarget.empty()) {
-            std::cout << "[daemon][" << accountConfig.name << "] placing outgoing call to "
-                       << accountConfig.outgoingCallTarget << "\n";
-            uint64_t callId = signal2sip_call_start_outgoing(acct.handle, accountConfig.outgoingCallTarget.c_str(),
-                                                              static_cast<uint32_t>(acct.account.device_id));
-            if (callId == 0) {
-                std::cerr << "[daemon][" << accountConfig.name << "] FAIL: signal2sip_call_start_outgoing failed\n";
+            // outgoing_call_target may be a plain e164 now, not just an
+            // already-known ACI/PNI - resolveOutgoingTarget leaves an
+            // actual ServiceId untouched and only hits the network (real,
+            // rate-limited CDSI) for an e164 that isn't already cached
+            // from a previous resolution. See ContactResolver.h.
+            std::string resolvedTarget;
+            try {
+                resolvedTarget = resolveOutgoingTarget(*acct.socket, *acct.storage, accountConfig.outgoingCallTarget,
+                                                        g_global.resolvedContactTtlSec);
+            } catch (const std::exception& e) {
+                std::cerr << "[daemon][" << accountConfig.name << "] FAIL: could not resolve outgoing_call_target '"
+                           << accountConfig.outgoingCallTarget << "': " << e.what() << "\n";
+                resolvedTarget.clear();
+            }
+            if (!resolvedTarget.empty()) {
+                std::cout << "[daemon][" << accountConfig.name << "] placing outgoing call to "
+                           << accountConfig.outgoingCallTarget << " (resolved: " << resolvedTarget << ")\n";
+                uint64_t callId = signal2sip_call_start_outgoing(acct.handle, resolvedTarget.c_str(),
+                                                                  static_cast<uint32_t>(acct.account.device_id));
+                if (callId == 0) {
+                    std::cerr << "[daemon][" << accountConfig.name
+                               << "] FAIL: signal2sip_call_start_outgoing failed\n";
+                }
             }
         } else {
             std::cout << "[daemon][" << accountConfig.name << "] waiting for incoming calls\n";

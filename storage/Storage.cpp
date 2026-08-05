@@ -2,6 +2,7 @@
 
 #include <sqlcipher/sqlite3.h>
 
+#include <ctime>
 #include <stdexcept>
 
 #include "generated/schema_sql.h"
@@ -356,6 +357,33 @@ std::optional<Bytes> Storage::loadRemoteIdentity(const std::string& address) {
     bindText(stmt, 2, address);
     if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
     return columnBlob(stmt, 0);
+}
+
+void Storage::saveResolvedContact(const std::string& e164, const std::string& aci, const std::string& pni) {
+    Stmt stmt(db_,
+        "INSERT INTO resolved_contact (account_name, e164, aci, pni, resolved_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (account_name, e164) DO UPDATE SET aci = excluded.aci, pni = excluded.pni, "
+        "resolved_at = excluded.resolved_at");
+    bindText(stmt, 1, accountName_);
+    bindText(stmt, 2, e164);
+    bindText(stmt, 3, aci);
+    bindText(stmt, 4, pni);
+    sqlite3_bind_int64(stmt, 5, static_cast<int64_t>(std::time(nullptr)));
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("saveResolvedContact failed: ") + sqlite3_errmsg(db_));
+    }
+}
+
+std::optional<ResolvedContactRecord> Storage::loadResolvedContact(const std::string& e164) {
+    Stmt stmt(db_, "SELECT aci, pni, resolved_at FROM resolved_contact WHERE account_name = ? AND e164 = ?");
+    bindText(stmt, 1, accountName_);
+    bindText(stmt, 2, e164);
+    if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
+    ResolvedContactRecord result;
+    result.aci = columnText(stmt, 0);
+    result.pni = columnText(stmt, 1);
+    result.resolved_at = sqlite3_column_int64(stmt, 2);
+    return result;
 }
 
 } // namespace signal2sip

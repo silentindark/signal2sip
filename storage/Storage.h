@@ -42,6 +42,14 @@ struct KyberPrekeyRecord {
     Bytes record;
 };
 
+// A cached CDSI lookup result (see native/signal/Cdsi.h) - aci/pni are ""
+// for a resolved-but-not-found e164, distinct from no cache entry at all
+// (see Storage::loadResolvedContact's own doc comment).
+struct ResolvedContactRecord {
+    std::string aci, pni;
+    int64_t resolved_at = 0;
+};
+
 // Encrypted (SQLCipher) local storage, scoped to one Signal account via
 // `accountName` - multiple Storage instances (one per account) can (and
 // normally do) point at the same shared database file/path, each opening
@@ -91,6 +99,12 @@ public:
     // use store, matching AccountIdentityStore's semantics.
     void saveRemoteIdentity(const std::string& address, const Bytes& publicKey);
     std::optional<Bytes> loadRemoteIdentity(const std::string& address);
+
+    // e164 must include the leading '+'. std::nullopt means "never looked
+    // up" - distinct from a cached record with empty aci/pni, which means
+    // "looked up, genuinely not on Signal".
+    void saveResolvedContact(const std::string& e164, const std::string& aci, const std::string& pni);
+    std::optional<ResolvedContactRecord> loadResolvedContact(const std::string& e164);
 
 private:
     sqlite3* db_ = nullptr;

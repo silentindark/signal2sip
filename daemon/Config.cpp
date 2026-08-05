@@ -99,6 +99,8 @@ DaemonConfig DaemonConfig::load(const std::string& path) {
     daemon.global.sipPort = static_cast<unsigned>(std::stoul(getOr(ini, "global", "sip_port", "5063")));
     daemon.global.sipRegWatchdogSec =
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "sip_reg_watchdog_sec", "60")));
+    daemon.global.resolvedContactTtlSec =
+        static_cast<unsigned>(std::stoul(getOr(ini, "global", "resolved_contact_ttl_sec", "86400")));
 
     // Zero accounts is a valid (if useless for the daemon itself) config -
     // gendb (native/gendb/) needs to load a config that has [global] but
@@ -120,6 +122,7 @@ DaemonConfig DaemonConfig::load(const std::string& path) {
         account.sipExtension = getOr(ini, section, "sip_extension", "");
         account.sipPassword = getOr(ini, section, "sip_password", "");
         account.sipBridgeDestination = getOr(ini, section, "sip_bridge_destination", "");
+        account.sipBridgeDid = getOr(ini, section, "sip_bridge_did", "");
         account.sipSrtp = getOr(ini, section, "sip_srtp", "disabled");
         if (account.sipSrtp != "disabled" && account.sipSrtp != "optional" && account.sipSrtp != "mandatory") {
             throw std::runtime_error("signal2sip.conf: [" + section +

@@ -77,6 +77,19 @@ struct GlobalConfig {
     // until the whole daemon is restarted, which needlessly disrupts
     // every other account too. See main.cpp's registration-watchdog loop.
     unsigned sipRegWatchdogSec = 60;
+
+    // How long (seconds) a cached e164->ACI/PNI resolution (see
+    // ContactResolver.h / native/signal/Cdsi.h / the resolved_contact
+    // table) is trusted before outgoing_call_target re-resolves it via a
+    // real Contact Discovery Service lookup instead of reusing the cached
+    // row. Real CDS lookups are rate-limited per account, so this isn't
+    // just an optimization - too low defeats the point of caching at all.
+    // Default 1 day: long enough that a normal outgoing_call_target
+    // (checked once per account setup, not per call attempt) essentially
+    // never re-resolves in practice, short enough that a target who
+    // genuinely changed numbers (see project notes: PNI, unlike ACI,
+    // changes with a real number change) doesn't stay wrong indefinitely.
+    unsigned resolvedContactTtlSec = 86400;
 };
 
 struct AccountConfig {
@@ -103,7 +116,25 @@ struct AccountConfig {
     std::string sipPassword;
     // What to dial out to when bridging an incoming Signal call to SIP -
     // e.g. "*43" for DPDZK's echo test, or a real destination extension.
+    // Only meaningful when this account's PJSIP endpoint context on the
+    // Asterisk/FreePBX side is "from-internal" (the usual FreePBX default
+    // for a plain extension) - the dialed value is looked up as an
+    // internal extension there, so it has to already BE one.
     std::string sipBridgeDestination;
+
+    // Same underlying mechanic (see startSipBridge()'s destUri
+    // construction - both fields end up dialed the exact same way, this
+    // is purely about which one an account fills in), but for an account
+    // whose PJSIP endpoint context is instead "from-pstn" (matching
+    // tg2sip's own convention) - the dialed value there is a DID that
+    // FreePBX's own Inbound Route (configured in the GUI, not here) uses
+    // to decide the REAL destination: ring group, IVR, time conditions,
+    // failover, all changeable without touching this config or
+    // restarting the daemon. If both this and sipBridgeDestination are
+    // set, this one wins - matches the corresponding Asterisk endpoint
+    // only ever having ONE context, never both at once, so only one of
+    // these two should realistically ever be set per account anyway.
+    std::string sipBridgeDid;
 
     // Secure media transport (SDES-SRTP) for the RTP leg to Asterisk -
     // NOT the Signal-side call encryption (already independently handled
@@ -159,12 +190,14 @@ struct AccountConfig {
     // Config.cpp), not a silent insecure default.
     bool sipTlsInsecure = false;
 
-    // The other account to place a test outgoing call to, if set - must
-    // be the target's ACI/UUID, not its e164 (GET /v2/keys/{e164}/* 404s
-    // on the current Signal server; own ACI is logged at startup).
-    // Matches this milestone's live-verification step (a real Signal call
-    // from one signal2sip-daemon account to another's ACI). Empty means
-    // this account only answers incoming calls.
+    // The other account to place a test outgoing call to, if set - either
+    // a ServiceId (ACI/PNI UUID, own ACI is logged at startup) or a plain
+    // e164 phone number ('+' prefixed). An e164 is resolved to a real
+    // ServiceId via CDSI (see ContactResolver.h/native/signal/Cdsi.h) the
+    // first time it's used - GET /v2/keys/{e164}/* itself 404s on the
+    // current Signal server, only a ServiceId works there, which is
+    // exactly the problem CDSI resolution solves. Empty means this account
+    // only answers incoming calls.
     std::string outgoingCallTarget;
 
     bool hasSip() const { return !sipHost.empty(); }

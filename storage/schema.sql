@@ -91,3 +91,24 @@ CREATE TABLE IF NOT EXISTS remote_identity (
     public_key      BLOB NOT NULL,
     PRIMARY KEY (account_name, address)
 );
+
+-- Cached e164 -> ACI/PNI resolution results from real Contact Discovery
+-- Service (CDSI) lookups - see native/signal/Cdsi.h. Avoids re-hitting
+-- Signal's real, rate-limited CDS endpoint for the same outgoing_call_target
+-- on every daemon (re)start. aci/pni are '' (not NULL) for a *resolved*
+-- negative result (looked up, genuinely not on Signal) - distinct from no
+-- row at all (never looked up yet). Kept per-account, like every other
+-- table here, even though the real-world answer doesn't actually depend on
+-- which of our accounts asked - simpler than a cross-account-shared table,
+-- and CDS lookups are already rate-limited per-account regardless.
+-- resolved_at has no automatic expiry (yet) - a stale row (e.g. the target
+-- reassigned their old number) just means a wrong cached serviceId, not a
+-- protocol-breaking one; revisit only if that turns out to matter live.
+CREATE TABLE IF NOT EXISTS resolved_contact (
+    account_name    TEXT NOT NULL REFERENCES account(account_name),
+    e164            TEXT NOT NULL,
+    aci             TEXT NOT NULL,          -- '' if not found on Signal at all
+    pni             TEXT NOT NULL,          -- '' if aci is also ''
+    resolved_at     INTEGER NOT NULL,       -- unix seconds
+    PRIMARY KEY (account_name, e164)
+);

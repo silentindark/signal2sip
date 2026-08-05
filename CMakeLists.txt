@@ -198,6 +198,7 @@ add_library(signal2sip_signal STATIC
     signal/ProtocolStores.cpp
     signal/Crypto.cpp
     signal/PreKeys.cpp
+    signal/Cdsi.cpp
 )
 target_include_directories(signal2sip_signal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_signal PUBLIC signal2sip_storage signal2sip_padding signal2sip_util libsignal_ffi
@@ -216,6 +217,35 @@ target_link_libraries(decryption_error_message_test PRIVATE signal2sip_signal)
 add_executable(refresh_prekeys_test test/refresh_prekeys_test.cpp)
 target_link_libraries(refresh_prekeys_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
     nlohmann_json::nlohmann_json)
+
+# Live verification for Cdsi.h (see that file's own doc comment) - needs
+# AuthSocket only to fetch the short-lived directory-service token
+# (GET /v2/directory/auth); CDSI itself is a separate libsignal `net`
+# transport, not signal2sip's usual chat.signal.org websocket.
+add_executable(cdsi_lookup_test test/cdsi_lookup_test.cpp)
+target_link_libraries(cdsi_lookup_test PRIVATE signal2sip_signal signal2sip_authsocket nlohmann_json::nlohmann_json)
+
+# One-off scratch helper (see the file's own doc comment) - not linked into
+# anything else, exists purely to feed refresh_prekeys_test/cdsi_lookup_test
+# a real account's credentials without hand-copying them out of the DB.
+add_executable(dump_account_json_test test/dump_account_json_test.cpp)
+target_link_libraries(dump_account_json_test PRIVATE signal2sip_storage nlohmann_json::nlohmann_json)
+
+# Live verification for ContactResolver.h - the cache+CDSI resolution path
+# signal2sip-daemon itself now uses for outgoing_call_target, minus the
+# actual signal2sip_call_start_outgoing call (so this never places a real
+# call to whatever target it's given).
+add_executable(resolve_outgoing_target_test test/resolve_outgoing_target_test.cpp)
+target_link_libraries(resolve_outgoing_target_test PRIVATE signal2sip_daemon signal2sip_storage
+    signal2sip_authsocket)
+
+# Isolation test for the "no active codec"/PJSIP_ESESSIONINSECURE bugs
+# found live 08-04 in startSipBridge() - mirrors main.cpp's shared-Endpoint
+# SIP setup exactly (no RingRTC/Signal at all) so this can be iterated on
+# without needing a real phone call each time.
+add_executable(sip_bridge_codec_test test/sip_bridge_codec_test.cpp)
+target_include_directories(sip_bridge_codec_test PRIVATE ${PJSIP_INCLUDE_DIRS})
+target_link_libraries(sip_bridge_codec_test PRIVATE PkgConfig::PJSIP)
 
 # RingRTC's Milestone D/E C ABI (see /home/vlad/.claude/plans/
 # jiggly-mapping-plum.md and this project's memory) - built via `cargo
@@ -318,6 +348,7 @@ target_include_directories(signal2sip_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # protobufs and RingRTC's C ABI - see native/daemon/CallSignaling.h.
 add_library(signal2sip_daemon STATIC
     daemon/CallSignaling.cpp
+    daemon/ContactResolver.cpp
 )
 target_include_directories(signal2sip_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_authsocket signal2sip_proto
