@@ -1,5 +1,6 @@
 #include "CallSignaling.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 
@@ -250,13 +251,11 @@ std::vector<int> CallMessageSender::resolveDeviceList(const std::string& remoteP
     return deviceIds;
 }
 
-std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePeerId,
-                                                      const signalservice::CallMessage& callMessage) {
-    std::vector<int> deviceIds = resolveDeviceList(remotePeerId);
+std::vector<int> CallMessageSender::sendContent(const std::string& destinationServiceId,
+                                                  const signalservice::Content& content) {
+    std::vector<int> deviceIds = resolveDeviceList(destinationServiceId);
     if (deviceIds.empty()) return deviceIds;
 
-    signalservice::Content content;
-    *content.mutable_callmessage() = callMessage;
     std::string contentBytes;
     content.SerializeToString(&contentBytes);
     Bytes plaintext(contentBytes.begin(), contentBytes.end());
@@ -279,9 +278,9 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
         std::lock_guard<std::mutex> lock(stores_.mutex());
         for (int deviceId : deviceIds) {
             EncryptedMessage encrypted = encryptForDevice(
-                stores_, localAddress, Address{remotePeerId, static_cast<uint32_t>(deviceId)}, plaintext);
+                stores_, localAddress, Address{destinationServiceId, static_cast<uint32_t>(deviceId)}, plaintext);
             int envelopeType = encrypted.type == SignalCiphertextMessageTypePreKey ? 3 : 1;
-            std::string address = remotePeerId + "." + std::to_string(deviceId);
+            std::string address = destinationServiceId + "." + std::to_string(deviceId);
             messages.push_back(
                 {{"type", envelopeType},
                  {"destinationDeviceId", deviceId},
@@ -290,22 +289,72 @@ std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePee
         }
     }
 
-    auto response = putMessages(socket_, remotePeerId, messages, /*online=*/true);
+    auto response = putMessages(socket_, destinationServiceId, messages, /*online=*/true);
+    if (response.status == 409) {
+        // {"missingDevices":[...],"extraDevices":[...]} - found live
+        // 2026-08-05 sending sendKeysRequest() to a real, ~1-year-old
+        // account: GET /v2/keys/{self}/* listed a device id the account's
+        // real current device list no longer has (a genuinely stale
+        // prekey-bundle row, not anything this project's own cache could
+        // have caused - a fresh process, empty deviceListCache_, hit this
+        // on its very first self-addressed send). extraDevices is
+        // actionable without another key fetch (just drop those entries
+        // and retry once); missingDevices would need fresh key bundles
+        // for devices we don't have yet, which this project's simple
+        // sender doesn't attempt - if that ever shows up non-empty here,
+        // this retry can't fully recover and the caller just sees the
+        // (still 409) result below.
+        std::string bodyStr(response.body.begin(), response.body.end());
+        try {
+            json errorBody = json::parse(bodyStr);
+            std::vector<int> extraDevices = errorBody.value("extraDevices", std::vector<int>{});
+            if (!extraDevices.empty()) {
+                json retryMessages = json::array();
+                for (const auto& m : messages) {
+                    int deviceId = m.at("destinationDeviceId").get<int>();
+                    if (std::find(extraDevices.begin(), extraDevices.end(), deviceId) == extraDevices.end()) {
+                        retryMessages.push_back(m);
+                    }
+                }
+                std::cout << "[daemon] PUT /v1/messages/" << destinationServiceId
+                           << " -> 409, retrying without " << extraDevices.size() << " extra device(s)\n";
+                if (!retryMessages.empty()) {
+                    response = putMessages(socket_, destinationServiceId, retryMessages, /*online=*/true);
+                }
+            }
+        } catch (const std::exception&) {
+            // Malformed/unexpected error body - fall through, handled as a
+            // plain failure below like any other non-2xx response.
+        }
+    }
     if (response.status / 100 != 2) {
-        std::cerr << "[daemon] PUT /v1/messages/" << remotePeerId << " -> " << response.status << " (body: "
+        std::cerr << "[daemon] PUT /v1/messages/" << destinationServiceId << " -> " << response.status << " (body: "
                    << std::string(response.body.begin(), response.body.end()) << ")\n";
         // Mismatched/stale devices - the cached list (or a device's
         // registration id within it) is wrong; drop it so the next send
         // fetches fresh instead of repeating the same failure.
         if (response.status == 409 || response.status == 410) {
             std::lock_guard<std::mutex> lock(stores_.mutex());
-            deviceListCache_.erase(remotePeerId);
+            deviceListCache_.erase(destinationServiceId);
         }
     } else {
-        std::cout << "[daemon] PUT /v1/messages/" << remotePeerId << " -> " << response.status << " ("
+        std::cout << "[daemon] PUT /v1/messages/" << destinationServiceId << " -> " << response.status << " ("
                    << deviceIds.size() << " device(s))\n";
     }
     return deviceIds;
+}
+
+std::vector<int> CallMessageSender::sendCallMessage(const std::string& remotePeerId,
+                                                      const signalservice::CallMessage& callMessage) {
+    signalservice::Content content;
+    *content.mutable_callmessage() = callMessage;
+    return sendContent(remotePeerId, content);
+}
+
+void CallMessageSender::sendKeysRequest() {
+    signalservice::Content content;
+    content.mutable_syncmessage()->mutable_request()->set_type(signalservice::SyncMessage_Request_Type_KEYS);
+    sendContent(localServiceId_, content);
 }
 
 void CallMessageSender::sendOffer(const std::string& remotePeerId, uint64_t callId, int32_t mediaType,

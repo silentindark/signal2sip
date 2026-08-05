@@ -996,6 +996,24 @@ void onPush(AccountState& acct, const std::string& verb, const std::string& path
         std::cout << "[daemon][" << acct.config.name << "][diag] DataMessage body: " << content.datamessage().body()
                    << "\n";
     }
+    // A real primary device sends this (SyncMessage.Keys) whenever an
+    // already-linked secondary device's account_entropy_pool needs
+    // updating - e.g. after a rotation, or in response to this account's
+    // own sendKeysRequest() (see syncStorageContacts()/setupAccount()).
+    // Found live 2026-08-05: before this handler existed, any such update
+    // was silently dropped (this dispatch only ever looked at
+    // DataMessage/CallMessage), so a linked account's locally-stored AEP
+    // could go stale forever relative to whatever's actually encrypting
+    // its real StorageService data - see project memory
+    // project_signal2sip_storage_service_sync.md for the live account
+    // this was found on.
+    if (content.has_syncmessage() && content.syncmessage().has_keys() &&
+        content.syncmessage().keys().has_accountentropypool()) {
+        acct.account.account_entropy_pool = content.syncmessage().keys().accountentropypool();
+        acct.storage->saveAccount(acct.account);
+        std::cout << "[daemon][" << acct.config.name
+                   << "] received updated account_entropy_pool via SyncMessage.Keys, saved\n";
+    }
     if (!content.has_callmessage()) return;
 
     std::cout << "[daemon][" << acct.config.name << "] CallMessage from " << senderServiceId << " device "
@@ -1318,6 +1336,28 @@ bool setupAccount(const AccountConfig& accountConfig) {
         // Initial sync - see main()'s own storage-sync loop for the
         // periodic re-sync every g_global.storageSyncIntervalSec.
         syncStorageContacts(acct);
+
+        // Ask the real primary device (if any) to resend this account's
+        // current account_entropy_pool - see sendKeysRequest()'s own doc
+        // comment and main.cpp's SyncMessage.Keys handling in the
+        // envelope dispatch for where the (async, only-if/when-the-
+        // primary-is-online) reply gets applied. One-shot at startup only
+        // (not on every periodic storage-sync tick) - this is a "fix a
+        // possibly-stale local key" nudge, not something to repeat
+        // indefinitely. Wrapped in try/catch - found live 2026-08-05 that
+        // an uncaught exception here (e.g. a real 429 from repeatedly
+        // restarting the daemon during testing, hitting Signal-Server's
+        // PRE_KEYS rate limit) aborted this WHOLE setupAccount() call,
+        // taking SIP registration down with it - a best-effort key-sync
+        // nudge should never be able to do that.
+        if (acct.account.account_entropy_pool && !acct.account.account_entropy_pool->empty()) {
+            try {
+                acct.sender->sendKeysRequest();
+            } catch (const std::exception& e) {
+                std::cerr << "[daemon][" << accountConfig.name << "] sendKeysRequest failed (non-fatal): " << e.what()
+                           << "\n";
+            }
+        }
 
         if (accountConfig.hasSip()) {
             ensureSharedEndpoint(); // no-ops if g_ep already exists

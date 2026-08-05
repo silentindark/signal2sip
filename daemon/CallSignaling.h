@@ -58,6 +58,17 @@ public:
                  uint32_t receiverDeviceId, const uint8_t* opaque, size_t opaqueLen);
     void sendHangup(const std::string& remotePeerId, uint64_t callId, int32_t hangupType, uint32_t hangupDeviceId);
 
+    // Sends SyncMessage{request: {type: KEYS}} to this account's OTHER
+    // devices (addressed to localServiceId_ itself - the server fans a
+    // self-addressed message out to every OTHER device on the account,
+    // never back to the sender). Asks the real primary device to resend
+    // its current account_entropy_pool (and media root backup key) via a
+    // SyncMessage.Keys reply - see main.cpp's envelope dispatch for where
+    // that reply gets applied. Fire-and-forget: the reply arrives
+    // asynchronously (only if/when the primary is online), there's
+    // nothing meaningful to return here.
+    void sendKeysRequest();
+
     // Fetches+processes a prekey bundle for every current device of
     // remotePeerId (the server requires every device to be addressed on
     // every send - see the .cpp definition's doc comment) and returns the
@@ -74,6 +85,14 @@ public:
     std::vector<int> resolveDeviceList(const std::string& remotePeerId);
 
 private:
+    // Encrypts+sends the given already-built Content to every device
+    // resolveDeviceList() returns for destinationServiceId. Returns the
+    // device ids actually sent to. Shared by sendCallMessage() (below) and
+    // sendKeysRequest() (above) - the only difference between a call
+    // message and a sync message at this layer is which Content field is
+    // populated and who the destination is.
+    std::vector<int> sendContent(const std::string& destinationServiceId, const signalservice::Content& content);
+
     // Encrypts+sends the given CallMessage to every device resolveDeviceList()
     // returns. Returns the device ids actually sent to.
     std::vector<int> sendCallMessage(const std::string& remotePeerId, const signalservice::CallMessage& callMessage);
