@@ -100,6 +100,8 @@ DaemonConfig DaemonConfig::load(const std::string& path) {
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "sip_reg_watchdog_sec", "60")));
     daemon.global.resolvedContactTtlSec =
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "resolved_contact_ttl_sec", "86400")));
+    daemon.global.storageSyncIntervalSec =
+        static_cast<unsigned>(std::stoul(getOr(ini, "global", "storage_sync_interval_sec", "43200")));
 
     // Zero accounts is a valid (if useless for the daemon itself) config -
     // gendb (native/gendb/) needs to load a config that has [global] but

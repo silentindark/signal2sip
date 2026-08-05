@@ -295,9 +295,47 @@ struct AccountState {
     pj::Call* incomingSipCall = nullptr;
 
     EnvelopeDispatchQueue dispatchQueue;
+
+    // Epoch-ms of the last StorageService sync attempt (success or
+    // failure - see main()'s own storage-sync loop, right next to the
+    // registration watchdog) - 0 means never attempted yet this process
+    // lifetime (setupAccount()'s own initial sync sets this too, so the
+    // periodic loop doesn't immediately redo it on the next tick).
+    int64_t lastStorageSyncMs = 0;
 };
 
 std::map<std::string, std::unique_ptr<AccountState>> g_accounts; // keyed by AccountConfig::name
+
+// Only a gendb-linked account (a real device linked into a real,
+// already-in-use Signal account) has a meaningful contact list to sync at
+// all - a bare gendb-registered account has no real contacts, and no
+// account_entropy_pool to derive the storage service key from either.
+// Always updates lastStorageSyncMs (success or failure) so callers on a
+// periodic timer don't retry a persistently-failing sync every tick - see
+// GlobalConfig::storageSyncIntervalSec's own doc comment. Non-fatal on
+// failure either way: resolveOutgoingTarget() just falls back to its
+// existing CDS-only path (PNI-only for a cold e164) - see
+// StorageServiceSync.h's own doc comment for the full "why" this exists.
+void syncStorageContacts(AccountState& acct) {
+    acct.lastStorageSyncMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+    if (!acct.account.account_entropy_pool || acct.account.account_entropy_pool->empty()) return;
+    try {
+        std::vector<StorageContact> contacts = fetchStorageContacts(*acct.socket, *acct.account.account_entropy_pool);
+        int cachedCount = 0;
+        for (const auto& contact : contacts) {
+            if (contact.e164.empty()) continue; // nothing to key resolveOutgoingTarget's cache by
+            acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
+            cachedCount++;
+        }
+        std::cout << "[daemon][" << acct.config.name << "] StorageService sync: " << contacts.size() << " contact(s), "
+                   << cachedCount << " cached (had an e164)\n";
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon][" << acct.config.name << "] StorageService sync failed (non-fatal): " << e.what()
+                   << "\n";
+    }
+}
 
 // --- RingRTC -> Signal CallMessage (send side) ---
 
@@ -1277,31 +1315,9 @@ bool setupAccount(const AccountConfig& accountConfig) {
 
         refreshPrekeys(*acct.storage, *acct.socket, acct.account);
 
-        // Only a gendb-linked account (a real device linked into a real,
-        // already-in-use Signal account) has a meaningful contact list to
-        // sync at all - a bare gendb-registered account has no real
-        // contacts, and no account_entropy_pool to derive the storage
-        // service key from either. Non-fatal: a sync failure just means
-        // resolveOutgoingTarget() falls back to its existing CDS-only
-        // path (PNI-only for a cold e164) - see StorageServiceSync.h's own
-        // doc comment for the full "why".
-        if (acct.account.account_entropy_pool && !acct.account.account_entropy_pool->empty()) {
-            try {
-                std::vector<StorageContact> contacts =
-                    fetchStorageContacts(*acct.socket, *acct.account.account_entropy_pool);
-                int cachedCount = 0;
-                for (const auto& contact : contacts) {
-                    if (contact.e164.empty()) continue; // nothing to key resolveOutgoingTarget's cache by
-                    acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
-                    cachedCount++;
-                }
-                std::cout << "[daemon][" << accountConfig.name << "] StorageService sync: " << contacts.size()
-                           << " contact(s), " << cachedCount << " cached (had an e164)\n";
-            } catch (const std::exception& e) {
-                std::cerr << "[daemon][" << accountConfig.name << "] StorageService sync failed (non-fatal): "
-                           << e.what() << "\n";
-            }
-        }
+        // Initial sync - see main()'s own storage-sync loop for the
+        // periodic re-sync every g_global.storageSyncIntervalSec.
+        syncStorageContacts(acct);
 
         if (accountConfig.hasSip()) {
             ensureSharedEndpoint(); // no-ops if g_ep already exists
@@ -1607,6 +1623,22 @@ int main(int argc, char** argv) {
                 // down next tick, we'll try again after another full
                 // watchdog interval rather than spamming every 200ms.
                 sipAccount->unregisteredSinceMs = nowMs;
+            }
+        }
+
+        // Periodic StorageService re-sync - see syncStorageContacts()'s own
+        // doc comment and GlobalConfig::storageSyncIntervalSec's. Runs
+        // synchronously on this same loop/thread like everything else here
+        // (matches this codebase's existing style - nothing in main()'s
+        // loop is async) - a real network hiccup could block this loop
+        // (and therefore the registration watchdog above, SIGHUP handling,
+        // etc.) for up to ~90s worst case (3 sequential 30s-timeout HTTP
+        // calls inside fetchStorageContacts()), but only once per account
+        // per storageSyncIntervalSec (12h default), not every 200ms tick.
+        for (auto& [name, acctPtr] : g_accounts) {
+            AccountState& acct = *acctPtr;
+            if (nowMs - acct.lastStorageSyncMs >= static_cast<int64_t>(g_global.storageSyncIntervalSec) * 1000) {
+                syncStorageContacts(acct);
             }
         }
 

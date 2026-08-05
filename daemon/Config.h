@@ -79,6 +79,20 @@ struct GlobalConfig {
     // genuinely changed numbers (see project notes: PNI, unlike ACI,
     // changes with a real number change) doesn't stay wrong indefinitely.
     unsigned resolvedContactTtlSec = 86400;
+
+    // How often (seconds) each account with a real account_entropy_pool
+    // (i.e. gendb-linked, see StorageServiceSync.h) re-syncs its real
+    // contact list from Signal's StorageService - see main.cpp's
+    // storage-sync loop, right next to the registration watchdog above.
+    // fetchStorageContacts() only ever ran once at startup before this
+    // (2026-08-05) - a contact added/changed on the real primary device
+    // afterward would never be picked up until the whole daemon
+    // restarted. Default 12 hours: real contact lists change rarely, and
+    // this hits Signal's real storage.signal.org host (not just a local
+    // DB), so this shouldn't be aggressive - but also shouldn't need to
+    // be as long as resolvedContactTtlSec above, since unlike a CDS
+    // lookup this isn't separately rate-limited per-target.
+    unsigned storageSyncIntervalSec = 43200;
 };
 
 struct AccountConfig {
