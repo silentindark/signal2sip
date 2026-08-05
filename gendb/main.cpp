@@ -42,11 +42,11 @@
 
 #include "AccountFinisher.h"
 #include "ProvisioningClient.h"
-#include "RegistrationClient.h"
 #include "../daemon/Config.h"
 #include "../signal/FfiUtil.h"
 #include "../storage/Storage.h"
 #include "../util/Base64.h"
+#include "../util/RegistrationClient.h"
 
 using namespace signal2sip;
 using json = nlohmann::json;

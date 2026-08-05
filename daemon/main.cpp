@@ -44,6 +44,7 @@
 #include <sstream>
 #include <thread>
 
+#include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <pjmedia/resample.h>
 #include <pjsua-lib/pjsua.h>
@@ -52,6 +53,7 @@
 #include "CallSignaling.h"
 #include "Config.h"
 #include "ContactResolver.h"
+#include "StorageServiceSync.h"
 #include "../ringrtc/signal2sip_ringrtc.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/Crypto.h"
@@ -284,7 +286,13 @@ struct AccountState {
     // still have its own call active concurrently, see this file's
     // top-of-file comment.
     std::unique_ptr<voip::RingRtcSipBridge> bridge;
-    pj::Call* sipCall = nullptr;
+    pj::Call* sipCall = nullptr; // BridgeCall - we're bridging OUT to the PBX
+
+    // IncomingSipCall - a real SIP INVITE arrived FROM the PBX and we're
+    // placing/running an outgoing Signal call in response (opposite
+    // direction from sipCall above; still only one of the two at a time,
+    // same one-call-per-account scope).
+    pj::Call* incomingSipCall = nullptr;
 
     EnvelopeDispatchQueue dispatchQueue;
 };
@@ -358,6 +366,39 @@ void onSendHangup(void* context, const char* remotePeerId, uint64_t callId, int3
 
 // --- SIP bridging (mirrors pjsip_ringrtc_echo_test.cpp's BridgeCall) ---
 
+// Shared by BridgeCall and IncomingSipCall's onCallMediaState - identical
+// resample-port wiring regardless of which direction the SIP leg is
+// going. Non-resampling PJSIP conference bridge in this build - see
+// pjsip_ringrtc_echo_test.cpp's onCallMediaState for the full story
+// (real 488 Not Acceptable Here forcing 48kHz against DPDZK's *43, this
+// resample-port approach is the fix that works for any call regardless
+// of negotiated codec).
+void wireBridgeAudio(pj::Call& call, voip::RingRtcSipBridge& bridge) {
+    pj::CallInfo ci = call.getInfo();
+    for (unsigned i = 0; i < ci.media.size(); i++) {
+        if (ci.media[i].type != PJMEDIA_TYPE_AUDIO || !call.getMedia(i)) continue;
+        auto* aud = static_cast<pj::AudioMedia*>(call.getMedia(i));
+        unsigned callRate = aud->getPortInfo().format.clockRate;
+        std::cout << "[daemon][sip] call clock rate: " << callRate << "\n";
+
+        pj_pool_t* pool = pjsua_pool_create("resample", 2048, 512);
+        pjmedia_port* inResample = nullptr;
+        pjmedia_resample_port_create(pool, bridge.InputPjmediaPort(), callRate, 0, &inResample);
+        pjsua_conf_port_id inResampleId = PJSUA_INVALID_ID;
+        pjsua_conf_add_port(pool, inResample, &inResampleId);
+        pjsua_conf_connect(aud->getPortId(), inResampleId);
+
+        pjmedia_port* outResample = nullptr;
+        pjmedia_resample_port_create(pool, bridge.OutputPjmediaPort(), callRate, 0, &outResample);
+        pjsua_conf_port_id outResampleId = PJSUA_INVALID_ID;
+        pjsua_conf_add_port(pool, outResample, &outResampleId);
+        pjsua_conf_connect(outResampleId, aud->getPortId());
+
+        std::cout << "[daemon][sip] audio wired to RingRtcSipBridge via resample ports\n";
+        bridge.Start();
+    }
+}
+
 class BridgeCall : public pj::Call {
 public:
     // `acct` lets onCallState() reach back into the Signal-side call (see
@@ -404,36 +445,7 @@ public:
         }
     }
 
-    void onCallMediaState(pj::OnCallMediaStateParam&) override {
-        pj::CallInfo ci = getInfo();
-        for (unsigned i = 0; i < ci.media.size(); i++) {
-            if (ci.media[i].type != PJMEDIA_TYPE_AUDIO || !getMedia(i)) continue;
-            auto* aud = static_cast<pj::AudioMedia*>(getMedia(i));
-            unsigned callRate = aud->getPortInfo().format.clockRate;
-            std::cout << "[daemon][sip] call clock rate: " << callRate << "\n";
-
-            // Non-resampling PJSIP conference bridge in this build - see
-            // pjsip_ringrtc_echo_test.cpp's onCallMediaState for the full
-            // story (real 488 Not Acceptable Here forcing 48kHz against
-            // DPDZK's *43, this resample-port approach is the fix that
-            // works for any call regardless of negotiated codec).
-            pj_pool_t* pool = pjsua_pool_create("resample", 2048, 512);
-            pjmedia_port* inResample = nullptr;
-            pjmedia_resample_port_create(pool, bridge_.InputPjmediaPort(), callRate, 0, &inResample);
-            pjsua_conf_port_id inResampleId = PJSUA_INVALID_ID;
-            pjsua_conf_add_port(pool, inResample, &inResampleId);
-            pjsua_conf_connect(aud->getPortId(), inResampleId);
-
-            pjmedia_port* outResample = nullptr;
-            pjmedia_resample_port_create(pool, bridge_.OutputPjmediaPort(), callRate, 0, &outResample);
-            pjsua_conf_port_id outResampleId = PJSUA_INVALID_ID;
-            pjsua_conf_add_port(pool, outResample, &outResampleId);
-            pjsua_conf_connect(outResampleId, aud->getPortId());
-
-            std::cout << "[daemon][sip] audio wired to RingRtcSipBridge via resample ports\n";
-            bridge_.Start();
-        }
-    }
+    void onCallMediaState(pj::OnCallMediaStateParam&) override { wireBridgeAudio(*this, bridge_); }
 
     std::atomic<bool> disconnected_{false};
     std::atomic<bool> weHungUp_{false}; // set by stopSipBridge() before its own hangup()
@@ -444,9 +456,62 @@ private:
     std::atomic<bool> acceptSent_{false};
 };
 
+// Handles the opposite direction from BridgeCall: a real SIP INVITE
+// arriving AT the daemon (from Asterisk/the PBX) that should place a real
+// outgoing Signal call - see BridgeAccount::onIncomingCall's own doc
+// comment for how the destination number and originating account get
+// picked. Not answered (200 OK) until the outgoing Signal call actually
+// reaches CONNECTED (see onCallState's own CONNECTED handler) - kept
+// Ringing until then so the caller sees real call progress instead of an
+// instant, possibly-wrong answer.
+class IncomingSipCall : public pj::Call {
+public:
+    IncomingSipCall(pj::Account& acc, int callId, voip::RingRtcSipBridge& bridge, AccountState& acct)
+        : pj::Call(acc, callId), bridge_(bridge), acct_(acct) {}
+
+    void onCallState(pj::OnCallStateParam&) override {
+        pj::CallInfo ci = getInfo();
+        std::cout << "[daemon][sip] incoming call state=" << ci.stateText << " (" << ci.state << ")\n";
+        if (ci.state == PJSIP_INV_STATE_DISCONNECTED) {
+            // Mirrors BridgeCall's own DISCONNECTED handling in the
+            // opposite direction: if the PBX/caller hung up or cancelled
+            // and this wasn't us hanging up first (weHungUp_, set by
+            // stopIncomingSipCall() before its own hangup()), end
+            // whatever the outgoing Signal call attempt is doing too -
+            // otherwise a caller hanging up before the Signal side ever
+            // answers would leave that outgoing call ringing forever.
+            if (!weHungUp_.exchange(true)) {
+                signal2sip_call_hangup(acct_.handle);
+            }
+            disconnected_ = true;
+        }
+    }
+
+    void onCallMediaState(pj::OnCallMediaStateParam&) override { wireBridgeAudio(*this, bridge_); }
+
+    std::atomic<bool> disconnected_{false};
+    std::atomic<bool> weHungUp_{false}; // set by stopIncomingSipCall() before its own hangup()
+
+private:
+    voip::RingRtcSipBridge& bridge_;
+    AccountState& acct_;
+};
+
 class BridgeAccount : public pj::Account {
 public:
     std::atomic<bool> registered{false};
+
+    // Set right after construction in setupAccount(), before this account
+    // can possibly receive any real SIP traffic - lets onIncomingCall()
+    // (defined out-of-line below, after g_global's declaration) know
+    // which Signal identity received the INVITE, so it knows which
+    // account to originate the resulting outgoing Signal call from.
+    AccountState* acctState = nullptr;
+
+    // Defined out-of-line after g_global (needed for
+    // resolvedContactTtlSec) - see its own doc comment there for the
+    // full "why".
+    void onIncomingCall(pj::OnIncomingCallParam& iprm) override;
 
     // Epoch-ms timestamp of the most recent transition into "not
     // registered" (0 while currently registered) - read by the
@@ -483,16 +548,17 @@ public:
 };
 
 // One shared PJSIP Endpoint for the whole process (pjsua2/PJSIP itself is
-// a process-wide singleton - only one Endpoint is possible per process,
-// unlike everything else in this file which is now per-account) - a
-// single UDP transport on it is shared by every account's pj::Account,
-// exactly like a real SIP softphone handling several registered lines
-// over one local port; PJSIP natively supports N accounts per Endpoint,
-// no separate transport-per-account needed. Created lazily (see
-// ensureSharedEndpoint()) the first time any account needs it - either at
-// startup or via a later SIGHUP reload - and never destroyed until
-// process exit. Read (never written after creation) from
-// startSipDial()'s libRegisterThread() call.
+// a process-wide singleton - only one Endpoint is possible per process).
+// Every account still gets its OWN dedicated transport off of this one
+// Endpoint though (see createAccountUdpTransport()/
+// createAccountTlsTransport()) - PJSIP can't reliably route an incoming
+// call to the right account when several accounts share one transport
+// and the Request-URI doesn't match any of their own identities (see
+// AccountConfig::sipTransport's own doc comment for the live bug this
+// caused). Created lazily (see ensureSharedEndpoint()) the first time any
+// account needs it - either at startup or via a later SIGHUP reload - and
+// never destroyed until process exit. Read (never written after
+// creation) from startSipDial()'s libRegisterThread() call.
 pj::Endpoint* g_ep = nullptr;
 std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
 
@@ -521,6 +587,44 @@ bool canBridgeToSip(const AccountConfig& config) {
     return it != g_sipAccounts.end() && it->second->registered.load();
 }
 
+// PJSUA2 requires every thread that calls into it to be registered with
+// PJLIB first (Endpoint::libRegisterThread()), unless it's the thread
+// that originally initialized the library (main()'s thread, which called
+// ep.libCreate()/libInit()/libStart()) or one of PJSIP's own worker
+// threads. Every function here that calls into pjsua2 from RingRTC's own
+// callback thread (onCallState() and anything it calls, e.g.
+// stopSipBridge()/stopIncomingSipCall() from the ENDED/CONCLUDED branch)
+// needs this, once per OS thread - found live in startSipDial() first:
+// without it, makeCall() still sent a real INVITE (the transport layer
+// tolerated the unregistered thread fine), but PJSIP's automatic
+// 401-challenge auto-retry - which relies on the dialog's thread-local
+// auth session state - never fired, so a real call to DPDZK's *43 got
+// exactly one INVITE, one 401, and then silently never connected.
+//
+// Found live again 2026-08-05, a second time: stopIncomingSipCall() was
+// calling call->hangup() from this same unregistered RingRTC callback
+// thread - unlike the Signal-call-bridges-to-SIP direction (where
+// startSipDial() always runs first for that call, on that same thread,
+// and registers it), the SIP-triggers-a-Signal-call direction has no
+// earlier pjsua2 call on that thread to register it first. Silently
+// broke that account's own SIP registration refresh a few seconds after
+// the next failed/timed-out call - not a crash, so it went unnoticed
+// until the registration itself quietly expired with nothing to renew
+// it (user's own diagnosis: registration died a few seconds after the
+// last failed Signal call, and stayed fine indefinitely when no call was
+// ever attempted).
+void registerPjsipThreadIfNeeded() {
+    thread_local bool registered = false;
+    if (!registered && g_ep) {
+        try {
+            g_ep->libRegisterThread("ringrtc-callback");
+        } catch (pj::Error& err) {
+            std::cerr << "[daemon] libRegisterThread failed: " << err.info() << "\n";
+        }
+        registered = true;
+    }
+}
+
 // Places an outbound SIP INVITE to bridgeTarget(acct.config) - called at
 // the incoming Signal call's Ringing state, deliberately BEFORE that
 // Signal call is ever accepted on this device. This is what lets the SIP
@@ -547,28 +651,7 @@ void startSipDial(AccountState& acct) {
     }
     BridgeAccount& sipAccount = *it->second;
 
-    // PJSUA2 requires every thread that calls into it to be registered
-    // with PJLIB first (Endpoint::libRegisterThread()), unless it's the
-    // thread that originally initialized the library (main()'s thread,
-    // which called ep.libCreate()/libInit()/libStart()) or one of
-    // PJSIP's own worker threads. onCallState() (and therefore this
-    // function) runs on whatever thread RingRTC invokes its call_state
-    // callback from - not main()'s thread - so register it here, once
-    // per OS thread. Found live: without this, makeCall() below still
-    // sent a real INVITE (the transport layer tolerated the unregistered
-    // thread fine), but PJSIP's automatic 401-challenge auto-retry -
-    // which relies on the dialog's thread-local auth session state -
-    // never fired, so a real call to DPDZK's *43 got exactly one INVITE,
-    // one 401, and then silently never connected.
-    thread_local bool sipThreadRegistered = false;
-    if (!sipThreadRegistered && g_ep) {
-        try {
-            g_ep->libRegisterThread("ringrtc-callback");
-        } catch (pj::Error& err) {
-            std::cerr << "[daemon] libRegisterThread failed: " << err.info() << "\n";
-        }
-        sipThreadRegistered = true;
-    }
+    registerPjsipThreadIfNeeded();
 
     acct.bridge = std::make_unique<voip::RingRtcSipBridge>(acct.handle);
 
@@ -597,6 +680,7 @@ void startSipDial(AccountState& acct) {
 }
 
 void stopSipBridge(AccountState& acct) {
+    registerPjsipThreadIfNeeded();
     if (acct.bridge) {
         acct.bridge->Stop();
     }
@@ -613,6 +697,33 @@ void stopSipBridge(AccountState& acct) {
         }
         delete call;
         acct.sipCall = nullptr;
+    }
+    acct.bridge.reset();
+}
+
+// Mirrors stopSipBridge() for the opposite direction (IncomingSipCall
+// instead of BridgeCall) - see AccountState::incomingSipCall's own doc
+// comment. acct.bridge is the same shared field either function may have
+// populated; harmless no-op here if the OTHER direction is what's
+// actually active (acct.bridge already null, guard below just skips).
+void stopIncomingSipCall(AccountState& acct) {
+    registerPjsipThreadIfNeeded();
+    if (acct.bridge) {
+        acct.bridge->Stop();
+    }
+    if (acct.incomingSipCall) {
+        auto* call = static_cast<IncomingSipCall*>(acct.incomingSipCall);
+        call->weHungUp_ = true; // before hangup() - see onCallState's DISCONNECTED handling
+        pj::CallOpParam hprm;
+        try {
+            call->hangup(hprm);
+        } catch (...) {
+        }
+        for (int i = 0; i < 50 && !call->disconnected_.load(); i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        delete call;
+        acct.incomingSipCall = nullptr;
     }
     acct.bridge.reset();
 }
@@ -714,11 +825,34 @@ void onCallState(void* context, const char* remotePeerId, uint64_t callId, int32
             // onCallMediaState() wires+starts the bridge independently
             // once the SIP side has media, regardless of exactly when
             // Signal's own CONNECTED fires relative to that.
-            if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
+            if (!acct.isCallee.load() && acct.incomingSipCall) {
+                // The mirror image of the above: a real SIP call is
+                // sitting in Ringing (BridgeAccount::onIncomingCall()
+                // placed it, never answered) waiting on exactly this
+                // moment - the outgoing Signal call it triggered just
+                // connected, so answer it now. IncomingSipCall's own
+                // onCallMediaState() wires+starts the bridge once this
+                // 200 OK's SDP answer negotiates media, same as the
+                // BridgeCall side. registerPjsipThreadIfNeeded() matters
+                // here too - this runs on RingRTC's own callback thread,
+                // same as stopSipBridge()/stopIncomingSipCall() (see that
+                // function's own doc comment for the live bug this fixes).
+                registerPjsipThreadIfNeeded();
+                auto* sipCall = static_cast<IncomingSipCall*>(acct.incomingSipCall);
+                pj::CallOpParam ansPrm;
+                ansPrm.statusCode = PJSIP_SC_OK;
+                try {
+                    sipCall->answer(ansPrm);
+                } catch (pj::Error& err) {
+                    std::cerr << "[daemon][" << acct.config.name << "][sip] answer(200) failed: " << err.info()
+                               << "\n";
+                }
+            } else if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
                 std::thread([&acct] { runProbe(acct); }).detach();
             }
         } else if (state == SIGNAL2SIP_CALL_STATE_ENDED || state == SIGNAL2SIP_CALL_STATE_CONCLUDED) {
             stopSipBridge(acct);
+            stopIncomingSipCall(acct);
             acct.isCallee = false;
         }
     });
@@ -865,11 +999,14 @@ GlobalConfig g_global;    // set once in main() from config.global, read by setu
 
 // Creates the shared Endpoint the first time any account needs it - either
 // during main()'s startup loop, or later via a SIGHUP reload adding the
-// first-ever SIP-enabled account to a daemon that started with none.
+// first-ever SIP-enabled account to a daemon that started with none. Does
+// NOT create any transport itself anymore - every account gets its own
+// dedicated one (see createAccountUdpTransport()/
+// createAccountTlsTransport(), both called from setupAccount()).
 // `epStorage` is function-static (not a main()-local variable) specifically
 // so it survives past the point where main()'s own startup code has
 // finished running, in case this is called again later from reloadConfig().
-void ensureSharedEndpoint(unsigned port) {
+void ensureSharedEndpoint() {
     if (g_ep) return; // already created
 
     static std::unique_ptr<pj::Endpoint> epStorage;
@@ -899,9 +1036,6 @@ void ensureSharedEndpoint(unsigned port) {
             epStorage->codecSetPriority(codec.codecId, codec.codecId == "L16/48000/1" ? 255 : 0);
         }
 
-        pj::TransportConfig tcfg;
-        tcfg.port = port;
-        epStorage->transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
         epStorage->libStart();
         g_ep = epStorage.get();
     } catch (pj::Error& err) {
@@ -911,20 +1045,41 @@ void ensureSharedEndpoint(unsigned port) {
     }
 }
 
-// Creates a TLS (SIPS) transport dedicated to ONE account - unlike the
-// shared UDP transport (see g_ep's own doc comment), PJSIP's TLS trust
-// settings (CaListFile/verifyServer) are configured once per transport
-// factory and apply to every connection made through it, so two accounts
-// pointing at two different Asterisk hosts with two different
+// Creates a UDP transport dedicated to ONE account. Local port 0 (OS
+// picks any free ephemeral port) - Asterisk always dials back to
+// whatever Contact this account's own registration advertised, so the
+// exact port doesn't need to be predictable, same reasoning as
+// createAccountTlsTransport()'s own port 0. Returns pj::PJSUA_INVALID_ID
+// on failure (logged there, caller just won't get a working account).
+// Requires g_ep to already exist (ensureSharedEndpoint() must run first).
+pj::TransportId createAccountUdpTransport(const AccountConfig& accountConfig) {
+    if (!g_ep) return PJSUA_INVALID_ID;
+
+    try {
+        pj::TransportConfig tcfg;
+        tcfg.port = 0;
+        pj::TransportId id = g_ep->transportCreate(PJSIP_TRANSPORT_UDP, tcfg);
+        std::cout << "[daemon][" << accountConfig.name << "] UDP transport created\n";
+        return id;
+    } catch (pj::Error& err) {
+        std::cerr << "[daemon][" << accountConfig.name << "] UDP transport setup failed: " << err.info() << "\n";
+        return PJSUA_INVALID_ID;
+    }
+}
+
+// Creates a TLS (SIPS) transport dedicated to ONE account - PJSIP's TLS
+// trust settings (CaListFile/verifyServer) are configured once per
+// transport factory and apply to every connection made through it, so two
+// accounts pointing at two different Asterisk hosts with two different
 // (self-signed) certificates genuinely need their own transport each -
 // see AccountConfig::sipTlsCaFile's own doc comment. Local port 0 (OS
 // picks any free port) is fine here - TLS/TCP is connection-oriented, so
 // Asterisk calls back over the same persistent connection this process
 // already opened for registration, unlike UDP where a specific advertised
-// port matters. Requires g_ep to already exist (ensureSharedEndpoint()
-// must run first).
-void createAccountTlsTransport(const AccountConfig& accountConfig) {
-    if (!g_ep) return;
+// port matters. Returns pj::PJSUA_INVALID_ID on failure. Requires g_ep to
+// already exist (ensureSharedEndpoint() must run first).
+pj::TransportId createAccountTlsTransport(const AccountConfig& accountConfig) {
+    if (!g_ep) return PJSUA_INVALID_ID;
 
     try {
         pj::TransportConfig tcfg;
@@ -944,13 +1099,134 @@ void createAccountTlsTransport(const AccountConfig& accountConfig) {
             // explicitly opted into this.
             tcfg.tlsConfig.verifyServer = false;
         }
-        g_ep->transportCreate(PJSIP_TRANSPORT_TLS, tcfg);
+        pj::TransportId id = g_ep->transportCreate(PJSIP_TRANSPORT_TLS, tcfg);
         std::cout << "[daemon][" << accountConfig.name << "] TLS transport created"
                    << (accountConfig.sipTlsCaFile.empty() ? " (server cert verification DISABLED - sip_tls_insecure=yes)"
                                                           : " (pinned to " + accountConfig.sipTlsCaFile + ")")
                    << "\n";
+        return id;
     } catch (pj::Error& err) {
         std::cerr << "[daemon][" << accountConfig.name << "] TLS transport setup failed: " << err.info() << "\n";
+        return PJSUA_INVALID_ID;
+    }
+}
+
+// A real SIP call arrived at this account's registered contact - place a
+// real outgoing Signal call in response. Found live 2026-08-05: this
+// direction (PBX calls IN to a signal2sip SIP trunk to originate a real
+// Signal call out) had no handler at all - pjsua2's default
+// Account::onIncomingCall() (i.e. not overriding it) leaves its
+// temporary Call wrapper to be destroyed at the end of the callback,
+// which itself hangs up with a bare 500 - every such INVITE was silently
+// rejected before this existed.
+//
+// The destination is read from the raw Request-URI's user part (NOT
+// this->acctState's own configured number) - confirmed live that
+// Asterisk's outbound-route/trunk config for a given destination number
+// can point its INVITE at a DIFFERENT account's registered contact than
+// that number itself (this test: a trunk for "123456789002" sent its
+// INVITE to 123456789004's TLS contact, Request-URI user still
+// "123456789002") - so the account that answers is just "whichever
+// identity Asterisk chose to send this INVITE from", and the number to
+// call is purely whatever's in the Request-URI, regardless of whether
+// that number also happens to be one of this daemon's own configured
+// accounts (user's own framing: "как обычный сигнал звонок").
+void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
+    if (!acctState) {
+        // Shouldn't happen - every BridgeAccount is constructed with a
+        // matching AccountState in setupAccount() before it can ever
+        // register (and therefore before it could receive any INVITE).
+        pj::Call tmp(*this, iprm.callId);
+        pj::CallOpParam prm;
+        prm.statusCode = PJSIP_SC_SERVICE_UNAVAILABLE;
+        try {
+            tmp.hangup(prm);
+        } catch (...) {
+        }
+        return;
+    }
+    AccountState& acct = *acctState;
+    if (acct.incomingSipCall || acct.sipCall) {
+        // Already bridging a call in one direction or the other -
+        // this project's one-call-at-a-time-per-account scope (see
+        // AccountState::bridge's own doc comment).
+        pj::Call tmp(*this, iprm.callId);
+        pj::CallOpParam prm;
+        prm.statusCode = PJSIP_SC_BUSY_HERE;
+        try {
+            tmp.hangup(prm);
+        } catch (...) {
+        }
+        return;
+    }
+
+    std::string destUser;
+    auto* rdata = static_cast<pjsip_rx_data*>(iprm.rdata.pjRxData);
+    if (rdata && rdata->msg_info.msg) {
+        pjsip_uri* reqUri = rdata->msg_info.msg->line.req.uri;
+        if (PJSIP_URI_SCHEME_IS_SIP(reqUri) || PJSIP_URI_SCHEME_IS_SIPS(reqUri)) {
+            auto* sipUri = static_cast<pjsip_sip_uri*>(pjsip_uri_get_uri(reqUri));
+            destUser.assign(sipUri->user.ptr, sipUri->user.slen);
+        }
+    }
+    // Request-URI user parts are plain digits by SIP convention (no '+'),
+    // but resolveOutgoingTarget()/ContactResolver.cpp only treats a target
+    // as a phone number needing CDSI resolution when it starts with '+' -
+    // anything else is assumed to already be a ServiceId. Found live
+    // 2026-08-05: without this, a bare "123456789001" from Asterisk's
+    // INVITE skipped CDSI entirely and got used as-is, so RingRTC tried
+    // fetching prekeys from "GET /v2/keys/123456789001/*" - a phone
+    // number, not a real ServiceId UUID - and always 404'd.
+    if (!destUser.empty() && destUser[0] != '+') {
+        destUser.insert(0, "+");
+    }
+    std::cout << "[daemon][" << acct.config.name << "][sip] incoming SIP call for '" << destUser << "'\n";
+    if (destUser.empty()) {
+        pj::Call tmp(*this, iprm.callId);
+        pj::CallOpParam prm;
+        prm.statusCode = PJSIP_SC_NOT_FOUND;
+        try {
+            tmp.hangup(prm);
+        } catch (...) {
+        }
+        return;
+    }
+
+    acct.bridge = std::make_unique<voip::RingRtcSipBridge>(acct.handle);
+    auto* call = new IncomingSipCall(*this, iprm.callId, *acct.bridge, acct);
+    acct.incomingSipCall = call;
+
+    // Ringing, not answered yet - held here until the outgoing Signal
+    // call this triggers actually connects (see onCallState's own
+    // CONNECTED handler for where the real answer(200) happens).
+    pj::CallOpParam ringPrm;
+    ringPrm.statusCode = PJSIP_SC_RINGING;
+    try {
+        call->answer(ringPrm);
+    } catch (pj::Error& err) {
+        std::cerr << "[daemon][" << acct.config.name << "][sip] answer(180) failed: " << err.info() << "\n";
+    }
+
+    // outgoing_call_target's own e164-resolution path (ContactResolver.h)
+    // reused verbatim - same CDSI-backed cache, same TTL.
+    std::string resolvedTarget;
+    try {
+        resolvedTarget = resolveOutgoingTarget(*acct.socket, *acct.storage, destUser, g_global.resolvedContactTtlSec);
+    } catch (const std::exception& e) {
+        std::cerr << "[daemon][" << acct.config.name << "][sip] could not resolve '" << destUser
+                   << "': " << e.what() << "\n";
+    }
+    if (resolvedTarget.empty()) {
+        stopIncomingSipCall(acct);
+        return;
+    }
+
+    acct.isCallee = false;
+    uint64_t callId = signal2sip_call_start_outgoing(acct.handle, resolvedTarget.c_str(),
+                                                       static_cast<uint32_t>(acct.account.device_id));
+    if (callId == 0) {
+        std::cerr << "[daemon][" << acct.config.name << "][sip] signal2sip_call_start_outgoing failed\n";
+        stopIncomingSipCall(acct);
     }
 }
 
@@ -1001,17 +1277,51 @@ bool setupAccount(const AccountConfig& accountConfig) {
 
         refreshPrekeys(*acct.storage, *acct.socket, acct.account);
 
+        // Only a gendb-linked account (a real device linked into a real,
+        // already-in-use Signal account) has a meaningful contact list to
+        // sync at all - a bare gendb-registered account has no real
+        // contacts, and no account_entropy_pool to derive the storage
+        // service key from either. Non-fatal: a sync failure just means
+        // resolveOutgoingTarget() falls back to its existing CDS-only
+        // path (PNI-only for a cold e164) - see StorageServiceSync.h's own
+        // doc comment for the full "why".
+        if (acct.account.account_entropy_pool && !acct.account.account_entropy_pool->empty()) {
+            try {
+                std::vector<StorageContact> contacts =
+                    fetchStorageContacts(*acct.socket, *acct.account.account_entropy_pool);
+                int cachedCount = 0;
+                for (const auto& contact : contacts) {
+                    if (contact.e164.empty()) continue; // nothing to key resolveOutgoingTarget's cache by
+                    acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
+                    cachedCount++;
+                }
+                std::cout << "[daemon][" << accountConfig.name << "] StorageService sync: " << contacts.size()
+                           << " contact(s), " << cachedCount << " cached (had an e164)\n";
+            } catch (const std::exception& e) {
+                std::cerr << "[daemon][" << accountConfig.name << "] StorageService sync failed (non-fatal): "
+                           << e.what() << "\n";
+            }
+        }
+
         if (accountConfig.hasSip()) {
-            ensureSharedEndpoint(g_global.sipPort); // no-ops if g_ep already exists
-            if (accountConfig.sipTransport == "tls") createAccountTlsTransport(accountConfig);
-            if (g_ep) {
+            ensureSharedEndpoint(); // no-ops if g_ep already exists
+            // Every account gets its own dedicated transport, bound
+            // explicitly via acfg.sipConfig.transportId below - see
+            // AccountConfig::sipTransport's own doc comment for why
+            // sharing one transport across accounts doesn't work for
+            // incoming calls.
+            pj::TransportId transportId = accountConfig.sipTransport == "tls"
+                                               ? createAccountTlsTransport(accountConfig)
+                                               : createAccountUdpTransport(accountConfig);
+            if (g_ep && transportId != PJSUA_INVALID_ID) {
                 auto sipAccount = std::make_unique<BridgeAccount>();
                 pj::AccountConfig acfg;
+                acfg.sipConfig.transportId = transportId;
                 // sips: (not sip:) is what actually routes this account's
-                // registration/calls over the shared TLS transport instead
-                // of the shared UDP one - see AccountConfig::sipTransport's
-                // own doc comment, including the "sip_host's port usually
-                // needs updating too" gotcha.
+                // registration/calls over its own TLS transport instead of
+                // a UDP one - see AccountConfig::sipTransport's own doc
+                // comment, including the "sip_host's port usually needs
+                // updating too" gotcha.
                 std::string scheme = accountConfig.sipTransport == "tls" ? "sips" : "sip";
                 acfg.idUri = scheme + ":" + accountConfig.sipExtension + "@" + accountConfig.sipHost;
                 acfg.regConfig.registrarUri = scheme + ":" + accountConfig.sipHost;
@@ -1036,6 +1346,7 @@ bool setupAccount(const AccountConfig& accountConfig) {
                     acfg.mediaConfig.srtpSecureSignaling = 0;
                 }
 
+                sipAccount->acctState = &acct;
                 sipAccount->create(acfg);
 
                 std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
@@ -1119,6 +1430,7 @@ void teardownAccount(const std::string& name) {
     if (it == g_accounts.end()) return;
     AccountState& acct = *it->second;
     stopSipBridge(acct);
+    stopIncomingSipCall(acct);
     acct.dispatchQueue.stopAndJoin();
     signal2sip_call_manager_destroy(acct.handle);
     acct.socket->close();
@@ -1201,6 +1513,11 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     setvbuf(stderr, nullptr, _IONBF, 0);
 
+    // Required once per process before any RegistrationClient use (see
+    // that class's own doc comment) - StorageServiceSync's storage.signal.org
+    // calls are the first daemon-side (not just gendb-side) user of it.
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
     // Reload config (add/remove accounts) without restarting - see
@@ -1241,14 +1558,10 @@ int main(int argc, char** argv) {
     bool anySip = std::any_of(config.accounts.begin(), config.accounts.end(),
                                [](const AccountConfig& a) { return a.hasSip(); });
     if (anySip) {
-        // One shared transport for every account (see g_ep's doc comment),
-        // bound to [global]'s sip_port - genuinely process-wide, not
-        // per-account (see GlobalConfig::sipPort's own doc comment). Any
-        // tls-transport accounts get their own dedicated TLS transport
-        // instead, created later in the per-account loop below (see
-        // createAccountTlsTransport()'s own doc comment for why that one
-        // isn't shared).
-        ensureSharedEndpoint(g_global.sipPort);
+        // Just brings up the shared pjsua2 Endpoint itself - each
+        // account's own dedicated transport is created later in the
+        // per-account loop below (see g_ep's own doc comment).
+        ensureSharedEndpoint();
     }
 
     // --- Per-account setup (see setupAccount()'s own doc comment).

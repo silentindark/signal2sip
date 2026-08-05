@@ -17,17 +17,13 @@ size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
-} // namespace
-
-RegistrationClient::RegistrationClient(std::string serverHost) : serverHost_(std::move(serverHost)) {}
-
-HttpResponse RegistrationClient::request(const std::string& method, const std::string& path,
-                                         const std::string& jsonBody, const std::string& basicAuthUser,
-                                         const std::string& basicAuthPass) {
+HttpResponse doRequest(const std::string& serverHost, const std::string& method, const std::string& path,
+                        const std::string& body, const std::string& contentType, const std::string& basicAuthUser,
+                        const std::string& basicAuthPass) {
     CURL* curl = curl_easy_init();
     if (!curl) throw std::runtime_error("curl_easy_init failed");
 
-    std::string url = "https://" + serverHost_ + path;
+    std::string url = "https://" + serverHost + path;
     std::string responseBody;
     struct curl_slist* headers = nullptr;
 
@@ -40,14 +36,13 @@ HttpResponse RegistrationClient::request(const std::string& method, const std::s
     if (method == "GET") {
         curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
     } else {
-        // POST/PUT/PATCH - all our calls carry a JSON body (possibly empty).
         if (method != "POST") curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonBody.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(jsonBody.size()));
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
         if (method == "POST") curl_easy_setopt(curl, CURLOPT_POST, 1L);
     }
 
-    if (!jsonBody.empty()) headers = curl_slist_append(headers, "Content-Type: application/json");
+    if (!body.empty()) headers = curl_slist_append(headers, ("Content-Type: " + contentType).c_str());
     if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
     if (!basicAuthUser.empty()) {
@@ -71,6 +66,22 @@ HttpResponse RegistrationClient::request(const std::string& method, const std::s
     curl_easy_cleanup(curl);
 
     return HttpResponse{status, responseBody};
+}
+
+} // namespace
+
+RegistrationClient::RegistrationClient(std::string serverHost) : serverHost_(std::move(serverHost)) {}
+
+HttpResponse RegistrationClient::request(const std::string& method, const std::string& path,
+                                         const std::string& jsonBody, const std::string& basicAuthUser,
+                                         const std::string& basicAuthPass) {
+    return doRequest(serverHost_, method, path, jsonBody, "application/json", basicAuthUser, basicAuthPass);
+}
+
+HttpResponse RegistrationClient::requestRaw(const std::string& method, const std::string& path,
+                                            const std::string& body, const std::string& contentType,
+                                            const std::string& basicAuthUser, const std::string& basicAuthPass) {
+    return doRequest(serverHost_, method, path, body, contentType, basicAuthUser, basicAuthPass);
 }
 
 } // namespace signal2sip

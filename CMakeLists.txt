@@ -83,9 +83,11 @@ pkg_check_modules(PJSIP REQUIRED IMPORTED_TARGET libpjproject)
 target_link_libraries(PkgConfig::PJSIP INTERFACE ${PJSIP_STATIC_LDFLAGS})
 find_package(Protobuf REQUIRED)
 find_package(nlohmann_json REQUIRED)
-# gendb-only deps (see native/gendb/): plain HTTPS for Flow A (RegistrationClient),
-# AES-256-CBC/HMAC-SHA256 for the provisioning cipher (Flow B), ASCII QR
-# rendering for Flow B's linking URL.
+# CURL: plain HTTPS for RegistrationClient (native/util/) - used by gendb's
+# Flow A/B and, since 08-05, the daemon's StorageServiceSync (storage.signal.org
+# is a plain-REST host too, unlike chat.signal.org's persistent-websocket
+# AuthSocket). OpenSSL::Crypto: AES-256-CBC/HMAC-SHA256 for gendb's
+# provisioning cipher (Flow B) and StorageServiceSync's own AES-256-GCM/HMAC.
 find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(QRENCODE REQUIRED IMPORTED_TARGET libqrencode)
@@ -99,6 +101,7 @@ set(SIGNAL_PROTO_FILES
     ${SIGNAL_PROTO_DIR}/SignalService.proto
     ${SIGNAL_PROTO_DIR}/WebSocketResources.proto
     ${SIGNAL_PROTO_DIR}/Provisioning.proto
+    ${SIGNAL_PROTO_DIR}/StorageService.proto
 )
 protobuf_generate_cpp(SIGNAL_PROTO_SRCS SIGNAL_PROTO_HDRS ${SIGNAL_PROTO_FILES})
 
@@ -128,8 +131,10 @@ target_link_libraries(signal2sip_storage PUBLIC PkgConfig::SQLCIPHER)
 
 add_library(signal2sip_util STATIC
     util/Base64.cpp
+    util/RegistrationClient.cpp
 )
 target_include_directories(signal2sip_util PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip_util PUBLIC CURL::libcurl)
 
 add_executable(storage_test test/storage_test.cpp)
 target_link_libraries(storage_test PRIVATE signal2sip_storage)
@@ -230,6 +235,13 @@ target_link_libraries(cdsi_lookup_test PRIVATE signal2sip_signal signal2sip_auth
 # a real account's credentials without hand-copying them out of the DB.
 add_executable(dump_account_json_test test/dump_account_json_test.cpp)
 target_link_libraries(dump_account_json_test PRIVATE signal2sip_storage nlohmann_json::nlohmann_json)
+
+# One-off scratch helper (see the file's own doc comment) - forces a live
+# PUT /v1/accounts/attributes/ discoverableByPhoneNumber change to kick
+# Signal's CDS directory-sync pipeline for an account with no real app UI.
+add_executable(toggle_discoverability_test test/toggle_discoverability_test.cpp)
+target_link_libraries(toggle_discoverability_test PRIVATE signal2sip_storage signal2sip_authsocket
+    nlohmann_json::nlohmann_json)
 
 # Live verification for ContactResolver.h - the cache+CDSI resolution path
 # signal2sip-daemon itself now uses for outgoing_call_target, minus the
@@ -349,10 +361,11 @@ target_include_directories(signal2sip_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(signal2sip_daemon STATIC
     daemon/CallSignaling.cpp
     daemon/ContactResolver.cpp
+    daemon/StorageServiceSync.cpp
 )
 target_include_directories(signal2sip_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_authsocket signal2sip_proto
-    signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json signal2sip_config)
+    signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json signal2sip_config OpenSSL::Crypto)
 
 add_executable(signal2sip-daemon daemon/main.cpp)
 target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -404,7 +417,6 @@ target_link_options(signal2sip-daemon PRIVATE $<$<CONFIG:Release>:-s>)
 # stays a small, fast-to-build binary with none of signal2sip-daemon's
 # link-line workarounds.
 add_library(signal2sip_gendb STATIC
-    gendb/RegistrationClient.cpp
     gendb/ProvisioningCipher.cpp
     gendb/ProvisioningClient.cpp
     gendb/AccountFinisher.cpp

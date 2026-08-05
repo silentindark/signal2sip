@@ -112,3 +112,21 @@ CREATE TABLE IF NOT EXISTS resolved_contact (
     resolved_at     INTEGER NOT NULL,       -- unix seconds
     PRIMARY KEY (account_name, e164)
 );
+
+-- Real contacts learned from this account's own StorageService sync (see
+-- native/daemon/StorageServiceSync.h/.cpp) - unlike resolved_contact
+-- (a CDS lookup, PNI-only for any e164 CDS treats as "cold"), this comes
+-- straight from the account's real contact list, so aci is populated for
+-- any genuinely mutual real contact regardless of CDS/PNP status. Only
+-- meaningful for an account with a real account_entropy_pool (i.e. a
+-- gendb-linked account, not a bare gendb-registered one with no real
+-- contacts to sync in the first place).
+CREATE TABLE IF NOT EXISTS synced_contact (
+    account_name    TEXT NOT NULL REFERENCES account(account_name),
+    e164            TEXT NOT NULL,
+    aci             TEXT NOT NULL,          -- '' if this contact record has none
+    pni             TEXT NOT NULL,
+    profile_key     BLOB NOT NULL,          -- empty if none
+    synced_at       INTEGER NOT NULL,       -- unix seconds
+    PRIMARY KEY (account_name, e164)
+);

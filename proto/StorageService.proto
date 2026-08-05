@@ -1,0 +1,105 @@
+/*
+ * Copyright 2020-2021 Signal Messenger, LLC
+ * SPDX-License-Identifier: AGPL-3.0-only
+ */
+// Trimmed from signalapp/Signal-Android's
+// lib/libsignal-service/src/main/protowire/StorageService.proto - only the
+// messages signal2sip actually needs (manifest fetch + CONTACT records) are
+// kept. Same `signalservice` package as SignalService.proto - message names
+// don't collide, so this just adds more types to that same C++ namespace.
+syntax = "proto3";
+
+package signalservice;
+
+option java_package         = "org.whispersystems.signalservice.internal.storage.protos";
+option java_multiple_files  = true;
+
+message StorageManifest {
+  uint64 version = 1;
+  bytes  value   = 2;
+}
+
+message StorageItem {
+  bytes key   = 1;
+  bytes value = 2;
+}
+
+message StorageItems {
+  repeated StorageItem items = 1;
+}
+
+message ReadOperation {
+  repeated bytes readKey = 1;
+}
+
+message ManifestRecord {
+  message Identifier {
+    enum Type {
+      UNKNOWN                 = 0;
+      CONTACT                 = 1;
+      GROUPV1                 = 2;
+      GROUPV2                 = 3;
+      ACCOUNT                 = 4;
+      STORY_DISTRIBUTION_LIST = 5;
+      STICKER_PACK            = 6;
+      CALL_LINK               = 7;
+      CHAT_FOLDER             = 8;
+      NOTIFICATION_PROFILE    = 9;
+    }
+
+    bytes raw  = 1;
+    Type  type = 2;
+  }
+
+           uint64     version      = 1;
+           uint32     sourceDevice = 3;
+  repeated Identifier identifiers  = 2;
+           bytes      recordIkm    = 4;
+}
+
+message StorageRecord {
+  oneof record {
+    ContactRecord contact = 1;
+    // groupV1/groupV2/account/... intentionally omitted - signal2sip only
+    // ever needs CONTACT records (e164 -> ACI/PNI/profileKey resolution).
+  }
+}
+
+message ContactRecord {
+  enum IdentityState {
+    DEFAULT    = 0;
+    VERIFIED   = 1;
+    UNVERIFIED = 2;
+  }
+
+  message Name {
+    string given  = 1;
+    string family = 2;
+  }
+
+  string        aci                     = 1;
+  string        e164                    = 2;
+  string        pni                     = 15;
+  bytes         profileKey              = 3;
+  bytes         identityKey             = 4;
+  IdentityState identityState           = 5;
+  string        givenName               = 6;
+  string        familyName              = 7;
+  string        username                = 8;
+  bool          blocked                 = 9;
+  bool          whitelisted             = 10;
+  bool          archived                = 11;
+  bool          markedUnread            = 12;
+  uint64        mutedUntilTimestamp     = 13;
+  bool          hideStory               = 14;
+  uint64        unregisteredAtTimestamp = 16;
+  string        systemGivenName         = 17;
+  string        systemFamilyName        = 18;
+  string        systemNickname          = 19;
+  bool          hidden                  = 20;
+  bool          pniSignatureVerified    = 21;
+  Name          nickname                = 22;
+  string        note                    = 23;
+  bytes         aciBinary               = 25; // 16-byte UUID
+  bytes         pniBinary               = 26; // 16-byte UUID
+}

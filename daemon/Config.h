@@ -55,17 +55,6 @@ struct GlobalConfig {
     std::string dbPath;  // required - one SQLCipher file shared by all accounts
     std::string dbKey;   // required - SQLCipher passphrase
 
-    // Local port for the daemon's own shared PJSIP UDP transport (see
-    // main.cpp's g_ep doc comment) - one transport for the whole process,
-    // used by every SIP-enabled account's registration, like a softphone
-    // with several lines on one local port. NOT the port Asterisk listens
-    // on (that's whatever [account.<name>]'s sip_host already says, e.g.
-    // "192.168.16.81:5061" if non-default). Genuinely process-wide, not
-    // per-account - was mistakenly a per-[account.<name>] field before
-    // 08-03; only the first SIP-enabled account's value ever took effect
-    // in practice, which is why it moved here.
-    unsigned sipPort = 5063;
-
     // How long (seconds) a SIP account may sit unregistered before the
     // daemon forces a fresh registration attempt itself, regardless of
     // what PJSIP's own auto-retry would do. Needed because PJSIP only
@@ -157,16 +146,20 @@ struct AccountConfig {
 
     // SIP signaling transport to Asterisk for THIS account - "udp"
     // (default, current behavior) or "tls" (SIPS - idUri/registrarUri get
-    // the sips: scheme instead of sip:). Unlike sipPort's shared UDP
-    // transport, each tls account gets its OWN dedicated TLS transport
-    // (see main.cpp's createAccountTlsTransport()) - PJSIP's TLS trust
-    // settings (CaListFile/verifyServer) are configured once per transport
-    // factory and apply to every connection made through it, so two
-    // accounts pointing at two different Asterisk hosts with two
-    // different (self-signed) certificates genuinely need separate
-    // transports, not one shared one. If sip_host has no explicit
-    // ":port", tls defaults it to ":5061" (Asterisk's usual TLS listener
-    // port) - see Config.cpp.
+    // the sips: scheme instead of sip:). Every account gets its OWN
+    // dedicated transport regardless of which (see main.cpp's
+    // createAccountUdpTransport()/createAccountTlsTransport()) - PJSIP
+    // can't reliably route an incoming call to the right account when
+    // several accounts share one transport and the Request-URI doesn't
+    // match any of their own identities (found live 2026-08-05: a real
+    // SIP-triggered outgoing-call INVITE's Request-URI is the DIALED
+    // NUMBER, not any account's own extension, so PJSIP fell back to
+    // whatever account happened to be created first - wrong account,
+    // wrong SRTP policy, spurious 488 Not Acceptable Here). TLS transports
+    // additionally need to be separate because CaListFile/verifyServer are
+    // configured once per transport factory and apply to every connection
+    // made through it. If sip_host has no explicit ":port", tls defaults
+    // it to ":5061" (Asterisk's usual TLS listener port) - see Config.cpp.
     std::string sipTransport = "udp"; // "udp" | "tls"
 
     // Only meaningful when sipTransport == "tls". Path to a PEM file

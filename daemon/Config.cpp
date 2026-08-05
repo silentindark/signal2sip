@@ -96,7 +96,6 @@ DaemonConfig DaemonConfig::load(const std::string& path) {
     if (daemon.global.dbKey.empty()) {
         throw std::runtime_error("signal2sip.conf: [global] db_key is required");
     }
-    daemon.global.sipPort = static_cast<unsigned>(std::stoul(getOr(ini, "global", "sip_port", "5063")));
     daemon.global.sipRegWatchdogSec =
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "sip_reg_watchdog_sec", "60")));
     daemon.global.resolvedContactTtlSec =

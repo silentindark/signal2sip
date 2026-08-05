@@ -50,6 +50,18 @@ struct ResolvedContactRecord {
     int64_t resolved_at = 0;
 };
 
+// A real contact learned from this account's own StorageService sync (see
+// native/daemon/StorageServiceSync.h) - unlike ResolvedContactRecord (a
+// CDS lookup, which for a cold/unknown e164 can only ever reveal PNI),
+// this comes straight from the account's real contact list, so aci is
+// populated whenever the contact record has one (i.e. for any genuinely
+// mutual real contact, regardless of CDS/PNP status).
+struct SyncedContactRecord {
+    std::string aci, pni;
+    Bytes profile_key;
+    int64_t synced_at = 0;
+};
+
 // Encrypted (SQLCipher) local storage, scoped to one Signal account via
 // `accountName` - multiple Storage instances (one per account) can (and
 // normally do) point at the same shared database file/path, each opening
@@ -105,6 +117,15 @@ public:
     // "looked up, genuinely not on Signal".
     void saveResolvedContact(const std::string& e164, const std::string& aci, const std::string& pni);
     std::optional<ResolvedContactRecord> loadResolvedContact(const std::string& e164);
+
+    // e164 must include the leading '+'. Overwrites any existing row for
+    // this e164 on every sync (StorageServiceSync's caller is expected to
+    // just re-save every contact it fetches each time - a real contact's
+    // own ACI/PNI/profileKey essentially never changes, but a wrong stale
+    // cache is worse than a redundant write).
+    void saveSyncedContact(const std::string& e164, const std::string& aci, const std::string& pni,
+                           const Bytes& profileKey);
+    std::optional<SyncedContactRecord> loadSyncedContact(const std::string& e164);
 
 private:
     sqlite3* db_ = nullptr;

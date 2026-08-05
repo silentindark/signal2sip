@@ -12,9 +12,16 @@
 // don't exist as a real account yet - whatever password that call
 // authenticates with becomes the account's permanent password.
 //
+// Also reused (not gendb-specific despite the class name and its original
+// home under native/gendb/) by the daemon's StorageServiceSync - Signal's
+// storage.signal.org host is a plain-REST/Basic-auth API too, just like
+// registration, and needs a raw (non-JSON) protobuf request body - see
+// requestRaw() below.
+//
 // Requires the caller (curl_global_init) to have initialized libcurl once
 // per process - not done here, to match the one-CURL-global-per-process
-// rule libcurl documents (gendb/main.cpp does this at startup).
+// rule libcurl documents (gendb/main.cpp and daemon/main.cpp both do this
+// at startup).
 
 #include <string>
 
@@ -35,6 +42,14 @@ public:
     // sent). basicAuthUser empty means no Authorization header at all.
     HttpResponse request(const std::string& method, const std::string& path, const std::string& jsonBody = "",
                          const std::string& basicAuthUser = "", const std::string& basicAuthPass = "");
+
+    // Same as request(), but for a non-JSON (e.g. protobuf) body - sends
+    // exactly `body` as-is (safe for embedded NULs; std::string is a
+    // length-prefixed byte container, not C-string-truncated) with
+    // `contentType` instead of always assuming "application/json".
+    HttpResponse requestRaw(const std::string& method, const std::string& path, const std::string& body,
+                            const std::string& contentType, const std::string& basicAuthUser = "",
+                            const std::string& basicAuthPass = "");
 
 private:
     std::string serverHost_;

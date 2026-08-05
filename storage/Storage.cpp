@@ -386,4 +386,34 @@ std::optional<ResolvedContactRecord> Storage::loadResolvedContact(const std::str
     return result;
 }
 
+void Storage::saveSyncedContact(const std::string& e164, const std::string& aci, const std::string& pni,
+                                const Bytes& profileKey) {
+    Stmt stmt(db_,
+        "INSERT INTO synced_contact (account_name, e164, aci, pni, profile_key, synced_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (account_name, e164) DO UPDATE SET aci = excluded.aci, pni = excluded.pni, "
+        "profile_key = excluded.profile_key, synced_at = excluded.synced_at");
+    bindText(stmt, 1, accountName_);
+    bindText(stmt, 2, e164);
+    bindText(stmt, 3, aci);
+    bindText(stmt, 4, pni);
+    bindBlob(stmt, 5, profileKey);
+    sqlite3_bind_int64(stmt, 6, static_cast<int64_t>(std::time(nullptr)));
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("saveSyncedContact failed: ") + sqlite3_errmsg(db_));
+    }
+}
+
+std::optional<SyncedContactRecord> Storage::loadSyncedContact(const std::string& e164) {
+    Stmt stmt(db_, "SELECT aci, pni, profile_key, synced_at FROM synced_contact WHERE account_name = ? AND e164 = ?");
+    bindText(stmt, 1, accountName_);
+    bindText(stmt, 2, e164);
+    if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
+    SyncedContactRecord result;
+    result.aci = columnText(stmt, 0);
+    result.pni = columnText(stmt, 1);
+    result.profile_key = columnBlob(stmt, 2);
+    result.synced_at = sqlite3_column_int64(stmt, 3);
+    return result;
+}
+
 } // namespace signal2sip
