@@ -360,12 +360,46 @@ void onSendHangup(void* context, const char* remotePeerId, uint64_t callId, int3
 
 class BridgeCall : public pj::Call {
 public:
-    BridgeCall(pj::Account& acc, voip::RingRtcSipBridge& bridge) : pj::Call(acc), bridge_(bridge) {}
+    // `acct` lets onCallState() reach back into the Signal-side call (see
+    // its own doc comment below) - only meaningful for an incoming-bridge
+    // BridgeCall (startSipDial()'s caller), not for any future
+    // outgoing-direction use of this class.
+    BridgeCall(pj::Account& acc, voip::RingRtcSipBridge& bridge, AccountState& acct)
+        : pj::Call(acc), bridge_(bridge), acct_(acct) {}
 
     void onCallState(pj::OnCallStateParam&) override {
         pj::CallInfo ci = getInfo();
         std::cout << "[daemon][sip] call state=" << ci.stateText << " (" << ci.state << ")\n";
+        // This is the actual moment the PBX side (a real extension/queue/
+        // IVR) picked up - only now do we take over the Signal call. See
+        // startSipDial()'s doc comment for why this is deliberately late
+        // (not right after Signal's own Ringing) - the whole point is to
+        // let a real linked device win the race if a human answers it
+        // first, and only "steal" the call once the PBX side has
+        // genuinely answered. acceptSent_ guards against PJSIP possibly
+        // reporting CONFIRMED more than once for the same dialog.
+        if (ci.state == PJSIP_INV_STATE_CONFIRMED && !acceptSent_.exchange(true)) {
+            std::cout << "[daemon][" << acct_.config.name
+                       << "][sip] PBX answered - accepting the Signal call\n";
+            signal2sip_call_accept(acct_.handle, acct_.activeCallId.load());
+        }
         if (ci.state == PJSIP_INV_STATE_DISCONNECTED) {
+            // If we'd actually taken over the Signal call (acceptSent_)
+            // and this disconnect wasn't us hanging up first (weHungUp_,
+            // set by stopSipBridge() right before its own call->hangup())
+            // then the PBX side hung up on its own - found live 2026-08-05:
+            // without this, ending the call on the PBX side left the
+            // Signal call sitting CONNECTED forever on the caller's
+            // Android, since nothing ever told RingRTC this side was
+            // done. hangup() ends whatever call_manager's current active
+            // call is; the ENDED/CONCLUDED event it triggers is what runs
+            // stopSipBridge()'s normal teardown (bridge_.Stop(), deleting
+            // this BridgeCall) - so no separate cleanup is needed here.
+            if (acceptSent_.load() && !weHungUp_.load()) {
+                std::cout << "[daemon][" << acct_.config.name
+                           << "][sip] PBX hung up - ending the Signal call\n";
+                signal2sip_call_hangup(acct_.handle);
+            }
             disconnected_ = true;
         }
     }
@@ -402,9 +436,12 @@ public:
     }
 
     std::atomic<bool> disconnected_{false};
+    std::atomic<bool> weHungUp_{false}; // set by stopSipBridge() before its own hangup()
 
 private:
     voip::RingRtcSipBridge& bridge_;
+    AccountState& acct_;
+    std::atomic<bool> acceptSent_{false};
 };
 
 class BridgeAccount : public pj::Account {
@@ -429,7 +466,7 @@ public:
         // Must mirror regIsActive both ways - PJSIP's own regc retries
         // registration automatically (default 300s interval) after a
         // failure/outage, but until that retry succeeds this flag is
-        // startSipBridge()'s only signal that the account isn't actually
+        // startSipDial()'s only signal that the account isn't actually
         // usable right now. Only ever setting it true (never back to
         // false) meant a Signal call arriving mid-outage would still
         // attempt a real INVITE through a dead registration instead of
@@ -455,7 +492,7 @@ public:
 // ensureSharedEndpoint()) the first time any account needs it - either at
 // startup or via a later SIGHUP reload - and never destroyed until
 // process exit. Read (never written after creation) from
-// startSipBridge()'s libRegisterThread() call.
+// startSipDial()'s libRegisterThread() call.
 pj::Endpoint* g_ep = nullptr;
 std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
 
@@ -471,11 +508,11 @@ const std::string& bridgeTarget(const AccountConfig& config) {
 // True only if this account both has a bridge target configured AND its
 // SIP registration is actually up right now - checked here, BEFORE ever
 // answering on the Signal side (see onCallState's INCOMING_AUDIO
-// handler), not just inside startSipBridge() itself. Confirmed live
+// handler), not just inside startSipDial() itself. Confirmed live
 // 08-04 that the earlier version of this check (target configured, full
 // stop) still steals the Accept from this account's other real devices
 // even when Asterisk/the SIP registration is unreachable - the call gets
-// answered here, then startSipBridge() discovers it can't actually bridge
+// answered here, then startSipDial() discovers it can't actually bridge
 // and just logs an error, by which point the real devices have already
 // lost the race for nothing.
 bool canBridgeToSip(const AccountConfig& config) {
@@ -484,10 +521,25 @@ bool canBridgeToSip(const AccountConfig& config) {
     return it != g_sipAccounts.end() && it->second->registered.load();
 }
 
-// Starts bridging acct's currently-active RingRTC call to a real SIP call
-// dialing bridgeTarget(acct.config) - called once that Signal call is
-// Accepted (real audio about to flow both ways).
-void startSipBridge(AccountState& acct) {
+// Places an outbound SIP INVITE to bridgeTarget(acct.config) - called at
+// the incoming Signal call's Ringing state, deliberately BEFORE that
+// Signal call is ever accepted on this device. This is what lets the SIP
+// leg ring/queue/IVR on the PBX side as an independent participant in the
+// account's normal multi-device fan-out, racing fairly against a real
+// linked device (phone, Desktop, ...) instead of the daemon eagerly
+// accepting the instant it's willing to bridge at all - the earlier
+// version of this code called signal2sip_call_accept() right after
+// Ringing, unconditionally, which (being near-instant) always beat a
+// human tapping Accept on their phone (see
+// [[project_signal2sip_incoming_call_steals_accept_bug]] in memory for
+// that first version of the problem - this is the same race, one layer
+// deeper: even gated on canBridgeToSip(), accepting before the PBX side
+// has actually answered still steals the call for a bridge attempt that
+// might itself go unanswered). BridgeCall::onCallState() is what actually
+// calls signal2sip_call_accept(), once and only once the SIP INVITE
+// reaches PJSIP_INV_STATE_CONFIRMED - i.e. once a real person/queue/IVR
+// on the PBX side has genuinely picked up.
+void startSipDial(AccountState& acct) {
     auto it = g_sipAccounts.find(acct.config.name);
     if (it == g_sipAccounts.end() || !it->second->registered.load()) {
         std::cerr << "[daemon][" << acct.config.name << "] cannot bridge to SIP: not registered\n";
@@ -532,7 +584,7 @@ void startSipBridge(AccountState& acct) {
     std::string scheme = acct.config.sipTransport == "tls" ? "sips" : "sip";
     std::string destUri = scheme + ":" + bridgeTarget(acct.config) + "@" + acct.config.sipHost;
     std::cout << "[daemon][" << acct.config.name << "][sip] placing bridge call to " << destUri << "\n";
-    auto* call = new BridgeCall(sipAccount, *acct.bridge);
+    auto* call = new BridgeCall(sipAccount, *acct.bridge, acct);
     acct.sipCall = call;
     pj::CallOpParam prm(true);
     prm.opt.audioCount = 1;
@@ -550,6 +602,7 @@ void stopSipBridge(AccountState& acct) {
     }
     if (acct.sipCall) {
         auto* call = static_cast<BridgeCall*>(acct.sipCall);
+        call->weHungUp_ = true; // before hangup() - see onCallState's DISCONNECTED handling
         pj::CallOpParam hprm;
         try {
             call->hangup(hprm);
@@ -634,13 +687,34 @@ void onCallState(void* context, const char* remotePeerId, uint64_t callId, int32
                 signal2sip_call_proceed(acct.handle, callId);
             }
         } else if (state == SIGNAL2SIP_CALL_STATE_RINGING && acct.isCallee.load()) {
-            // See signal2sip_call_accept()'s doc comment - must wait for
-            // Ringing, not accept right after proceed().
-            signal2sip_call_accept(acct.handle, callId);
+            // Used to call signal2sip_call_accept() right here (see
+            // signal2sip_call_accept()'s own doc comment for why it's only
+            // legal after Ringing, never right after proceed()) - but
+            // doing so unconditionally meant the daemon always won the
+            // multi-device accept race the instant it was willing to
+            // bridge at all, before the PBX side had even been dialed,
+            // let alone answered (confirmed live 2026-08-05: calling
+            // +123456789002 from another Signal account, the daemon
+            // intercepted the call immediately and the real linked phone
+            // never got a chance to ring). Re-checking canBridgeToSip()
+            // here mirrors the same re-check this branch used to do at
+            // CONNECTED, in case registration dropped between Proceed and
+            // Ringing. Accepting now happens in BridgeCall::onCallState()
+            // once the SIP leg placed by startSipDial() actually reaches
+            // PJSIP_INV_STATE_CONFIRMED - i.e. once the PBX side has
+            // genuinely answered - so a real linked device tapping Accept
+            // first still wins normally.
+            if (canBridgeToSip(acct.config)) {
+                startSipDial(acct);
+            }
         } else if (state == SIGNAL2SIP_CALL_STATE_CONNECTED) {
-            if (acct.isCallee.load() && canBridgeToSip(acct.config)) {
-                startSipBridge(acct);
-            } else if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
+            // The isCallee branch that used to live here (calling
+            // startSipBridge() once Signal was Accepted) is gone - the SIP
+            // leg is now dialed earlier, at Ringing, and BridgeCall's own
+            // onCallMediaState() wires+starts the bridge independently
+            // once the SIP side has media, regardless of exactly when
+            // Signal's own CONNECTED fires relative to that.
+            if (!acct.isCallee.load() && !acct.config.outgoingCallTarget.empty()) {
                 std::thread([&acct] { runProbe(acct); }).detach();
             }
         } else if (state == SIGNAL2SIP_CALL_STATE_ENDED || state == SIGNAL2SIP_CALL_STATE_CONCLUDED) {
