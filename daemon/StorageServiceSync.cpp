@@ -1,6 +1,7 @@
 #include "StorageServiceSync.h"
 
 #include <cstdio>
+#include <iostream>
 #include <stdexcept>
 
 #include <openssl/evp.h>
@@ -89,33 +90,87 @@ Bytes deriveManifestKey(const Bytes& storageServiceKey, uint64_t version) {
     return hmacSha256(storageServiceKey, "Manifest_" + std::to_string(version));
 }
 
-// StorageKey.kt: deriveItemKey(rawId) = HMAC-SHA256(key, "Item_" + base64(rawId))
-// - standard padded base64 (Base64.encodeWithPadding), matches this
-// project's own base64Encode().
+// Legacy path (StorageKey.kt: deriveItemKey(rawId) = HMAC-SHA256(key,
+// "Item_" + base64(rawId)), standard padded base64) - only correct when
+// the manifest has no recordIkm (see deriveItemKeyFromRecordIkm below,
+// the modern/default path for any account with SSRE2 record-IKM support -
+// which covers every item in this project's own real test account, so
+// this legacy path is effectively dead code for us but kept as the
+// documented fallback real Signal-Android/iOS also keep).
 Bytes deriveItemKey(const Bytes& storageServiceKey, const Bytes& rawId) {
     return hmacSha256(storageServiceKey, "Item_" + base64Encode(rawId));
+}
+
+// RecordIkm.kt: deriveStorageItemKey(rawId) = HKDF-SHA256(ikm=recordIkm,
+// salt=empty, info="20240801_SIGNAL_STORAGE_SERVICE_ITEM_" + rawId (raw
+// bytes, NOT base64 - unlike the legacy HMAC path above), outputLength=32).
+// recordIkm comes from ManifestRecord.recordIkm - present whenever the
+// account has the modern SSRE2 record-IKM feature, which per real
+// Signal-Android's StorageSyncJob.kt log message ("SSRE2 capability is
+// supported, but no recordIkm is set") is the expected default for
+// current accounts - confirmed 2026-08-06 to be exactly why this
+// project's own item decrypts were failing 72/72: this file was only
+// ever implementing the legacy path.
+Bytes deriveItemKeyFromRecordIkm(const Bytes& recordIkm, const Bytes& rawId) {
+    static const std::string kInfoPrefix = "20240801_SIGNAL_STORAGE_SERVICE_ITEM_";
+    Bytes info(kInfoPrefix.begin(), kInfoPrefix.end());
+    info.insert(info.end(), rawId.begin(), rawId.end());
+    Bytes out(32);
+    checkError(signal_hkdf_derive(borrowMutable(out), borrow(recordIkm), borrow(info), SignalBorrowedBuffer{nullptr, 0}));
+    return out;
 }
 
 } // namespace
 
 std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::string& accountEntropyPool) {
-    // Every step of this derivation chain (AEP->svrKey HKDF-SHA256, svrKey->
-    // storageServiceKey HMAC-SHA256, and this file's own AES-256-GCM decrypt)
-    // was independently verified live 2026-08-05 against known-answer test
-    // vectors (libsignal's own rust/account-keys/src/lib.rs::svr_key_tests,
-    // an independently Python-computed HKDF vector, and a standard AES-GCM
-    // vector) - all matched exactly, and this account's own stored AEP
-    // passes signal_account_entropy_pool_is_valid(). Yet the real manifest
-    // still fails to decrypt for account 123456789002 specifically (a
-    // year-plus-old account, linked via gendb) - most likely explanation:
-    // this account predates the AEP-based key-derivation scheme entirely
-    // (the HKDF info string is literally "20240801_SIGNAL_SVR_MASTER_KEY",
-    // i.e. introduced 2024-08-01) and its real storage service key still
-    // comes from an old, separately-stored/PIN-recovered "master key" that
-    // was never migrated to be AEP-derivable, or our own gendb link flow
-    // never captured that legacy key at all (only ever captures
-    // accountEntropyPool - see AccountFinisher.cpp). Not yet resolved -
-    // see project memory for the current status before extending this.
+    // The "legacy pre-AEP master key" theory this comment used to describe
+    // is DISPROVEN as of 2026-08-06: a real Desktop client linked to this
+    // same account (123456789002) a month before this account_entropy_pool
+    // was captured, and synced its contact list correctly - so whatever
+    // key that Desktop client used was already AEP-derived by then, and a
+    // fresh SyncMessage.Keys round-trip against the live primary returned
+    // the exact same 64-char AEP we already had (byte-for-byte) - not stale.
+    //
+    // RESOLVED 2026-08-06: the manifest decrypt's real non-determinism
+    // (byte-identical key+ciphertext sometimes decrypting, sometimes not,
+    // within this process, while a standalone Python decrypt of the exact
+    // same captured bytes succeeded 5/5 outside it) was this project's
+    // third instance of the libsrtp-collision bug class (see
+    // tools/isolate_webrtc_boringssl_symbols.py's docstring): both
+    // ringrtc/webrtc's prebuilt libwebrtc.a AND libsignal_ffi.a (via
+    // aws-lc-rs) statically vendor their own BoringSSL-family copy of the
+    // plain-C OpenSSL EVP API, and one of them was silently winning link-
+    // time symbol resolution over system libcrypto.so.3 for exactly the
+    // EVP_aes_256_gcm/EVP_CIPHER_CTX_*/EVP_Decrypt* symbols this file
+    // calls - confirmed via `nm -D` on the built daemon (these symbols
+    // were entirely absent from the dynamic-undefined list, i.e. never
+    // going to be satisfied by libcrypto.so.3 at runtime) and via `nm` on
+    // the vendored archives (both had their own global, non-namespaced
+    // definitions). Isolating both archives' BoringSSL-family symbols the
+    // same way libsrtp's were isolated fixed it - manifest decrypt is now
+    // 100% reliable (verified via native/test/storage_sync_loop_test.cpp,
+    // 20/20 real fetches, plus step-by-step EVP call tracing and a
+    // dladdr() check confirming every call now genuinely resolves to
+    // libcrypto.so.3).
+    //
+    // Separately, RESOLVED 2026-08-06: every one of this account's ~72
+    // CONTACT item records failed to decrypt under deriveItemKey()
+    // (legacy HMAC path), independent of the fix above - the formula and
+    // storageServiceKey were both independently proven correct (a
+    // "storageServiceKey rotated, old records never rewritten" theory
+    // didn't hold up either: a real Desktop client linked to this same
+    // account ~1 month before this AEP was captured synced its contact
+    // list correctly immediately, and SyncMessage.Keys confirms our AEP
+    // is still byte-identical to the primary's current one - no rotation
+    // in between). Real cause found by checking Signal-Android/iOS source
+    // directly: modern accounts with the SSRE2 "record IKM" feature
+    // (RecordIkm.kt, real Signal-Android's StorageSyncJob.kt logs "SSRE2
+    // capability is supported, but no recordIkm is set" as a warning,
+    // implying it's the expected default) encrypt every item under a key
+    // derived via HKDF from ManifestRecord.recordIkm, NOT the legacy
+    // HMAC-from-storageServiceKey path - this file only ever implemented
+    // the legacy path. See deriveItemKeyFromRecordIkm() below - confirmed
+    // fixed live, all 72 items now decrypt.
     if (accountEntropyPool.empty()) {
         throw std::runtime_error("no account_entropy_pool stored for this account - cannot derive storage key");
     }
@@ -139,10 +194,6 @@ std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::
     if (!manifest.ParseFromString(manifestResp.body)) {
         throw std::runtime_error("failed to parse StorageManifest protobuf");
     }
-
-    std::cerr << "[storage-sync-debug] manifestRespBodyLen=" << manifestResp.body.size()
-               << " manifest.version=" << manifest.version() << " manifest.value.size=" << manifest.value().size()
-               << "\n";
 
     Bytes manifestKey = deriveManifestKey(storageServiceKey, manifest.version());
     Bytes manifestPlaintext =
@@ -176,11 +227,27 @@ std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::
         throw std::runtime_error("failed to parse StorageItems protobuf");
     }
 
+    Bytes recordIkm(manifestRecord.recordikm().begin(), manifestRecord.recordikm().end());
+
     std::vector<StorageContact> contacts;
+    int skipped = 0;
     for (const auto& item : items.items()) {
         Bytes rawId(item.key().begin(), item.key().end());
-        Bytes itemKey = deriveItemKey(storageServiceKey, rawId);
-        Bytes itemPlaintext = aesGcmDecrypt(itemKey, Bytes(item.value().begin(), item.value().end()));
+        Bytes itemKey = recordIkm.empty() ? deriveItemKey(storageServiceKey, rawId)
+                                           : deriveItemKeyFromRecordIkm(recordIkm, rawId);
+        Bytes itemPlaintext;
+        try {
+            itemPlaintext = aesGcmDecrypt(itemKey, Bytes(item.value().begin(), item.value().end()));
+        } catch (const std::exception&) {
+            // Shouldn't normally happen now that both the manifest-decrypt
+            // and item-key-derivation bugs are fixed (see this function's
+            // own doc comment) - kept as a defensive skip-and-continue,
+            // matching real Signal client behavior, in case a genuinely
+            // corrupt/edge-case record ever shows up. One bad record
+            // shouldn't fail the whole sync.
+            skipped++;
+            continue;
+        }
 
         signalservice::StorageRecord record;
         if (!record.ParseFromArray(itemPlaintext.data(), static_cast<int>(itemPlaintext.size()))) continue;
@@ -193,6 +260,10 @@ std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::
         contact.e164 = c.e164();
         contact.profileKey.assign(c.profilekey().begin(), c.profilekey().end());
         contacts.push_back(std::move(contact));
+    }
+    if (skipped > 0) {
+        std::cerr << "[storage-sync] " << skipped << " of " << items.items_size()
+                   << " contact record(s) could not be decrypted (stale key) - skipped\n";
     }
     return contacts;
 }

@@ -1013,6 +1013,17 @@ void onPush(AccountState& acct, const std::string& verb, const std::string& path
         acct.storage->saveAccount(acct.account);
         std::cout << "[daemon][" << acct.config.name
                    << "] received updated account_entropy_pool via SyncMessage.Keys, saved\n";
+        // Without this, a fresh key received here just sits unused until
+        // the next periodic tick - up to storageSyncIntervalSec (12h
+        // default) away - because setupAccount()'s own initial
+        // syncStorageContacts() call (which always runs before this reply
+        // can possibly arrive) already stamped lastStorageSyncMs, and the
+        // periodic loop only re-fires once that interval elapses. Deferred
+        // onto the dispatch queue rather than called inline - this handler
+        // runs on the websocket read thread, and fetchStorageContacts()
+        // does synchronous network I/O (matches the existing
+        // sendDecryptionErrorReply() dispatch a few lines up).
+        acct.dispatchQueue.push([&acct] { syncStorageContacts(acct); });
     }
     if (!content.has_callmessage()) return;
 

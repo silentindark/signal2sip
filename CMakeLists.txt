@@ -193,11 +193,31 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/signal_ffi_cxx/signal_ffi.h "${
 # signal2sip-gendb's final size (gendb links almost nothing else
 # statically, so its whole ~66MB was essentially this). Matches
 # RINGRTC_DIR's own target/release convention just below.
+# libsignal_ffi.a vendors its own separate BoringSSL-family copy (aws-lc-rs,
+# monolithic module bcm.cc.o) that collides with system OpenSSL's plain-C
+# API the exact same way WebRTC's bcm.o does - see
+# tools/isolate_webrtc_boringssl_symbols.py's docstring (found chasing the
+# same aesGcmDecrypt() bug: isolating WebRTC's copy alone wasn't enough,
+# since this archive's copy - earlier on the link line than the real
+# -lcrypto - silently took over instead).
+set(LIBSIGNAL_FFI_OPENSSL_SAFE ${CMAKE_CURRENT_BINARY_DIR}/generated/libsignal_ffi_openssl_safe.a)
+add_custom_command(
+    OUTPUT ${LIBSIGNAL_FFI_OPENSSL_SAFE}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_boringssl_symbols.py
+            ${LIBSIGNAL_DIR}/target/release/libsignal_ffi.a ${LIBSIGNAL_FFI_OPENSSL_SAFE}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_boringssl_symbols.py
+            ${LIBSIGNAL_DIR}/target/release/libsignal_ffi.a
+    COMMENT "Isolating libsignal_ffi's bundled BoringSSL-family crypto symbols from system OpenSSL's"
+    VERBATIM
+)
+add_custom_target(libsignal_ffi_openssl_safe_gen DEPENDS ${LIBSIGNAL_FFI_OPENSSL_SAFE})
 add_library(libsignal_ffi STATIC IMPORTED)
 set_target_properties(libsignal_ffi PROPERTIES
-    IMPORTED_LOCATION ${LIBSIGNAL_DIR}/target/release/libsignal_ffi.a
+    IMPORTED_LOCATION ${LIBSIGNAL_FFI_OPENSSL_SAFE}
     INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_BINARY_DIR}/generated/signal_ffi_cxx
 )
+add_dependencies(libsignal_ffi libsignal_ffi_openssl_safe_gen)
 
 add_library(signal2sip_signal STATIC
     signal/ProtocolStores.cpp
@@ -319,15 +339,30 @@ target_link_options(two_call_managers_audio_isolation_test PRIVATE ${PIN_LLD21})
 # copy, since libwebrtc.a comes first on the link line). Use
 # `webrtc_pjsip_safe` instead, a derived copy with the vendored libsrtp's
 # plain-C symbols renamed out of the way.
+# Two isolation passes chained (order doesn't matter - disjoint symbol
+# namespaces, see isolate_webrtc_boringssl_symbols.py's docstring): first
+# libsrtp's plain-C API (PJSIP collision), then BoringSSL's bcm.o crypto
+# surface (system OpenSSL collision - see that script's docstring for the
+# real aesGcmDecrypt() bug this fixes, found 2026-08-06).
+set(WEBRTC_SRTP_SAFE_LIB ${CMAKE_CURRENT_BINARY_DIR}/generated/libwebrtc_srtp_safe.a)
 set(WEBRTC_PJSIP_SAFE_LIB ${CMAKE_CURRENT_BINARY_DIR}/generated/libwebrtc_pjsip_safe.a)
 add_custom_command(
-    OUTPUT ${WEBRTC_PJSIP_SAFE_LIB}
+    OUTPUT ${WEBRTC_SRTP_SAFE_LIB}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/generated
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_srtp_symbols.py
-            ${RINGRTC_DIR}/out/release/obj/libwebrtc.a ${WEBRTC_PJSIP_SAFE_LIB}
+            ${RINGRTC_DIR}/out/release/obj/libwebrtc.a ${WEBRTC_SRTP_SAFE_LIB}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_srtp_symbols.py
             ${RINGRTC_DIR}/out/release/obj/libwebrtc.a
     COMMENT "Isolating WebRTC's vendored libsrtp symbols from PJSIP's"
+    VERBATIM
+)
+add_custom_command(
+    OUTPUT ${WEBRTC_PJSIP_SAFE_LIB}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_boringssl_symbols.py
+            ${WEBRTC_SRTP_SAFE_LIB} ${WEBRTC_PJSIP_SAFE_LIB}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/isolate_webrtc_boringssl_symbols.py
+            ${WEBRTC_SRTP_SAFE_LIB}
+    COMMENT "Isolating WebRTC's bundled BoringSSL crypto symbols from system OpenSSL's"
     VERBATIM
 )
 add_custom_target(webrtc_pjsip_safe_gen DEPENDS ${WEBRTC_PJSIP_SAFE_LIB})
@@ -366,6 +401,15 @@ add_library(signal2sip_daemon STATIC
 target_include_directories(signal2sip_daemon PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_daemon PUBLIC signal2sip_signal signal2sip_authsocket signal2sip_proto
     signal2sip_voip ringrtc webrtc_pjsip_safe nlohmann_json::nlohmann_json signal2sip_config OpenSSL::Crypto)
+
+# Diagnostic for the aesGcmDecrypt()/BoringSSL-symbol-collision
+# investigation - see test/storage_sync_loop_test.cpp's own doc comment.
+add_executable(storage_sync_loop_test test/storage_sync_loop_test.cpp)
+target_include_directories(storage_sync_loop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(storage_sync_loop_test PRIVATE signal2sip_daemon signal2sip_signal signal2sip_authsocket
+    signal2sip_proto signal2sip_voip ringrtc webrtc_pjsip_safe PkgConfig::PJSIP
+    ${CMAKE_DL_LIBS} pthread m stdc++ pulse nlohmann_json::nlohmann_json)
+target_link_options(storage_sync_loop_test PRIVATE ${PIN_LLD21} -Wl,--allow-multiple-definition)
 
 add_executable(signal2sip-daemon daemon/main.cpp)
 target_include_directories(signal2sip-daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

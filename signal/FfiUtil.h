@@ -37,6 +37,10 @@ inline SignalBorrowedBuffer borrow(const Bytes& data) {
     return SignalBorrowedBuffer{data.data(), data.size()};
 }
 
+inline SignalBorrowedMutableBuffer borrowMutable(Bytes& data) {
+    return SignalBorrowedMutableBuffer{data.data(), data.size()};
+}
+
 // Copies an owned buffer's contents out and frees it - never hold onto the
 // raw pointer past this call.
 inline Bytes takeOwned(SignalOwnedBuffer& buffer) {
