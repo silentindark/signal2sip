@@ -55,8 +55,29 @@ namespace voip {
         pjmedia_port *InputPjmediaPort() { return audio_input_.GetPjmediaPort(); }
         pjmedia_port *OutputPjmediaPort() { return audio_output_.GetPjmediaPort(); }
 
+        // Records the resample ports wireBridgeAudio() (main.cpp) wires
+        // InputPjmediaPort()/OutputPjmediaPort() through, so the destructor
+        // can tear them down BEFORE audio_input_/audio_output_ get
+        // destroyed - see ~RingRtcSipBridge()'s own comment for why this
+        // matters. Idempotent: a no-op if already set, since
+        // onCallMediaState() (and therefore wireBridgeAudio()) can fire
+        // more than once for the same call - without this guard a second
+        // firing would wire up a SECOND pair of resample ports into the
+        // same downstream ports (double audio delivery) and leak the
+        // first pair's ids here.
+        bool HasResamplePorts() const { return resample_pool_ != nullptr; }
+        void SetResamplePorts(pj_pool_t *pool, pjsua_conf_port_id in_id, pjsua_conf_port_id out_id) {
+            resample_pool_ = pool;
+            in_resample_id_ = in_id;
+            out_resample_id_ = out_id;
+        }
+
     private:
         void FeederLoop();
+
+        pj_pool_t *resample_pool_{nullptr};
+        pjsua_conf_port_id in_resample_id_{PJSUA_INVALID_ID};
+        pjsua_conf_port_id out_resample_id_{PJSUA_INVALID_ID};
 
         static constexpr size_t kRingBufferCapacitySamples = 48000 * 2; // 2s @ 48kHz
         static constexpr unsigned kSamplesPerFrame = 480; // 10ms @ 48kHz mono

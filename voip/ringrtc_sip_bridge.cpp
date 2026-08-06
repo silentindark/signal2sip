@@ -6,6 +6,29 @@ RingRtcSipBridge::RingRtcSipBridge(Signal2sipCallManagerHandle *handle) : handle
 
 RingRtcSipBridge::~RingRtcSipBridge() {
     Stop();
+
+    // Found live 2026-08-06: without this, a real SIGSEGV - PJMEDIA's own
+    // clock_thread (a separate, independent realtime thread that keeps
+    // ticking at 48kHz regardless of any C++ object lifetime) called
+    // resample_put_frame() on a resample port wireBridgeAudio() (main.cpp)
+    // had wired to InputPjmediaPort()/OutputPjmediaPort() but never
+    // removed - and by the time this destructor's implicit epilogue got
+    // around to destroying audio_input_/audio_output_ below (freeing
+    // their pjmedia_port + pool), the resample port was STILL registered
+    // in the pjsua conference bridge and still forwarding frames into now
+    // -freed memory. `pjsua_conf_remove_port()` must run - and the
+    // resample ports must actually stop being driven - before
+    // audio_input_/audio_output_'s own destructors run just below, which
+    // is exactly why this is in the destructor BODY (runs first) rather
+    // than a separate explicit call site: correct ordering is guaranteed
+    // regardless of which teardown path (stopSipBridge() vs
+    // stopIncomingSipCall()) got here.
+    if (resample_pool_) {
+        pjsua_conf_remove_port(in_resample_id_);
+        pjsua_conf_remove_port(out_resample_id_);
+        pj_pool_release(resample_pool_);
+        resample_pool_ = nullptr;
+    }
 }
 
 void RingRtcSipBridge::Start() {

@@ -437,6 +437,16 @@ void onSendHangup(void* context, const char* remotePeerId, uint64_t callId, int3
 // resample-port approach is the fix that works for any call regardless
 // of negotiated codec).
 void wireBridgeAudio(pj::Call& call, voip::RingRtcSipBridge& bridge) {
+    // onCallMediaState() (this function's only caller) can fire more than
+    // once for the same call (renegotiation, hold/resume, ...) - without
+    // this guard a second firing would wire up a SECOND pair of resample
+    // ports into the same downstream ports (double audio delivery) and
+    // leak the first pair, since SetResamplePorts() below only has room
+    // for one. Found alongside the real SIGSEGV this function's other
+    // change here fixes - see RingRtcSipBridge::SetResamplePorts()'s own
+    // doc comment.
+    if (bridge.HasResamplePorts()) return;
+
     pj::CallInfo ci = call.getInfo();
     for (unsigned i = 0; i < ci.media.size(); i++) {
         if (ci.media[i].type != PJMEDIA_TYPE_AUDIO || !call.getMedia(i)) continue;
@@ -444,18 +454,37 @@ void wireBridgeAudio(pj::Call& call, voip::RingRtcSipBridge& bridge) {
         unsigned callRate = aud->getPortInfo().format.clockRate;
         std::cout << "[daemon][sip] call clock rate: " << callRate << "\n";
 
+        // PJMEDIA_RESAMPLE_DONT_DESTROY_DN: the default (0) behavior is
+        // for a resample port to destroy its OWN downstream port when
+        // it's itself destroyed - which here would be
+        // bridge.InputPjmediaPort()/OutputPjmediaPort(), whose lifetime
+        // SoftwareAudioInput/SoftwareAudioOutput already separately own
+        // and destroy (audio_bridge.cpp) - without this flag, whichever
+        // side destroys its port first leaves the other with a dangling
+        // pointer/double-free.
         pj_pool_t* pool = pjsua_pool_create("resample", 2048, 512);
         pjmedia_port* inResample = nullptr;
-        pjmedia_resample_port_create(pool, bridge.InputPjmediaPort(), callRate, 0, &inResample);
+        pjmedia_resample_port_create(pool, bridge.InputPjmediaPort(), callRate,
+                                      PJMEDIA_RESAMPLE_DONT_DESTROY_DN, &inResample);
         pjsua_conf_port_id inResampleId = PJSUA_INVALID_ID;
         pjsua_conf_add_port(pool, inResample, &inResampleId);
         pjsua_conf_connect(aud->getPortId(), inResampleId);
 
         pjmedia_port* outResample = nullptr;
-        pjmedia_resample_port_create(pool, bridge.OutputPjmediaPort(), callRate, 0, &outResample);
+        pjmedia_resample_port_create(pool, bridge.OutputPjmediaPort(), callRate,
+                                      PJMEDIA_RESAMPLE_DONT_DESTROY_DN, &outResample);
         pjsua_conf_port_id outResampleId = PJSUA_INVALID_ID;
         pjsua_conf_add_port(pool, outResample, &outResampleId);
         pjsua_conf_connect(outResampleId, aud->getPortId());
+
+        // Record these so ~RingRtcSipBridge() can tear them down before
+        // it destroys the ports they wrap - found live 2026-08-06: a real
+        // SIGSEGV (resample_put_frame() called into freed memory) from
+        // PJMEDIA's own clock_thread still driving these resample ports
+        // after audio_input_/audio_output_ had already been destroyed by
+        // stopSipBridge()/stopIncomingSipCall(), since nothing previously
+        // retained these ids/pool anywhere to ever remove them.
+        bridge.SetResamplePorts(pool, inResampleId, outResampleId);
 
         std::cout << "[daemon][sip] audio wired to RingRtcSipBridge via resample ports\n";
         bridge.Start();
