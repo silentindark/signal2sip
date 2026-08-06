@@ -40,6 +40,16 @@ void bindTextOpt(sqlite3_stmt* stmt, int index, const std::optional<std::string>
 }
 
 void bindBlob(sqlite3_stmt* stmt, int index, const Bytes& value) {
+    // An empty vector's .data() is commonly nullptr, and sqlite3_bind_blob
+    // treats a NULL pointer as binding SQL NULL regardless of the length
+    // argument - found live via a real NOT NULL constraint violation on
+    // synced_contact.profile_key for a real contact with no cached profile
+    // key. sqlite3_bind_zeroblob always produces an actual zero-length
+    // blob (X''), immune to this pointer-nullness gotcha.
+    if (value.empty()) {
+        sqlite3_bind_zeroblob(stmt, index, 0);
+        return;
+    }
     sqlite3_bind_blob(stmt, index, value.data(), static_cast<int>(value.size()), SQLITE_TRANSIENT);
 }
 

@@ -326,8 +326,18 @@ void syncStorageContacts(AccountState& acct) {
         int cachedCount = 0;
         for (const auto& contact : contacts) {
             if (contact.e164.empty()) continue; // nothing to key resolveOutgoingTarget's cache by
-            acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
-            cachedCount++;
+            try {
+                acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
+                cachedCount++;
+            } catch (const std::exception& e) {
+                // One bad row (e.g. a real DB constraint issue) shouldn't
+                // lose every contact after it in this batch - found live
+                // 2026-08-06: this loop had no per-contact handling at
+                // all, so a single failure silently discarded the rest of
+                // a real account's contact list.
+                std::cerr << "[daemon][" << acct.config.name << "] saveSyncedContact(" << contact.e164
+                           << ") failed (non-fatal): " << e.what() << "\n";
+            }
         }
         std::cout << "[daemon][" << acct.config.name << "] StorageService sync: " << contacts.size() << " contact(s), "
                    << cachedCount << " cached (had an e164)\n";
@@ -599,6 +609,26 @@ public:
 // creation) from startSipDial()'s libRegisterThread() call.
 pj::Endpoint* g_ep = nullptr;
 std::map<std::string, std::unique_ptr<BridgeAccount>> g_sipAccounts; // keyed by AccountConfig::name
+
+// Ground truth for "which account does this incoming SIP call actually
+// belong to" - keyed by the actual local UDP/TLS port each account's own
+// dedicated transport is bound to (see createAccountUdpTransport()/
+// createAccountTlsTransport(), populated right after each is created).
+// BridgeAccount::onIncomingCall() cannot just trust `this->acctState`
+// (i.e. trust that pjsua2 invoked the callback on the "right" Account
+// object) - found live 2026-08-06: a real INVITE whose Request-URI
+// (`sip:+123456789001@192.168.16.79:39445;ob`) and CDR both unambiguously
+// showed it physically arrived on 123456789003's own dedicated port
+// (39445) still fired onIncomingCall() on 123456789002's BridgeAccount
+// instead - pjsua's internal account-matching for an incoming call tries
+// to match the Request-URI against each account's own registered AOR,
+// and none of them match a bare phone number like "+123456789001", so it
+// falls back to some other (apparently unreliable, observed live to be
+// wrong) heuristic instead of the transport the packet actually arrived
+// on. Cross-checking against the real receiving transport's own local
+// port - which this project controls and knows unambiguously, unlike
+// pjsua's internal matching - sidesteps the whole question.
+std::map<int, AccountState*> g_portToAccount;
 
 // sipBridgeDid wins if both are somehow set - see AccountConfig's own doc
 // comment for why that shouldn't realistically happen (the matching
@@ -1198,6 +1228,23 @@ pj::TransportId createAccountTlsTransport(const AccountConfig& accountConfig) {
 // call is purely whatever's in the Request-URI, regardless of whether
 // that number also happens to be one of this daemon's own configured
 // accounts (user's own framing: "как обычный сигнал звонок").
+//
+// RESOLVED 2026-08-06: a second, worse variant of the same class of
+// problem - this time pjsua ITSELF (not Asterisk) picked the wrong
+// account. A real INVITE whose Request-URI and the resulting Asterisk
+// CDR both unambiguously showed it physically arrived on account
+// 123456789003's own dedicated transport still fired this callback with
+// `this->acctState` bound to 123456789002 - confirmed live (the outgoing
+// Signal call that resulted used 123456789002's own contact list/
+// identity, not 123456789003's). Root cause: pjsua's internal incoming-
+// call account matching compares the Request-URI against each account's
+// own registered AOR, and none of them match a bare phone number like
+// "+123456789001" - it silently falls back to some other, observed-live-
+// to-be-wrong heuristic instead of "whichever transport the packet
+// physically arrived on". See g_portToAccount's own doc comment for the
+// fix: cross-check (and override if necessary) against a registry this
+// project controls directly, keyed by each transport's own real local
+// port - not pjsua's account selection.
 void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
     if (!acctState) {
         // Shouldn't happen - every BridgeAccount is constructed with a
@@ -1212,7 +1259,25 @@ void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
         }
         return;
     }
-    AccountState& acct = *acctState;
+
+    auto* rdata = static_cast<pjsip_rx_data*>(iprm.rdata.pjRxData);
+
+    // Don't just trust that pjsua2 invoked this callback on the "right"
+    // Account object (this->acctState) - see g_portToAccount's own doc
+    // comment for the real, live-confirmed misattribution this guards
+    // against. The receiving transport's own local port is ground truth.
+    AccountState* resolvedAcct = acctState;
+    if (rdata && rdata->tp_info.transport) {
+        int actualPort = pj_sockaddr_get_port(&rdata->tp_info.transport->local_addr);
+        auto it = g_portToAccount.find(actualPort);
+        if (it != g_portToAccount.end() && it->second != acctState) {
+            std::cerr << "[daemon][" << acctState->config.name << "][sip] pjsua invoked onIncomingCall on the "
+                       << "wrong account - INVITE actually arrived on port " << actualPort << " (account '"
+                       << it->second->config.name << "'), not this one - using the correct account instead\n";
+            resolvedAcct = it->second;
+        }
+    }
+    AccountState& acct = *resolvedAcct;
     if (acct.incomingSipCall || acct.sipCall) {
         // Already bridging a call in one direction or the other -
         // this project's one-call-at-a-time-per-account scope (see
@@ -1228,7 +1293,6 @@ void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
     }
 
     std::string destUser;
-    auto* rdata = static_cast<pjsip_rx_data*>(iprm.rdata.pjRxData);
     if (rdata && rdata->msg_info.msg) {
         pjsip_uri* reqUri = rdata->msg_info.msg->line.req.uri;
         if (PJSIP_URI_SCHEME_IS_SIP(reqUri) || PJSIP_URI_SCHEME_IS_SIPS(reqUri)) {
@@ -1244,8 +1308,19 @@ void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
     // INVITE skipped CDSI entirely and got used as-is, so RingRTC tried
     // fetching prekeys from "GET /v2/keys/123456789001/*" - a phone
     // number, not a real ServiceId UUID - and always 404'd.
-    if (!destUser.empty() && destUser[0] != '+') {
-        destUser.insert(0, "+");
+    //
+    // Strip any leading '+'(s) first, then add exactly one back - found
+    // live 2026-08-06: Asterisk itself can send an R-URI user part
+    // already containing "++<e164>" (a trunk's own dialoutprefix='+'
+    // stacking with a caller who already dialed a leading '+'), which
+    // the old "only add if missing" check let straight through as an
+    // invalid double-plus number - CDSI correctly rejected it as not a
+    // real e164 every time. Normalizing to exactly one '+' regardless of
+    // how many Asterisk's R-URI already had is robust to this regardless
+    // of trunk dialoutprefix config on the Asterisk side.
+    if (!destUser.empty()) {
+        std::size_t firstNonPlus = destUser.find_first_not_of('+');
+        destUser = "+" + destUser.substr(firstNonPlus == std::string::npos ? destUser.size() : firstNonPlus);
     }
     std::cout << "[daemon][" << acct.config.name << "][sip] incoming SIP call for '" << destUser << "'\n";
     if (destUser.empty()) {
@@ -1381,6 +1456,27 @@ bool setupAccount(const AccountConfig& accountConfig) {
                                                ? createAccountTlsTransport(accountConfig)
                                                : createAccountUdpTransport(accountConfig);
             if (g_ep && transportId != PJSUA_INVALID_ID) {
+                // See g_portToAccount's own doc comment - this is the
+                // authoritative record of which account this port belongs
+                // to, independent of whatever pjsua's own (unreliable)
+                // incoming-call account matching later decides.
+                try {
+                    std::string localAddr = g_ep->transportGetInfo(transportId).localAddress;
+                    std::size_t colon = localAddr.rfind(':');
+                    if (colon != std::string::npos) {
+                        int port = std::stoi(localAddr.substr(colon + 1));
+                        g_portToAccount[port] = &acct;
+                    }
+                } catch (pj::Error& err) {
+                    std::cerr << "[daemon][" << accountConfig.name
+                               << "] could not record transport port for incoming-call routing: " << err.info()
+                               << "\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "[daemon][" << accountConfig.name
+                               << "] could not record transport port for incoming-call routing: " << e.what()
+                               << "\n";
+                }
+
                 auto sipAccount = std::make_unique<BridgeAccount>();
                 pj::AccountConfig acfg;
                 acfg.sipConfig.transportId = transportId;

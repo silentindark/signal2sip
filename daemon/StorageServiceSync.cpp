@@ -111,6 +111,27 @@ Bytes deriveItemKey(const Bytes& storageServiceKey, const Bytes& rawId) {
 // current accounts - confirmed 2026-08-06 to be exactly why this
 // project's own item decrypts were failing 72/72: this file was only
 // ever implementing the legacy path.
+// ContactRecord.aci/pni (StorageService.proto fields 1/15, plain string
+// UUID) are the legacy representation - real, current Signal-Android
+// writes the 16-byte binary aciBinary/pniBinary (fields 25/26) instead,
+// leaving the string fields empty. Found live 2026-08-06: a real,
+// long-established mutual contact (both directions, years of real
+// messages/calls) came back with an empty aci from this file's own
+// c.aci() read, breaking ContactResolver's ACI-preferred lookup and
+// silently falling all the way back to the CDS/PNI cold-call path for a
+// contact that should never have needed it - same root cause class as
+// this project's other legacy-string-field-vs-binary-field bugs (see
+// FfiUtil.h's resolveServiceId() for the analogous Envelope field, and
+// the PNI: prefix fix in this daemon's outgoing-call resolution).
+std::string uuidBytesToStringOrEmpty(const std::string& bytes) {
+    if (bytes.size() != 16) return "";
+    const auto* b = reinterpret_cast<const uint8_t*>(bytes.data());
+    char buf[37];
+    std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x", b[0],
+                  b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return buf;
+}
+
 Bytes deriveItemKeyFromRecordIkm(const Bytes& recordIkm, const Bytes& rawId) {
     static const std::string kInfoPrefix = "20240801_SIGNAL_STORAGE_SERVICE_ITEM_";
     Bytes info(kInfoPrefix.begin(), kInfoPrefix.end());
@@ -255,8 +276,8 @@ std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::
 
         const auto& c = record.contact();
         StorageContact contact;
-        contact.aci = c.aci();
-        contact.pni = c.pni();
+        contact.aci = !c.acibinary().empty() ? uuidBytesToStringOrEmpty(c.acibinary()) : c.aci();
+        contact.pni = !c.pnibinary().empty() ? uuidBytesToStringOrEmpty(c.pnibinary()) : c.pni();
         contact.e164 = c.e164();
         contact.profileKey.assign(c.profilekey().begin(), c.profilekey().end());
         contacts.push_back(std::move(contact));
