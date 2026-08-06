@@ -51,6 +51,40 @@ struct AuthSocket::Impl {
 
     static int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t len);
 
+    // Shared by connect() (first-time setup) and reconnect() (after a
+    // drop) - both just need a fresh WebSocket handshake against the
+    // already-created lws_context. Blocks until the handshake completes
+    // or throws on failure/timeout.
+    void doConnect() {
+        {
+            std::lock_guard<std::mutex> lock(connectMutex);
+            connected = false;
+            connectFailed = false;
+            connectError.clear();
+        }
+
+        lws_client_connect_info connectInfo{};
+        connectInfo.context = context;
+        connectInfo.address = "chat.signal.org";
+        connectInfo.port = 443;
+        connectInfo.ssl_connection = LCCSCF_USE_SSL;
+        connectInfo.path = "/v1/websocket/";
+        connectInfo.host = connectInfo.address;
+        connectInfo.origin = connectInfo.address;
+        connectInfo.protocol = kProtocols[0].name;
+        connectInfo.pwsi = &wsi;
+
+        if (!lws_client_connect_via_info(&connectInfo)) {
+            throw std::runtime_error("lws_client_connect_via_info failed");
+        }
+
+        std::unique_lock<std::mutex> lock(connectMutex);
+        bool ok = connectCv.wait_for(lock, std::chrono::seconds(15),
+                                     [this] { return connected || connectFailed; });
+        if (!ok) throw std::runtime_error("timed out connecting to chat.signal.org");
+        if (connectFailed) throw std::runtime_error("websocket connect failed: " + connectError);
+    }
+
     void enqueue(Bytes message) {
         {
             std::lock_guard<std::mutex> lock(outgoingMutex);
@@ -61,6 +95,14 @@ struct AuthSocket::Impl {
     }
 
     void sendKeepAlive() {
+        // Skip while disconnected - otherwise these just pile up in
+        // `outgoing` for however long the reconnect watchdog takes to
+        // notice and fix the underlying drop, then all flush at once the
+        // moment reconnect() succeeds.
+        {
+            std::lock_guard<std::mutex> lock(connectMutex);
+            if (!connected) return;
+        }
         signalservice::WebSocketMessage msg;
         msg.set_type(signalservice::WebSocketMessage_Type_REQUEST);
         auto* req = msg.mutable_request();
@@ -161,6 +203,17 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
         }
         case LWS_CALLBACK_CLIENT_CLOSED: {
             {
+                std::lock_guard<std::mutex> lock(self->connectMutex);
+                self->connected = false;
+            }
+            self->connectCv.notify_all();
+            // wsi is about to be invalidated by libwebsockets - null it out
+            // so enqueue() (called from arbitrary threads, e.g. the
+            // keepalive thread) stops handing it to lws_callback_on_writable()
+            // once this handshake is gone. The next reconnect() attempt
+            // gives us a fresh one via connectInfo.pwsi.
+            self->wsi = nullptr;
+            {
                 std::lock_guard<std::mutex> lock(self->pendingMutex);
                 for (auto& [id, response] : self->pendingResponses) {
                     if (!response) response = Response{0, {}};
@@ -226,32 +279,13 @@ void AuthSocket::connect() {
     impl_->context = lws_create_context(&info);
     if (!impl_->context) throw std::runtime_error("lws_create_context failed");
 
-    lws_client_connect_info connectInfo{};
-    connectInfo.context = impl_->context;
-    connectInfo.address = "chat.signal.org";
-    connectInfo.port = 443;
-    connectInfo.ssl_connection = LCCSCF_USE_SSL;
-    connectInfo.path = "/v1/websocket/";
-    connectInfo.host = connectInfo.address;
-    connectInfo.origin = connectInfo.address;
-    connectInfo.protocol = Impl::kProtocols[0].name;
-    connectInfo.pwsi = &impl_->wsi;
-
-    if (!lws_client_connect_via_info(&connectInfo)) {
-        throw std::runtime_error("lws_client_connect_via_info failed");
-    }
-
     impl_->serviceThread = std::thread([this] {
         while (!impl_->stopping.load()) {
             lws_service(impl_->context, 50);
         }
     });
 
-    std::unique_lock<std::mutex> lock(impl_->connectMutex);
-    bool ok = impl_->connectCv.wait_for(lock, std::chrono::seconds(15),
-                                        [this] { return impl_->connected || impl_->connectFailed; });
-    if (!ok) throw std::runtime_error("timed out connecting to chat.signal.org");
-    if (impl_->connectFailed) throw std::runtime_error("websocket connect failed: " + impl_->connectError);
+    impl_->doConnect();
 
     impl_->keepAliveThread = std::thread([this] {
         while (!impl_->stopping.load()) {
@@ -260,6 +294,13 @@ void AuthSocket::connect() {
         }
     });
 }
+
+bool AuthSocket::isConnected() const {
+    std::lock_guard<std::mutex> lock(impl_->connectMutex);
+    return impl_->connected;
+}
+
+void AuthSocket::reconnect() { impl_->doConnect(); }
 
 AuthSocket::Response AuthSocket::request(const std::string& verb, const std::string& path, const Bytes* body) {
     uint64_t id = impl_->nextId.fetch_add(1);

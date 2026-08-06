@@ -302,9 +302,24 @@ struct AccountState {
     // lifetime (setupAccount()'s own initial sync sets this too, so the
     // periodic loop doesn't immediately redo it on the next tick).
     int64_t lastStorageSyncMs = 0;
+
+    // Signal WebSocket watchdog bookkeeping (main()'s loop, right next to
+    // the registration watchdog) - see AuthSocket::isConnected()'s own doc
+    // comment. socketConnected mirrors the last isConnected() reading, so
+    // the watchdog only logs/acts on the down->up and up->down edges
+    // instead of every 200ms tick; starts true since setupAccount() only
+    // ever returns after a successful connect().
+    bool socketConnected = true;
+    int64_t lastSocketReconnectAttemptMs = 0;
 };
 
 std::map<std::string, std::unique_ptr<AccountState>> g_accounts; // keyed by AccountConfig::name
+
+// How often main()'s loop retries a dropped Signal WebSocket - see the
+// watchdog next to the SIP registration watchdog. A plain constant (not a
+// GlobalConfig knob like sipRegWatchdogSec) - reconnecting a dead socket
+// every few seconds is cheap enough that this doesn't need to be tunable.
+constexpr int64_t kSocketReconnectIntervalMs = 5000;
 
 // Only a gendb-linked account (a real device linked into a real,
 // already-in-use Signal account) has a meaningful contact list to sync at
@@ -1770,6 +1785,59 @@ int main(int argc, char** argv) {
                 // down next tick, we'll try again after another full
                 // watchdog interval rather than spamming every 200ms.
                 sipAccount->unregisteredSinceMs = nowMs;
+            }
+        }
+
+        // Signal WebSocket watchdog - AuthSocket has no built-in reconnect
+        // (see AuthSocket::reconnect()'s own doc comment); found live
+        // 2026-08-06 that a dropped chat.signal.org connection left an
+        // account's SIP registration looking perfectly healthy (PJSIP
+        // itself never notices - the drop is on a completely separate
+        // connection) while incoming Signal calls silently never reached
+        // the daemon at all, for hours, with nothing in the log past the
+        // initial disconnect. Bring SIP down the moment the socket drops -
+        // an honest "Unregistered" beats a stale "Registered" nothing can
+        // actually route to - and keep retrying the WebSocket every
+        // kSocketReconnectIntervalMs until it's back, then bring SIP back
+        // up too.
+        for (auto& [name, acctPtr] : g_accounts) {
+            AccountState& acct = *acctPtr;
+            if (!acct.socket) continue;
+            auto sipIt = g_sipAccounts.find(name);
+
+            bool nowConnected = acct.socket->isConnected();
+            if (acct.socketConnected && !nowConnected) {
+                std::cerr << "[daemon][" << name << "] Signal websocket dropped\n";
+                if (sipIt != g_sipAccounts.end()) {
+                    try {
+                        sipIt->second->setRegistration(false);
+                    } catch (pj::Error& err) {
+                        std::cerr << "[daemon][" << name
+                                   << "] could not bring SIP registration down: " << err.info() << "\n";
+                    }
+                }
+            }
+            acct.socketConnected = nowConnected;
+
+            if (!nowConnected &&
+                nowMs - acct.lastSocketReconnectAttemptMs >= kSocketReconnectIntervalMs) {
+                acct.lastSocketReconnectAttemptMs = nowMs;
+                std::cout << "[daemon][" << name << "] reconnecting Signal websocket...\n";
+                try {
+                    acct.socket->reconnect();
+                    std::cout << "[daemon][" << name << "] Signal websocket reconnected\n";
+                    acct.socketConnected = true;
+                    if (sipIt != g_sipAccounts.end()) {
+                        try {
+                            sipIt->second->setRegistration(true);
+                        } catch (pj::Error& err) {
+                            std::cerr << "[daemon][" << name
+                                       << "] could not bring SIP registration back up: " << err.info() << "\n";
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "[daemon][" << name << "] Signal websocket reconnect failed: " << e.what() << "\n";
+                }
             }
         }
 

@@ -40,6 +40,21 @@ public:
     // on failure/timeout).
     void connect();
 
+    // True once the WebSocket upgrade has completed and the connection
+    // hasn't been closed since - cleared from the background service
+    // thread's LWS_CALLBACK_CLIENT_CLOSED handler. Poll this instead of
+    // assuming a connect()ed socket stays connected forever; chat.signal.org
+    // (or the network path to it) can and does drop the connection with no
+    // warning.
+    bool isConnected() const;
+
+    // Re-establishes the connection after isConnected() has gone false.
+    // Unlike connect(), reuses the existing lws_context and background
+    // threads - only redoes the WebSocket handshake itself - so it's safe
+    // to call repeatedly from a watchdog loop. Blocks until the handshake
+    // completes (or throws on failure/timeout), same as connect().
+    void reconnect();
+
     // Client-initiated request (e.g. GET /v2/keys/..., PUT /v1/messages/...).
     // Blocks the calling thread until a response arrives or times out.
     Response request(const std::string& verb, const std::string& path, const Bytes* body = nullptr);
