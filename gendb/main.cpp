@@ -43,6 +43,7 @@
 #include "AccountFinisher.h"
 #include "ProvisioningClient.h"
 #include "../daemon/Config.h"
+#include "../signal/AuthSocket.h"
 #include "../signal/FfiUtil.h"
 #include "../storage/Storage.h"
 #include "../util/Base64.h"
@@ -610,6 +611,79 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
                  "restart it) if you don't want it to try starting this account again.\n";
 }
 
+// ---- Primary account lifecycle: unregister (soft) / reactivate ----
+
+// PUT /v1/accounts/attributes/ over the account's own authenticated
+// WebSocket (same call toggle_discoverability_test.cpp already proved
+// live). Signal-Server's handler (AccountController.setAccountAttributes)
+// unconditionally OVERWRITES capabilities/name/discoverableByPhoneNumber/
+// unrestrictedUnidentifiedAccess with whatever this body sends - it does
+// NOT merge against the account's current values - so every field below
+// must always be resent, or it gets silently reset to a Java-default
+// (false/null) rather than left alone. fetchesMessages is the only field
+// that actually changes between unregister and reactivate; the rest just
+// re-assert the same values cmdVerify/cmdLink already set at account
+// creation.
+// TODO once the DeviceName encryption fix lands (see project memory
+// signal2sip-device-name-unknown): `name` here must resend the encrypted
+// device name instead of null, or every unregister/reactivate call will
+// silently reset the real Linked Devices list entry back to "Unnamed
+// device".
+void putFetchesMessages(const AccountRecord& account, bool fetchesMessages) {
+    std::string username =
+        account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
+    AuthSocket socket(username, account.password, kCaCertPath,
+                      [](const std::string&, const std::string&, const Bytes&) {});
+    socket.connect();
+
+    json body = {
+        {"fetchesMessages", fetchesMessages},
+        {"registrationId", account.registration_id},
+        {"pniRegistrationId", account.pni_registration_id},
+        {"name", nullptr},
+        {"capabilities", capabilitiesJson()},
+        {"unrestrictedUnidentifiedAccess", true},
+        {"discoverableByPhoneNumber", true},
+    };
+    std::string bodyStr = body.dump();
+    Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
+    auto response = socket.request("PUT", "/v1/accounts/attributes/", &bodyBytes);
+    socket.close();
+    if (response.status / 100 != 2) {
+        throw std::runtime_error("PUT /v1/accounts/attributes/ failed with status " +
+                                 std::to_string(response.status));
+    }
+}
+
+void cmdUnregister(const DaemonConfig& config, const std::string& accountName) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+    putFetchesMessages(account, /*fetchesMessages=*/false);
+    std::cout << "[unregister] account '" << accountName << "' (e164=" << account.e164
+              << ") is now dormant (fetchesMessages=false) - senders can no longer reach this number.\n";
+    std::cout << "[unregister] this is REVERSIBLE and purely a server-side flag flip - no local data or "
+                 "registration/identity keys were touched. Run `reactivate` to bring it back.\n";
+    std::cout << "[unregister] if signal2sip-daemon is currently running this account, stop it (or drop the "
+                 "[account." << accountName << "] section and SIGHUP) first - otherwise its already-open "
+                 "connection may keep the account looking active until it next reconnects.\n";
+}
+
+void cmdReactivate(const DaemonConfig& config, const std::string& accountName) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+    putFetchesMessages(account, /*fetchesMessages=*/true);
+    std::cout << "[reactivate] account '" << accountName << "' (e164=" << account.e164
+              << ") is active again (fetchesMessages=true), no re-verification needed.\n";
+    std::cout << "[reactivate] start (or SIGHUP-reload) signal2sip-daemon with this account in its config to "
+                 "actually resume receiving.\n";
+}
+
 void printUsage() {
     std::cerr
         << "usage:\n"
@@ -618,10 +692,16 @@ void printUsage() {
           "  signal2sip-gendb <account-name> verify <code> [--config <path>]\n"
           "  signal2sip-gendb <account-name> link [--config <path>]\n"
           "  signal2sip-gendb <account-name> unlink [--config <path>]\n"
+          "  signal2sip-gendb <account-name> unregister [--config <path>]\n"
+          "  signal2sip-gendb <account-name> reactivate [--config <path>]\n"
           "\n"
           "`unlink` wipes this account's local data (keys, sessions, cached contacts) from the database. It is\n"
           "LOCAL ONLY - it does not contact Signal's servers, so use it after the account is already gone on the\n"
           "real side (a real unlink/delete-account done elsewhere), not as a way to perform that unlink itself.\n"
+          "\n"
+          "`unregister`/`reactivate` are the opposite: a REAL, reversible server-side flag flip\n"
+          "(fetchesMessages) using the account's own stored credentials - senders can't reach an unregistered\n"
+          "number until `reactivate` is run. Neither touches local data or requires re-verification.\n"
           "\n"
           "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf), same as\n"
           "signal2sip-daemon. Its [global] section (db_path/db_key) is bootstrapped automatically on a clean\n"
@@ -701,6 +781,10 @@ int main(int argc, char** argv) {
             cmdLink(config, configPath, args.accountName);
         } else if (args.command == "unlink") {
             cmdUnlink(config, args.accountName);
+        } else if (args.command == "unregister") {
+            cmdUnregister(config, args.accountName);
+        } else if (args.command == "reactivate") {
+            cmdReactivate(config, args.accountName);
         } else {
             printUsage();
             exitCode = 1;

@@ -472,8 +472,8 @@ target_link_libraries(signal2sip_gendb PUBLIC signal2sip_signal signal2sip_stora
 add_executable(signal2sip-gendb gendb/main.cpp)
 target_include_directories(signal2sip-gendb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_config signal2sip_signal
-    signal2sip_storage signal2sip_proto CURL::libcurl OpenSSL::Crypto PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE
-    nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
+    signal2sip_storage signal2sip_authsocket signal2sip_proto CURL::libcurl OpenSSL::Crypto
+    PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
 # See signal2sip-daemon's own -s comment above - same deal here.
 # PIN_LLD21: gendb also links libsignal_ffi_openssl_safe's BoringSSL Rust
 # code (via signal2sip_signal), so it hits the same distro-lld eh_frame
