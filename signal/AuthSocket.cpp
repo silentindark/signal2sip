@@ -36,6 +36,34 @@ struct AuthSocket::Impl {
     bool connectFailed = false;
     std::string connectError;
 
+    // Together, currentWsi/abandonedWsi/isStaleWsi() answer "does this
+    // callback belong to the attempt doConnect() is actually still
+    // waiting on" - two DIFFERENT staleness signals, both needed, each
+    // catching a distinct self-inflicted-flapping scenario found live
+    // 2026-08-08 (see git history for the two separate incidents):
+    //   - currentWsi: cross-thread-safe mirror of `wsi` below (that
+    //     member has its own pre-existing, unrelated data race - written
+    //     from doConnect()'s caller thread, read/nulled from the lws
+    //     callback thread - not fixed here, out of scope). A callback
+    //     whose own wsi parameter doesn't match this is for an attempt a
+    //     NEWER doConnect() call has already superseded - e.g. our own
+    //     forced-close of an abandoned connection (below) triggers
+    //     LWS_CALLBACK_CLIENT_CONNECTION_ERROR for that SAME stale wsi;
+    //     without this check that handler would clobber the shared
+    //     connectFailed/connectError state a completely different,
+    //     still-legitimately-in-progress doConnect() call is waiting on.
+    //   - abandonedWsi: set by doConnect() when its local 15s wait times
+    //     out (see doConnect()'s own comment) - catches the callback
+    //     landing late for the SAME attempt when nothing newer has
+    //     started yet, which currentWsi comparison alone can't catch
+    //     (currentWsi wouldn't have changed in that window). Using this
+    //     late is exactly how a fresh doConnect() succeeding meanwhile
+    //     ends up with two live sessions for the same device - Signal's
+    //     server then kicks one with a 4409 "Connected elsewhere" close.
+    std::atomic<lws*> currentWsi{nullptr};
+    std::atomic<lws*> abandonedWsi{nullptr};
+    bool isStaleWsi(lws* w) { return w != currentWsi.load() || w == abandonedWsi.load(); }
+
     // See AuthSocket::isDeauthorized()'s own doc comment. Set from the
     // callback thread in LWS_CALLBACK_CLIENT_CONNECTION_ERROR (upgrade
     // rejected with 401/403) or LWS_CALLBACK_WS_PEER_INITIATED_CLOSE
@@ -85,11 +113,25 @@ struct AuthSocket::Impl {
         if (!lws_client_connect_via_info(&connectInfo)) {
             throw std::runtime_error("lws_client_connect_via_info failed");
         }
+        // lws writes the fresh handle into `wsi` synchronously above (only
+        // the handshake itself is async) - mirror it into the atomic right
+        // away so the callback thread can always tell which attempt is the
+        // one anybody's still waiting on, including after this function
+        // itself gives up below (see currentWsi's own comment).
+        currentWsi = wsi;
 
         std::unique_lock<std::mutex> lock(connectMutex);
         bool ok = connectCv.wait_for(lock, std::chrono::seconds(15),
                                      [this] { return connected || connectFailed; });
-        if (!ok) throw std::runtime_error("timed out connecting to chat.signal.org");
+        if (!ok) {
+            // Mark this exact attempt abandoned (see abandonedWsi's own
+            // comment) before giving up on it - if it lands late, the
+            // ESTABLISHED callback needs to recognize and kill it rather
+            // than silently starting to use a connection this function
+            // already told its caller failed.
+            abandonedWsi = wsi;
+            throw std::runtime_error("timed out connecting to chat.signal.org");
+        }
         if (connectFailed) throw std::runtime_error("websocket connect failed: " + connectError);
     }
 
@@ -193,6 +235,19 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
             break;
         }
         case LWS_CALLBACK_CLIENT_ESTABLISHED: {
+            if (self->isStaleWsi(wsi)) {
+                // See isStaleWsi()'s own comment - this attempt is either
+                // superseded by a newer one or was already abandoned
+                // locally on timeout. Close it instead of marking it
+                // connected: using it risks a second live session for
+                // this device that Signal's server will notice and kick
+                // (4409 "Connected elsewhere"), which was the real cause
+                // of a live self-inflicted flapping loop.
+                std::cerr << "[authsocket][" << self->username
+                           << "] a superseded/timed-out connection attempt established late - closing it instead "
+                              "of using it\n";
+                return -1;
+            }
             {
                 std::lock_guard<std::mutex> lock(self->connectMutex);
                 self->connected = true;
@@ -202,6 +257,21 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
             break;
         }
         case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
+            if (self->isStaleWsi(wsi)) {
+                // This failure belongs to an attempt doConnect() is no
+                // longer waiting on - often our own forced-close of a
+                // stale connection in LWS_CALLBACK_CLIENT_ESTABLISHED
+                // just above, which triggers this callback for that same
+                // wsi. Reporting it into the shared connectFailed/
+                // connectError state would wake a DIFFERENT, still-
+                // legitimately-in-progress doConnect() call with
+                // somebody else's failure - live-observed 2026-08-08 as
+                // a second self-inflicted flapping loop stacked on top
+                // of the first one isStaleWsi() exists to fix.
+                std::cerr << "[authsocket][" << self->username
+                           << "] connection error on an already-superseded attempt, ignoring\n";
+                break;
+            }
             // The WebSocket upgrade request itself was rejected - if
             // Signal's server responded with a real HTTP status (rather
             // than the connection failing before any HTTP response, e.g.
@@ -260,7 +330,16 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
             // a materially different failure mode than the server
             // cleanly closing it, worth telling apart when chasing a
             // flapping connection.
-            std::cerr << "[authsocket][" << self->username << "] connection closed (teardown)\n";
+            bool stale = self->isStaleWsi(wsi);
+            std::cerr << "[authsocket][" << self->username << "] connection closed (teardown)"
+                       << (stale ? " [already-superseded attempt, ignoring]" : "") << "\n";
+            if (stale) {
+                // Not the attempt anyone's waiting on (see isStaleWsi()'s
+                // own comment) - skip touching connected/pendingResponses
+                // entirely, those belong to whatever connection actually
+                // IS current right now, not this dead one.
+                break;
+            }
             {
                 std::lock_guard<std::mutex> lock(self->connectMutex);
                 self->connected = false;
@@ -272,6 +351,7 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
             // once this handshake is gone. The next reconnect() attempt
             // gives us a fresh one via connectInfo.pwsi.
             self->wsi = nullptr;
+            self->currentWsi = nullptr;
             {
                 std::lock_guard<std::mutex> lock(self->pendingMutex);
                 for (auto& [id, response] : self->pendingResponses) {
