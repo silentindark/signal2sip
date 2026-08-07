@@ -475,4 +475,8 @@ target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_confi
     signal2sip_storage signal2sip_proto CURL::libcurl OpenSSL::Crypto PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE
     nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
 # See signal2sip-daemon's own -s comment above - same deal here.
-target_link_options(signal2sip-gendb PRIVATE $<$<CONFIG:Release>:-s>)
+# PIN_LLD21: gendb also links libsignal_ffi_openssl_safe's BoringSSL Rust
+# code (via signal2sip_signal), so it hits the same distro-lld eh_frame
+# relocation failure signal2sip-daemon does - see PIN_LLD21 above and
+# project memory project_signal2sip_debian12_daemon_crash.
+target_link_options(signal2sip-gendb PRIVATE ${PIN_LLD21} $<$<CONFIG:Release>:-s>)

@@ -585,6 +585,31 @@ void cmdLink(const DaemonConfig& config, const std::string& configPath, const st
               << finished.deviceId << ")\n";
 }
 
+// ---- Local account removal ----
+
+// Wipes every row for this account (identity keys, prekeys, sessions,
+// remote identities, cached/synced contacts, the account row itself) from
+// the shared local database. Purely local: does NOT contact Signal's
+// servers, so it does not unlink/deregister the real account there -
+// intended for cleaning up an account whose real-side registration is
+// already gone (real unlink, real delete-account, or a local number that
+// was never actually verified) so its dead key material doesn't linger
+// and block reusing the account name (see requireNoExistingAccount()).
+void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database - nothing to unlink");
+    }
+    AccountRecord account = storage.loadAccount();
+    storage.deleteAccount();
+    std::cout << "[unlink] removed all local data for account '" << accountName << "' (e164=" << account.e164
+              << ")\n";
+    std::cout << "[unlink] this was LOCAL ONLY - it does not unlink or delete the account on Signal's real servers.\n";
+    std::cout << "[unlink] the [account." << accountName
+              << "] section in the config file was left in place - remove it yourself (and SIGHUP the daemon, or "
+                 "restart it) if you don't want it to try starting this account again.\n";
+}
+
 void printUsage() {
     std::cerr
         << "usage:\n"
@@ -592,6 +617,11 @@ void printUsage() {
           "  signal2sip-gendb <account-name> register-captcha <token> [--config <path>]\n"
           "  signal2sip-gendb <account-name> verify <code> [--config <path>]\n"
           "  signal2sip-gendb <account-name> link [--config <path>]\n"
+          "  signal2sip-gendb <account-name> unlink [--config <path>]\n"
+          "\n"
+          "`unlink` wipes this account's local data (keys, sessions, cached contacts) from the database. It is\n"
+          "LOCAL ONLY - it does not contact Signal's servers, so use it after the account is already gone on the\n"
+          "real side (a real unlink/delete-account done elsewhere), not as a way to perform that unlink itself.\n"
           "\n"
           "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf), same as\n"
           "signal2sip-daemon. Its [global] section (db_path/db_key) is bootstrapped automatically on a clean\n"
@@ -669,6 +699,8 @@ int main(int argc, char** argv) {
             cmdVerify(config, configPath, args.accountName, args.positional[0]);
         } else if (args.command == "link") {
             cmdLink(config, configPath, args.accountName);
+        } else if (args.command == "unlink") {
+            cmdUnlink(config, args.accountName);
         } else {
             printUsage();
             exitCode = 1;

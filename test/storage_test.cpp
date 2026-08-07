@@ -139,6 +139,56 @@ int main() {
         check(threw, "opening with the wrong key fails");
     }
 
+    // --- deleteAccount() wipes every table for this account, leaves other accounts in the same file alone ---
+    {
+        Storage storage(dbPath, key, "test");
+        std::string serviceId = "33333333-3333-3333-3333-333333333333";
+
+        storage.saveResolvedContact("+380000000099", "44444444-4444-4444-4444-444444444444", "");
+        storage.saveSyncedContact("+380000000098", "55555555-5555-5555-5555-555555555555", "",
+                                  bytesFrom("profile-key-bytes"));
+        check(storage.loadResolvedContact("+380000000099").has_value(), "resolved_contact present before delete");
+        check(storage.loadSyncedContact("+380000000098").has_value(), "synced_contact present before delete");
+
+        // A second, unrelated account sharing the same physical DB file - deleteAccount() must not touch it.
+        Storage other(dbPath, key, "test2");
+        AccountRecord otherAccount;
+        otherAccount.e164 = "+380000000002";
+        otherAccount.aci = "66666666-6666-6666-6666-666666666666";
+        otherAccount.pni = "77777777-7777-7777-7777-777777777777";
+        otherAccount.device_id = 1;
+        otherAccount.password = "other-secret";
+        otherAccount.registration_id = 1;
+        otherAccount.pni_registration_id = 1;
+        other.saveAccount(otherAccount);
+        other.saveIdentityKeypair("aci", IdentityKeypairRecord{bytesFrom("other-priv"), bytesFrom("other-pub")});
+
+        storage.deleteAccount();
+
+        check(!storage.hasAccount(), "account row gone after deleteAccount");
+        check(!storage.loadIdentityKeypair("aci").has_value(), "identity_keypair gone after deleteAccount");
+        check(!storage.loadSignedPrekey("aci").has_value(), "signed_prekey gone after deleteAccount");
+        check(!storage.loadKyberPrekey("aci").has_value(), "kyber_prekey gone after deleteAccount");
+        check(!storage.loadSession(serviceId + ".1").has_value(), "session gone after deleteAccount");
+        check(storage.knownDeviceIdsFor(serviceId).empty(), "knownDeviceIdsFor empty after deleteAccount");
+        check(!storage.loadRemoteIdentity(serviceId).has_value(), "remote_identity gone after deleteAccount");
+        check(!storage.loadResolvedContact("+380000000099").has_value(), "resolved_contact gone after deleteAccount");
+        check(!storage.loadSyncedContact("+380000000098").has_value(), "synced_contact gone after deleteAccount");
+
+        check(other.hasAccount(), "unrelated account 'test2' survives deleteAccount() on 'test'");
+        check(other.loadIdentityKeypair("aci").has_value(),
+              "unrelated account 'test2' identity_keypair survives deleteAccount() on 'test'");
+
+        // Calling it again on an already-empty account must not throw.
+        bool threwOnEmpty = false;
+        try {
+            storage.deleteAccount();
+        } catch (const std::exception&) {
+            threwOnEmpty = true;
+        }
+        check(!threwOnEmpty, "deleteAccount() on an already-empty account does not throw");
+    }
+
     std::cout << "\n" << (g_failures == 0 ? "ALL PASS" : std::to_string(g_failures) + " FAILURE(S)") << "\n";
     return g_failures == 0 ? 0 : 1;
 }

@@ -426,4 +426,43 @@ std::optional<SyncedContactRecord> Storage::loadSyncedContact(const std::string&
     return result;
 }
 
+void Storage::deleteAccount() {
+    char* errmsg = nullptr;
+    if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        throw std::runtime_error("deleteAccount: BEGIN failed: " + err);
+    }
+
+    // schema.sql has no ON DELETE CASCADE, so every table needs its own
+    // explicit DELETE - order doesn't matter for correctness (no FK
+    // enforcement is active here beyond PRAGMA foreign_keys=ON, which
+    // SQLite only checks on INSERT/UPDATE of the referencing column, not
+    // on deleting the referenced row), only the whole set needs to land
+    // atomically.
+    static const char* kTables[] = {
+        "identity_keypair", "signed_prekey",   "kyber_prekey",    "session",
+        "remote_identity",  "resolved_contact", "synced_contact", "account",
+    };
+    try {
+        for (const char* table : kTables) {
+            std::string sql = std::string("DELETE FROM ") + table + " WHERE account_name = ?";
+            Stmt stmt(db_, sql.c_str());
+            bindText(stmt, 1, accountName_);
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("DELETE FROM ") + table + " failed: " + sqlite3_errmsg(db_));
+            }
+        }
+    } catch (...) {
+        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        throw;
+    }
+
+    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        throw std::runtime_error("deleteAccount: COMMIT failed: " + err);
+    }
+}
+
 } // namespace signal2sip

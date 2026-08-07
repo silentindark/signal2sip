@@ -127,6 +127,14 @@ public:
                            const Bytes& profileKey);
     std::optional<SyncedContactRecord> loadSyncedContact(const std::string& e164);
 
+    // Deletes every row for this account across every table (identity
+    // keypairs, prekeys, sessions, remote identities, resolved/synced
+    // contacts, and the account row itself), in one transaction. Purely
+    // local - does NOT contact Signal's servers, so it does not itself
+    // unlink/deregister the real account. Safe to call even if
+    // hasAccount() is false (a no-op transaction in that case).
+    void deleteAccount();
+
 private:
     sqlite3* db_ = nullptr;
     std::string accountName_;
