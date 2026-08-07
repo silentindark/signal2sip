@@ -1823,6 +1823,19 @@ int main(int argc, char** argv) {
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
         for (auto& [name, sipAccount] : g_sipAccounts) {
+            // Don't fight the Signal websocket watchdog below: if that
+            // account's credentials were rejected (401/403/4401 - see
+            // AuthSocket::isDeauthorized()), the Signal side is
+            // permanently dead and forcing SIP back up here would just
+            // recreate exactly the "stale Registered nothing can actually
+            // route to" problem the two watchdogs were built to prevent
+            // in the first place - found live 2026-08-07: this watchdog
+            // blindly re-registered a deauthorized account's SIP trunk
+            // 60s after the other watchdog had correctly brought it down.
+            if (auto acctIt = g_accounts.find(name);
+                acctIt != g_accounts.end() && acctIt->second->socket && acctIt->second->socket->isDeauthorized()) {
+                continue;
+            }
             int64_t since = sipAccount->unregisteredSinceMs.load();
             if (since != 0 && nowMs - since >= static_cast<int64_t>(g_global.sipRegWatchdogSec) * 1000) {
                 std::cerr << "[daemon][" << name << "] registration watchdog: still unregistered after "
