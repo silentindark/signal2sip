@@ -311,6 +311,15 @@ struct AccountState {
     // ever returns after a successful connect().
     bool socketConnected = true;
     int64_t lastSocketReconnectAttemptMs = 0;
+
+    // Set once the watchdog has logged the loud "give up, needs manual
+    // re-link" message for this account (see AuthSocket::isDeauthorized())
+    // - keeps that message from repeating every kSocketReconnectIntervalMs
+    // once we've already stopped retrying. Reset on a fresh successful
+    // reconnect (defensive - in practice a deauthorized account never
+    // reaches that branch again without a process restart, since the
+    // watchdog skips reconnect() entirely once this is true).
+    bool deauthorizedAlerted = false;
 };
 
 std::map<std::string, std::unique_ptr<AccountState>> g_accounts; // keyed by AccountConfig::name
@@ -1600,8 +1609,22 @@ bool setupAccount(const AccountConfig& accountConfig) {
         }
         return true;
     } catch (const std::exception& e) {
-        std::cerr << "[daemon][" << accountConfig.name << "] account setup failed: " << e.what()
-                   << " - skipping this account, continuing with the rest\n";
+        bool deauthorized = false;
+        if (auto lookup = g_accounts.find(accountConfig.name);
+            lookup != g_accounts.end() && lookup->second->socket) {
+            deauthorized = lookup->second->socket->isDeauthorized();
+        }
+        if (deauthorized) {
+            std::cerr << "[daemon][" << accountConfig.name
+                       << "] account setup failed: Signal rejected this device's credentials (401/403/4401) - "
+                          "the account was most likely unlinked or deleted on the real Signal side before this "
+                          "daemon even started. Run `signal2sip-gendb " << accountConfig.name
+                       << " link` to re-link it, then restart the daemon - skipping this account for now, "
+                          "continuing with the rest\n";
+        } else {
+            std::cerr << "[daemon][" << accountConfig.name << "] account setup failed: " << e.what()
+                       << " - skipping this account, continuing with the rest\n";
+        }
         // If the failure happened after dispatchQueue.start() (e.g.
         // socket->connect() or SIP registration throwing), its worker
         // thread is still running - erasing the map entry directly would
@@ -1848,6 +1871,29 @@ int main(int argc, char** argv) {
             }
             acct.socketConnected = nowConnected;
 
+            // Signal itself told us this device's credentials are no
+            // longer valid (401/403 on the upgrade, or a live session
+            // closed with code 4401 - see AuthSocket::isDeauthorized()'s
+            // own doc comment) - almost always a real unlink/deregistration
+            // done elsewhere, or a delete-account. Retrying with the same
+            // credentials can never succeed, so stop spinning the 5s
+            // reconnect loop for this account specifically (unlike a
+            // generic drop, which keeps retrying below) and say so loudly
+            // exactly once, instead of the silent "dropped"/"reconnect
+            // failed" spam this used to produce forever.
+            if (!nowConnected && acct.socket->isDeauthorized()) {
+                if (!acct.deauthorizedAlerted) {
+                    acct.deauthorizedAlerted = true;
+                    std::cerr << "[daemon][" << name
+                               << "] Signal rejected this device's credentials (401/403/4401) - the account was "
+                                  "most likely unlinked or deleted on the real Signal side. Giving up on automatic "
+                                  "reconnection for this account; run `signal2sip-gendb " << name
+                               << " link` to re-link it (or `unlink` first if it needs a clean local slate), then "
+                                  "restart the daemon.\n";
+                }
+                continue;
+            }
+
             if (!nowConnected &&
                 nowMs - acct.lastSocketReconnectAttemptMs >= kSocketReconnectIntervalMs) {
                 acct.lastSocketReconnectAttemptMs = nowMs;
@@ -1856,6 +1902,7 @@ int main(int argc, char** argv) {
                     acct.socket->reconnect();
                     std::cout << "[daemon][" << name << "] Signal websocket reconnected\n";
                     acct.socketConnected = true;
+                    acct.deauthorizedAlerted = false;
                     if (sipIt != g_sipAccounts.end()) {
                         try {
                             sipIt->second->setRegistration(true);

@@ -55,6 +55,21 @@ public:
     // completes (or throws on failure/timeout), same as connect().
     void reconnect();
 
+    // True once the most recent connection attempt (or an already-
+    // established session) ended because Signal's server rejected or
+    // revoked this device's credentials, rather than an ordinary
+    // transient network failure: either the WebSocket upgrade itself
+    // returned HTTP 401/403, or an established session was closed with
+    // close code 4401 ("Reauthentication required" - Signal's real
+    // signal for this device having been unlinked/deregistered/had its
+    // credentials rotated elsewhere, see WebSocketDisconnectionRequestListener
+    // in Signal-Server). Retrying reconnect()/connect() with the same
+    // credentials after this is true is futile until the account is
+    // re-linked - a caller's watchdog loop should stop retrying and
+    // surface this instead of looping forever. Cleared back to false by
+    // a subsequent successful connection.
+    bool isDeauthorized() const;
+
     // Client-initiated request (e.g. GET /v2/keys/..., PUT /v1/messages/...).
     // Blocks the calling thread until a response arrives or times out.
     Response request(const std::string& verb, const std::string& path, const Bytes* body = nullptr);

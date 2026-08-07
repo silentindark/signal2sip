@@ -35,6 +35,13 @@ struct AuthSocket::Impl {
     bool connectFailed = false;
     std::string connectError;
 
+    // See AuthSocket::isDeauthorized()'s own doc comment. Set from the
+    // callback thread in LWS_CALLBACK_CLIENT_CONNECTION_ERROR (upgrade
+    // rejected with 401/403) or LWS_CALLBACK_WS_PEER_INITIATED_CLOSE
+    // (established session closed with code 4401); cleared on the next
+    // LWS_CALLBACK_CLIENT_ESTABLISHED.
+    std::atomic<bool> deauthorized{false};
+
     std::mutex pendingMutex;
     std::condition_variable pendingCv;
     std::map<uint64_t, std::optional<Response>> pendingResponses;
@@ -189,16 +196,51 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
                 std::lock_guard<std::mutex> lock(self->connectMutex);
                 self->connected = true;
             }
+            self->deauthorized.store(false);
             self->connectCv.notify_all();
             break;
         }
         case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
+            // The WebSocket upgrade request itself was rejected - if
+            // Signal's server responded with a real HTTP status (rather
+            // than the connection failing before any HTTP response, e.g.
+            // DNS/TCP/TLS failures), lws_http_client_http_response()
+            // still returns it here even though the doc comment says to
+            // capture it during LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP -
+            // that's for plain HTTP client connections, this is the
+            // websocket-upgrade-rejected path, and the wsi is still valid
+            // at this point (destroyed only after this callback returns).
+            unsigned int httpStatus = lws_http_client_http_response(wsi);
+            if (httpStatus == 401 || httpStatus == 403) {
+                self->deauthorized.store(true);
+            }
             {
                 std::lock_guard<std::mutex> lock(self->connectMutex);
                 self->connectFailed = true;
                 self->connectError = in ? std::string(static_cast<const char*>(in), len) : "connection error";
+                if (httpStatus != 0) self->connectError += " (HTTP " + std::to_string(httpStatus) + ")";
             }
             self->connectCv.notify_all();
+            break;
+        }
+        case LWS_CALLBACK_WS_PEER_INITIATED_CLOSE: {
+            // The server sent an unsolicited Close frame - in/len are the
+            // close code (first 2 bytes, network order) plus optional
+            // reason text. 4401 ("Reauthentication required") is Signal's
+            // real, purpose-built signal for this device having been
+            // unlinked/deregistered/had its credentials rotated
+            // elsewhere (see WebSocketDisconnectionRequestListener in
+            // Signal-Server) - distinct from an ordinary drop, which
+            // carries no close frame or a different code (1000, 1001,
+            // etc). Returning 0 (the default) lets lws echo the close and
+            // finish tearing the connection down normally; LWS_CALLBACK_
+            // CLIENT_CLOSED fires right after this with the actual
+            // teardown.
+            if (in && len >= 2) {
+                const auto* bytes = static_cast<const unsigned char*>(in);
+                uint16_t code = (static_cast<uint16_t>(bytes[0]) << 8) | bytes[1];
+                if (code == 4401) self->deauthorized.store(true);
+            }
             break;
         }
         case LWS_CALLBACK_CLIENT_CLOSED: {
@@ -301,6 +343,8 @@ bool AuthSocket::isConnected() const {
 }
 
 void AuthSocket::reconnect() { impl_->doConnect(); }
+
+bool AuthSocket::isDeauthorized() const { return impl_->deauthorized.load(); }
 
 AuthSocket::Response AuthSocket::request(const std::string& verb, const std::string& path, const Bytes* body) {
     uint64_t id = impl_->nextId.fetch_add(1);
