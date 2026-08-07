@@ -41,6 +41,7 @@
 #include <nlohmann/json.hpp>
 
 #include "AccountFinisher.h"
+#include "DeviceNameCipher.h"
 #include "ProvisioningClient.h"
 #include "../daemon/Config.h"
 #include "../signal/AuthSocket.h"
@@ -56,6 +57,13 @@ namespace {
 
 // Same CA cert every native TLS client in this project pins.
 constexpr const char* kCaCertPath = "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem";
+
+// The name a linked device shows up as in the real Signal app's Linked
+// Devices list (see DeviceNameCipher.h). Not user-configurable yet - every
+// account this project links gets the same name, which is fine since
+// there's currently no need to tell multiple linked signal2sip instances
+// apart from within one real account's device list.
+constexpr const char* kDeviceName = "signal2sip";
 
 std::string base64NoPadding(const Bytes& data) {
     std::string s = base64Encode(data);
@@ -539,13 +547,19 @@ void cmdLink(const DaemonConfig& config, const std::string& configPath, const st
     // from the server's point of view (matches link-new-device.js).
     std::string ourPassword = base64NoPadding(randomBytes(18));
 
+    // Linked devices show up as "Unnamed device" in the real Signal app's
+    // Linked Devices list without this - see project notes (device-name
+    // investigation). Encrypted with the ACI identity private key we just
+    // received above, matching DeviceNameUtil.encryptDeviceName() exactly.
+    std::string encryptedDeviceName = encryptDeviceName(kDeviceName, aciIdentity.privateKey);
+
     json body = {
         {"verificationCode", provisioned.provisioningCode},
         {"accountAttributes",
         {{"fetchesMessages", true},
          {"registrationId", registrationId},
          {"pniRegistrationId", pniRegistrationId},
-         {"name", nullptr},
+         {"name", encryptedDeviceName},
          {"capabilities", capabilitiesJson()}}},
         {"aciSignedPreKey", signedPreKeyJson(prekeys.aciSignedPreKey)},
         {"pniSignedPreKey", signedPreKeyJson(prekeys.pniSignedPreKey)},
@@ -624,23 +638,30 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
 // that actually changes between unregister and reactivate; the rest just
 // re-assert the same values cmdVerify/cmdLink already set at account
 // creation.
-// TODO once the DeviceName encryption fix lands (see project memory
-// signal2sip-device-name-unknown): `name` here must resend the encrypted
-// device name instead of null, or every unregister/reactivate call will
-// silently reset the real Linked Devices list entry back to "Unnamed
-// device".
-void putFetchesMessages(const AccountRecord& account, bool fetchesMessages) {
+// `name` must match whatever cmdLink/cmdVerify already set: null for a
+// standalone/primary account (no device name shown/expected there, by
+// convention - matches every real client), or the encrypted device name
+// for a linked account, re-derived fresh each call from the account's
+// stored ACI identity private key + the fixed kDeviceName - no need to
+// persist the plaintext name anywhere since it's always the same constant.
+void putFetchesMessages(Storage& storage, const AccountRecord& account, bool fetchesMessages) {
     std::string username =
         account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
     AuthSocket socket(username, account.password, kCaCertPath,
                       [](const std::string&, const std::string&, const Bytes&) {});
     socket.connect();
 
+    json name = nullptr;
+    if (account.flow == "linked") {
+        auto aciKeypair = storage.loadIdentityKeypair("aci");
+        if (aciKeypair) name = encryptDeviceName(kDeviceName, aciKeypair->private_key);
+    }
+
     json body = {
         {"fetchesMessages", fetchesMessages},
         {"registrationId", account.registration_id},
         {"pniRegistrationId", account.pni_registration_id},
-        {"name", nullptr},
+        {"name", name},
         {"capabilities", capabilitiesJson()},
         {"unrestrictedUnidentifiedAccess", true},
         {"discoverableByPhoneNumber", true},
@@ -661,7 +682,7 @@ void cmdUnregister(const DaemonConfig& config, const std::string& accountName) {
         throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
     }
     AccountRecord account = storage.loadAccount();
-    putFetchesMessages(account, /*fetchesMessages=*/false);
+    putFetchesMessages(storage, account, /*fetchesMessages=*/false);
     std::cout << "[unregister] account '" << accountName << "' (e164=" << account.e164
               << ") is now dormant (fetchesMessages=false) - senders can no longer reach this number.\n";
     std::cout << "[unregister] this is REVERSIBLE and purely a server-side flag flip - no local data or "
@@ -677,7 +698,7 @@ void cmdReactivate(const DaemonConfig& config, const std::string& accountName) {
         throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
     }
     AccountRecord account = storage.loadAccount();
-    putFetchesMessages(account, /*fetchesMessages=*/true);
+    putFetchesMessages(storage, account, /*fetchesMessages=*/true);
     std::cout << "[reactivate] account '" << accountName << "' (e164=" << account.e164
               << ") is active again (fetchesMessages=true), no re-verification needed.\n";
     std::cout << "[reactivate] start (or SIGHUP-reload) signal2sip-daemon with this account in its config to "

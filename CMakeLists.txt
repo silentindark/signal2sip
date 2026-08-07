@@ -102,6 +102,7 @@ set(SIGNAL_PROTO_FILES
     ${SIGNAL_PROTO_DIR}/WebSocketResources.proto
     ${SIGNAL_PROTO_DIR}/Provisioning.proto
     ${SIGNAL_PROTO_DIR}/StorageService.proto
+    ${SIGNAL_PROTO_DIR}/DeviceName.proto
 )
 protobuf_generate_cpp(SIGNAL_PROTO_SRCS SIGNAL_PROTO_HDRS ${SIGNAL_PROTO_FILES})
 
@@ -464,6 +465,7 @@ add_library(signal2sip_gendb STATIC
     gendb/ProvisioningCipher.cpp
     gendb/ProvisioningClient.cpp
     gendb/AccountFinisher.cpp
+    gendb/DeviceNameCipher.cpp
 )
 target_include_directories(signal2sip_gendb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_gendb PUBLIC signal2sip_signal signal2sip_storage signal2sip_proto
