@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -239,11 +240,27 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
             if (in && len >= 2) {
                 const auto* bytes = static_cast<const unsigned char*>(in);
                 uint16_t code = (static_cast<uint16_t>(bytes[0]) << 8) | bytes[1];
+                std::string reason(reinterpret_cast<const char*>(bytes) + 2, len - 2);
+                // Found live 2026-08-07: this was silently discarding the
+                // close code/reason for every case except 4401 - real
+                // diagnostic gap when a connection is flapping for an
+                // unknown server-side reason. Logged unconditionally now,
+                // not just on the deauthorization path.
+                std::cerr << "[authsocket][" << self->username << "] peer-initiated close, code=" << code
+                           << (reason.empty() ? "" : (" reason=" + reason)) << "\n";
                 if (code == 4401) self->deauthorized.store(true);
             }
             break;
         }
         case LWS_CALLBACK_CLIENT_CLOSED: {
+            // Diagnostic pair with the peer-initiated-close log above: if
+            // THIS fires with no preceding "peer-initiated close" line for
+            // the same account, the connection died without a WebSocket
+            // close frame at all (TCP reset, TLS-layer failure, timeout) -
+            // a materially different failure mode than the server
+            // cleanly closing it, worth telling apart when chasing a
+            // flapping connection.
+            std::cerr << "[authsocket][" << self->username << "] connection closed (teardown)\n";
             {
                 std::lock_guard<std::mutex> lock(self->connectMutex);
                 self->connected = false;

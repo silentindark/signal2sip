@@ -92,6 +92,15 @@ find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 pkg_check_modules(QRENCODE REQUIRED IMPORTED_TARGET libqrencode)
 
+# signal2sip-tui only - see native/tui/main.cpp's own doc comment.
+# Packaged in Debian's apt archive (libftxui-dev) - a real dependency, not
+# hand-rolled raw ncurses escape sequences, deliberately: FTXUI's
+# flexbox-like layout is what makes maintaining several real screens
+# (account list/detail/config-edit/wizard) tractable, unlike this
+# project's usual "small hand-rolled parser" preference for things that
+# genuinely are simple.
+find_package(ftxui REQUIRED)
+
 # Signal's on-the-wire message shapes, unchanged from the Node prototype -
 # same .proto sources (pulled from signalapp/Signal-Android, see
 # ../PROTOCOL.md), compiled fresh for C++ instead of loaded at runtime via
@@ -482,3 +491,18 @@ target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_confi
 # relocation failure signal2sip-daemon does - see PIN_LLD21 above and
 # project memory project_signal2sip_debian12_daemon_crash.
 target_link_options(signal2sip-gendb PRIVATE ${PIN_LLD21} $<$<CONFIG:Release>:-s>)
+
+# Deliberately does NOT link signal2sip_signal/authsocket/ringrtc/webrtc/
+# PJSIP - the TUI only ever reads the database directly (Storage's
+# listAllAccounts()/loadAccount(), same as gendb) and shells out to the
+# already-built signal2sip-gendb binary for every action (register/link/
+# enable/disable/config set/...) instead of duplicating that logic here -
+# see project memory project_signal2sip_tui_future.md for why. Keeps this
+# a small, fast-to-build binary with none of signal2sip-daemon's
+# Rust-FFI/PJSIP link-line workarounds, same reasoning signal2sip_gendb's
+# own comment gives for itself above.
+add_executable(signal2sip-tui tui/main.cpp)
+target_include_directories(signal2sip-tui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(signal2sip-tui PRIVATE signal2sip_storage signal2sip_config
+    ftxui::component ftxui::dom ftxui::screen pthread)
+target_link_options(signal2sip-tui PRIVATE ${PIN_LLD21} $<$<CONFIG:Release>:-s>)
