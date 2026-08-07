@@ -684,6 +684,82 @@ void cmdReactivate(const DaemonConfig& config, const std::string& accountName) {
                  "actually resume receiving.\n";
 }
 
+// ---- Primary account lifecycle: delete-account (hard, irreversible) ----
+
+// Best-effort: DELETE /v1/accounts/registration_lock. Safe to call even
+// if no lock is set (Signal-Server's removeRegistrationLock just sets the
+// lock hash/salt to null unconditionally, see AccountController.java) -
+// matches signal-cli's own AccountHelper.deleteAccount(), which does the
+// same thing and only logs a warning on failure rather than aborting.
+void disableRegistrationLockBestEffort(AuthSocket& socket) {
+    try {
+        auto response = socket.request("DELETE", "/v1/accounts/registration_lock");
+        if (response.status / 100 != 2) {
+            std::cout << "[delete-account] warning: DELETE /v1/accounts/registration_lock returned status "
+                      << response.status << " - continuing anyway (matches real clients' best-effort handling)\n";
+        }
+    } catch (const std::exception& e) {
+        std::cout << "[delete-account] warning: failed to clear registration lock: " << e.what()
+                  << " - continuing anyway\n";
+    }
+}
+
+// Real, irreversible DELETE /v1/accounts/me - frees the phone number
+// entirely from Signal's servers, destroys the account and every linked
+// device at once. libsignal-service-java's own doc comment on this
+// endpoint (AccountApi.kt) says "204: Success, 4401: Success" - Signal's
+// server can complete this request by closing the WebSocket with close
+// code 4401 instead of returning a normal response frame. AuthSocket
+// doesn't decode the actual close code yet (see project memory
+// signal2sip-account-deletion-unlink's Gap 2), so from here a connection
+// that closes before any response arrives is genuinely AMBIGUOUS - it
+// could be that success-via-4401-closure, or an unrelated network drop.
+// Given that ambiguity, this deliberately does NOT auto-wipe local data
+// on an ambiguous outcome - only a clean 2xx response is treated as
+// confirmed success.
+void cmdDeleteAccount(const DaemonConfig& config, const std::string& accountName) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+
+    std::string username =
+        account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
+    AuthSocket socket(username, account.password, kCaCertPath,
+                      [](const std::string&, const std::string&, const Bytes&) {});
+    socket.connect();
+
+    disableRegistrationLockBestEffort(socket);
+
+    auto response = socket.request("DELETE", "/v1/accounts/me");
+    socket.close();
+
+    if (response.status / 100 == 2) {
+        storage.deleteAccount();
+        std::cout << "[delete-account] account '" << accountName << "' (e164=" << account.e164
+                  << ") DELETED from Signal's real servers (status " << response.status
+                  << ") - the phone number is now free for anyone to register. Local data wiped too.\n";
+        return;
+    }
+
+    if (response.status == 0) {
+        std::cout << "[delete-account] AMBIGUOUS: the connection closed before any response arrived for account '"
+                  << accountName << "' (e164=" << account.e164
+                  << "). Signal's own protocol documents this endpoint as sometimes completing via a WebSocket "
+                     "close (code 4401) instead of a normal response - this MAY have succeeded. signal2sip's "
+                     "AuthSocket does not yet decode the actual close code to tell that apart from a genuine "
+                     "network failure (see project notes on detecting real-side unlink for the same gap).\n";
+        std::cout << "[delete-account] local data was deliberately left untouched. Verify manually (e.g. try "
+                     "registering this e164 fresh elsewhere, or re-run `delete-account` - a second delete of an "
+                     "already-deleted account should fail auth outright, distinguishing the two cases), then run "
+                     "`unlink` yourself once you've confirmed it.\n";
+        return;
+    }
+
+    throw std::runtime_error("DELETE /v1/accounts/me failed with status " + std::to_string(response.status));
+}
+
 void printUsage() {
     std::cerr
         << "usage:\n"
@@ -694,6 +770,11 @@ void printUsage() {
           "  signal2sip-gendb <account-name> unlink [--config <path>]\n"
           "  signal2sip-gendb <account-name> unregister [--config <path>]\n"
           "  signal2sip-gendb <account-name> reactivate [--config <path>]\n"
+          "  signal2sip-gendb <account-name> delete-account [--config <path>]\n"
+          "\n"
+          "`delete-account` is REAL and IRREVERSIBLE - it deletes the account from Signal's real servers\n"
+          "(DELETE /v1/accounts/me) and frees the phone number for anyone to register, then wipes local data\n"
+          "too on confirmed success. Unlike unregister, there is no undo.\n"
           "\n"
           "`unlink` wipes this account's local data (keys, sessions, cached contacts) from the database. It is\n"
           "LOCAL ONLY - it does not contact Signal's servers, so use it after the account is already gone on the\n"
@@ -785,6 +866,8 @@ int main(int argc, char** argv) {
             cmdUnregister(config, args.accountName);
         } else if (args.command == "reactivate") {
             cmdReactivate(config, args.accountName);
+        } else if (args.command == "delete-account") {
+            cmdDeleteAccount(config, args.accountName);
         } else {
             printUsage();
             exitCode = 1;
