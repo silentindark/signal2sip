@@ -1025,6 +1025,17 @@ ParsedArgs parseArgs(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+    // glibc only line-buffers stdout when it's a real terminal - piped
+    // to anything else (a file, or another process's pipe), it silently
+    // switches to full block buffering. Harmless for a normal terminal
+    // run or for a caller like runGendb() that reads everything only
+    // after the process exits, but it means `link`'s std::cout QR/status
+    // output can sit unflushed indefinitely while the process blocks for
+    // up to ~90s waiting for a scan - exactly the case signal2sip-tui's
+    // Screen 5 needs to stream live. Force line buffering unconditionally
+    // so a pipe behaves the same as a terminal here.
+    ::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {

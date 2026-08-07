@@ -55,16 +55,34 @@ std::string urlEncode(const std::string& in) {
 // narrow window silently corrupts the whole pattern) - renderQr() below
 // also always writes a real PNG as a dependency-free fallback that sidesteps
 // all of that.
+//
+// Two real scan-failure causes fixed 2026-08-08 after a live report of a
+// phone camera refusing to lock onto this: (1) the quiet zone here was only
+// 2 modules - the QR spec (ISO/IEC 18004) calls for 4, and most scanners'
+// finder-pattern search genuinely relies on that full margin being blank;
+// (2) this printed with no explicit colors at all, so it inherited
+// whatever the surrounding terminal's colors were - on a dark-themed
+// terminal (the common case) that renders as light block glyphs on a dark
+// background, the exact inverse of the dark-modules-on-light convention
+// scanners are tuned for. Explicit SGR codes force true black-on-white
+// here regardless of the terminal's own theme; signal2sip-tui's Screen 5
+// does the equivalent at the FTXUI layer for the same reason (raw ANSI
+// codes piped through a subprocess don't reach FTXUI's own text styling).
 void printQrAscii(const QRcode* qr) {
     int width = qr->width;
     auto dark = [&](int x, int y) -> bool {
         if (x < 0 || y < 0 || x >= width || y >= width) return false;
         return (qr->data[y * width + x] & 1) != 0;
     };
-    // 2-module quiet zone border on every side.
-    for (int y = -2; y < width + 2; y += 2) {
+    std::cout << "\x1b[30;107m"; // black-on-bright-white, overriding the terminal's own theme
+    // 6-module quiet zone border on every side - past ISO/IEC 18004's
+    // 4-module recommended minimum, deliberately generous since each
+    // "module" here is only a character cell (coarse compared to a real
+    // printed/screen QR), and this was still hard to lock onto with just
+    // the spec minimum in a live test.
+    for (int y = -6; y < width + 6; y += 2) {
         std::string line;
-        for (int x = -2; x < width + 2; x++) {
+        for (int x = -6; x < width + 6; x++) {
             bool top = dark(x, y);
             bool bottom = dark(x, y + 1);
             if (top && bottom) {
@@ -79,6 +97,7 @@ void printQrAscii(const QRcode* qr) {
         }
         std::cout << line << "\n";
     }
+    std::cout << "\x1b[0m"; // reset - don't leak black-on-white into whatever prints next
 }
 
 uint32_t crc32Of(const uint8_t* data, size_t len) {
@@ -424,6 +443,15 @@ ProvisioningClient::~ProvisioningClient() {
 }
 
 ProvisionMessageResult ProvisioningClient::waitForProvisionMessage() {
+    // Nothing in this file ever called lws_set_log_level(), so
+    // libwebsockets ran at its own built-in default (errors + warnings +
+    // NOTICE) - the NOTICE tier is pure connection-lifecycle bookkeeping
+    // (context creation, object refcounting, accept-gating) that's noise
+    // to an operator watching for the QR/link result, not useful
+    // diagnostics. Real failures still surface via LLL_ERR/LLL_WARN and
+    // via this function's own std::runtime_error on timeout/failure.
+    lws_set_log_level(LLL_ERR | LLL_WARN, nullptr);
+
     lws_context_creation_info info{};
     info.port = CONTEXT_PORT_NO_LISTEN;
     info.protocols = Impl::kProtocols;
