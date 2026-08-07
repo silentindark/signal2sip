@@ -1,9 +1,12 @@
 #include "Config.h"
 
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <stdexcept>
 #include <sys/stat.h>
+
+#include "../storage/Storage.h"
 
 namespace signal2sip {
 
@@ -56,24 +59,64 @@ std::string getOr(const IniMap& ini, const std::string& section, const std::stri
     return it->second;
 }
 
-bool getBool(const IniMap& ini, const std::string& section, const std::string& key, bool fallback) {
-    std::string value = getOr(ini, section, key, "");
-    if (value.empty()) return fallback;
-    return value == "yes" || value == "true" || value == "1";
-}
+// Builds one account's AccountConfig from its database row (see
+// Storage.h's AccountRecord/schema.sql's own comment on the `account`
+// table for why these fields live there now, not a [account.<name>]
+// section) - applies the exact same validation this project always has
+// (sip_srtp/sip_transport enum checks, the tls_ca_file/tls_insecure
+// requirement, the :5061 TLS default port). Throws std::runtime_error on
+// an invalid config, same as before - the caller (DaemonConfig::load())
+// catches this per-account so one account's bad config doesn't take every
+// other account down with it.
+AccountConfig accountConfigFromRecord(const std::string& name, const AccountRecord& record) {
+    AccountConfig account;
+    account.name = name;
+    account.configVersion = record.config_version;
 
-// Every account's own name, collected from `[account.<name>]` section
-// headers.
-std::vector<std::string> collectAccountNames(const IniMap& ini) {
-    constexpr char kPrefix[] = "account.";
-    constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-    std::vector<std::string> names;
-    for (const auto& [section, _] : ini) {
-        if (section.rfind(kPrefix, 0) == 0 && section.size() > kPrefixLen) {
-            names.push_back(section.substr(kPrefixLen));
-        }
+    account.e164 = record.e164;
+    if (account.e164.empty()) {
+        throw std::runtime_error("account '" + name + "': e164 is empty");
     }
-    return names;
+    account.serverUrl = record.server_url;
+
+    account.sipHost = record.sip_host;
+    account.sipExtension = record.sip_extension;
+    account.sipPassword = record.sip_password;
+    account.sipBridgeDestination = record.sip_bridge_destination;
+    account.sipBridgeDid = record.sip_bridge_did;
+
+    account.sipSrtp = record.sip_srtp.empty() ? "disabled" : record.sip_srtp;
+    if (account.sipSrtp != "disabled" && account.sipSrtp != "optional" && account.sipSrtp != "mandatory") {
+        throw std::runtime_error("account '" + name + "': sip_srtp must be disabled/optional/mandatory, got '" +
+                                 account.sipSrtp + "'");
+    }
+
+    account.sipTransport = record.sip_transport.empty() ? "udp" : record.sip_transport;
+    if (account.sipTransport != "udp" && account.sipTransport != "tls") {
+        throw std::runtime_error("account '" + name + "': sip_transport must be udp/tls, got '" +
+                                 account.sipTransport + "'");
+    }
+    // sip_host with no explicit ":port" defaults to Asterisk's plain SIP
+    // port implicitly (whatever sip:'s own resolution does) - but for
+    // tls, default explicitly to 5061 (Asterisk's usual TLS listener
+    // port, and this project's own DPDZK test setup) rather than leaving
+    // it to chance.
+    if (account.sipTransport == "tls" && !account.sipHost.empty() && account.sipHost.find(':') == std::string::npos) {
+        account.sipHost += ":5061";
+    }
+    account.sipTlsCaFile = record.sip_tls_ca_file;
+    account.sipTlsInsecure = record.sip_tls_insecure;
+    if (account.sipTransport == "tls" && account.sipTlsCaFile.empty() && !account.sipTlsInsecure) {
+        throw std::runtime_error(
+            "account '" + name +
+            "': sip_transport=tls needs either sip_tls_ca_file (pin the Asterisk server's certificate) or "
+            "sip_tls_insecure=yes (skip verification entirely) - one of the two is required, not silently "
+            "insecure by default");
+    }
+
+    account.outgoingCallTarget = record.outgoing_call_target;
+
+    return account;
 }
 
 } // namespace
@@ -102,63 +145,23 @@ DaemonConfig DaemonConfig::load(const std::string& path) {
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "resolved_contact_ttl_sec", "86400")));
     daemon.global.storageSyncIntervalSec =
         static_cast<unsigned>(std::stoul(getOr(ini, "global", "storage_sync_interval_sec", "43200")));
+    daemon.global.configPollIntervalSec =
+        static_cast<unsigned>(std::stoul(getOr(ini, "global", "config_poll_interval_sec", "30")));
 
-    // Zero accounts is a valid (if useless for the daemon itself) config -
-    // gendb (native/gendb/) needs to load a config that has [global] but
-    // not yet any [account.<name>] section, to add the very first one.
-    std::vector<std::string> names = collectAccountNames(ini);
-
-    for (const std::string& name : names) {
-        AccountConfig account;
-        account.name = name;
-
-        const std::string section = "account." + name;
-        account.e164 = getOr(ini, section, "e164", "");
-        if (account.e164.empty()) {
-            throw std::runtime_error("signal2sip.conf: [" + section + "] e164 is required");
+    // Every account's SIP/deployment config + enabled flag now lives in
+    // the database (see AccountConfig's own doc comment) - zero accounts
+    // is still a valid config (gendb needs to load a config that has
+    // [global] but no accounts registered yet, to add the very first
+    // one).
+    for (const AccountSummary& summary : listAllAccounts(daemon.global.dbPath, daemon.global.dbKey)) {
+        if (!summary.enabled) continue;
+        try {
+            Storage storage(daemon.global.dbPath, daemon.global.dbKey, summary.account_name);
+            AccountRecord record = storage.loadAccount();
+            daemon.accounts.push_back(accountConfigFromRecord(summary.account_name, record));
+        } catch (const std::exception& e) {
+            std::cerr << "[config] skipping account '" << summary.account_name << "': " << e.what() << "\n";
         }
-        account.serverUrl = getOr(ini, section, "server_url", "");
-
-        account.sipHost = getOr(ini, section, "sip_host", "");
-        account.sipExtension = getOr(ini, section, "sip_extension", "");
-        account.sipPassword = getOr(ini, section, "sip_password", "");
-        account.sipBridgeDestination = getOr(ini, section, "sip_bridge_destination", "");
-        account.sipBridgeDid = getOr(ini, section, "sip_bridge_did", "");
-        account.sipSrtp = getOr(ini, section, "sip_srtp", "disabled");
-        if (account.sipSrtp != "disabled" && account.sipSrtp != "optional" && account.sipSrtp != "mandatory") {
-            throw std::runtime_error("signal2sip.conf: [" + section +
-                                     "] sip_srtp must be disabled/optional/mandatory, got '" + account.sipSrtp + "'");
-        }
-
-        account.sipTransport = getOr(ini, section, "sip_transport", "udp");
-        if (account.sipTransport != "udp" && account.sipTransport != "tls") {
-            throw std::runtime_error("signal2sip.conf: [" + section + "] sip_transport must be udp/tls, got '" +
-                                     account.sipTransport + "'");
-        }
-        // sip_host with no explicit ":port" defaults to Asterisk's plain
-        // SIP port implicitly (whatever sip:'s own resolution does) - but
-        // for tls, default explicitly to 5061 (Asterisk's usual TLS
-        // listener port, and this project's own DPDZK test setup) rather
-        // than leaving it to chance, since a bare hostname/IP here would
-        // otherwise resolve however PJSIP's sips: URI handling decides on
-        // its own.
-        if (account.sipTransport == "tls" && !account.sipHost.empty() &&
-            account.sipHost.find(':') == std::string::npos) {
-            account.sipHost += ":5061";
-        }
-        account.sipTlsCaFile = getOr(ini, section, "sip_tls_ca_file", "");
-        account.sipTlsInsecure = getBool(ini, section, "sip_tls_insecure", false);
-        if (account.sipTransport == "tls" && account.sipTlsCaFile.empty() && !account.sipTlsInsecure) {
-            throw std::runtime_error(
-                "signal2sip.conf: [" + section +
-                "] sip_transport=tls needs either sip_tls_ca_file (pin the Asterisk server's certificate) or "
-                "sip_tls_insecure=yes (skip verification entirely) - one of the two is required, not silently "
-                "insecure by default");
-        }
-
-        account.outgoingCallTarget = getOr(ini, section, "outgoing_call_target", "");
-
-        daemon.accounts.push_back(std::move(account));
     }
 
     return daemon;

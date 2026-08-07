@@ -138,6 +138,50 @@ void copyOldSyncedContactDataIfPresent(sqlite3* db) {
     }
 }
 
+// Generic additive-column migration: SQLite has no `ALTER TABLE ... ADD
+// COLUMN IF NOT EXISTS` (confirmed live 2026-08-07 - it's a syntax error,
+// unlike `DROP COLUMN IF EXISTS` which SQLite does support), so a plain
+// unconditional ALTER TABLE in schema.sql would fail on every startup
+// after the first once the column exists. Checked once per call via
+// pragma_table_info before altering - safe to call unconditionally from
+// the constructor on every startup, no-op once the column is there.
+void addColumnIfMissing(sqlite3* db, const char* table, const char* column, const char* columnDefSql) {
+    std::string checkSql = std::string("SELECT 1 FROM pragma_table_info('") + table + "') WHERE name = ?";
+    Stmt check(db, checkSql.c_str());
+    bindText(check, 1, column);
+    if (sqlite3_step(check) == SQLITE_ROW) return; // already exists
+
+    std::string alterSql = std::string("ALTER TABLE ") + table + " ADD COLUMN " + column + " " + columnDefSql;
+    char* errmsg = nullptr;
+    if (sqlite3_exec(db, alterSql.c_str(), nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        throw std::runtime_error("failed to add column " + std::string(column) + " to " + table + ": " + err);
+    }
+}
+
+// Live-migrates a database created before 2026-08-07's config-in-DB work:
+// adds every new `account` column from schema.sql's own comment on that
+// table (SIP/deployment config + enabled/config_version), each defaulting
+// exactly as schema.sql specifies so a pre-existing row reads back as "no
+// SIP config yet, enabled" - matching a fresh account row on a brand-new
+// database (which gets these columns directly from CREATE TABLE instead).
+void migrateAccountConfigColumnsIfNeeded(sqlite3* db) {
+    addColumnIfMissing(db, "account", "server_url", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_host", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_extension", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_password", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_bridge_destination", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_bridge_did", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_srtp", "TEXT NOT NULL DEFAULT 'disabled'");
+    addColumnIfMissing(db, "account", "sip_transport", "TEXT NOT NULL DEFAULT 'udp'");
+    addColumnIfMissing(db, "account", "sip_tls_ca_file", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "sip_tls_insecure", "INTEGER NOT NULL DEFAULT 0");
+    addColumnIfMissing(db, "account", "outgoing_call_target", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "enabled", "INTEGER NOT NULL DEFAULT 1");
+    addColumnIfMissing(db, "account", "config_version", "INTEGER NOT NULL DEFAULT 0");
+}
+
 } // namespace
 
 Storage::Storage(const std::string& path, const std::string& key, const std::string& accountName)
@@ -219,6 +263,7 @@ Storage::Storage(const std::string& path, const std::string& key, const std::str
 
     try {
         copyOldSyncedContactDataIfPresent(db_);
+        migrateAccountConfigColumnsIfNeeded(db_);
     } catch (const std::exception& e) {
         sqlite3_close(db_);
         db_ = nullptr;
@@ -241,7 +286,10 @@ AccountRecord Storage::loadAccount() {
     Stmt stmt(db_,
         "SELECT e164, aci, pni, device_id, password, registration_id, pni_registration_id, "
         "flow, account_entropy_pool, media_root_backup_key, profile_key, "
-        "registered_at, linked_at, prekeys_refreshed_at "
+        "registered_at, linked_at, prekeys_refreshed_at, "
+        "server_url, sip_host, sip_extension, sip_password, sip_bridge_destination, sip_bridge_did, "
+        "sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure, outgoing_call_target, "
+        "enabled, config_version "
         "FROM account WHERE account_name = ?");
     bindText(stmt, 1, accountName_);
     if (sqlite3_step(stmt) != SQLITE_ROW) {
@@ -262,7 +310,48 @@ AccountRecord Storage::loadAccount() {
     account.registered_at = columnInt64Opt(stmt, 11);
     account.linked_at = columnInt64Opt(stmt, 12);
     account.prekeys_refreshed_at = columnInt64Opt(stmt, 13);
+    account.server_url = columnText(stmt, 14);
+    account.sip_host = columnText(stmt, 15);
+    account.sip_extension = columnText(stmt, 16);
+    account.sip_password = columnText(stmt, 17);
+    account.sip_bridge_destination = columnText(stmt, 18);
+    account.sip_bridge_did = columnText(stmt, 19);
+    account.sip_srtp = columnText(stmt, 20);
+    account.sip_transport = columnText(stmt, 21);
+    account.sip_tls_ca_file = columnText(stmt, 22);
+    account.sip_tls_insecure = sqlite3_column_int(stmt, 23) != 0;
+    account.outgoing_call_target = columnText(stmt, 24);
+    account.enabled = sqlite3_column_int(stmt, 25) != 0;
+    account.config_version = sqlite3_column_int64(stmt, 26);
     return account;
+}
+
+void Storage::saveAccountConfig(const AccountRecord& account) {
+    Stmt stmt(db_,
+        "UPDATE account SET server_url = ?, sip_host = ?, sip_extension = ?, sip_password = ?, "
+        "sip_bridge_destination = ?, sip_bridge_did = ?, sip_srtp = ?, sip_transport = ?, "
+        "sip_tls_ca_file = ?, sip_tls_insecure = ?, outgoing_call_target = ?, enabled = ?, "
+        "config_version = config_version + 1 "
+        "WHERE account_name = ?");
+    bindText(stmt, 1, account.server_url);
+    bindText(stmt, 2, account.sip_host);
+    bindText(stmt, 3, account.sip_extension);
+    bindText(stmt, 4, account.sip_password);
+    bindText(stmt, 5, account.sip_bridge_destination);
+    bindText(stmt, 6, account.sip_bridge_did);
+    bindText(stmt, 7, account.sip_srtp);
+    bindText(stmt, 8, account.sip_transport);
+    bindText(stmt, 9, account.sip_tls_ca_file);
+    sqlite3_bind_int(stmt, 10, account.sip_tls_insecure ? 1 : 0);
+    bindText(stmt, 11, account.outgoing_call_target);
+    sqlite3_bind_int(stmt, 12, account.enabled ? 1 : 0);
+    bindText(stmt, 13, accountName_);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("saveAccountConfig failed: ") + sqlite3_errmsg(db_));
+    }
+    if (sqlite3_changes(db_) == 0) {
+        throw std::runtime_error("saveAccountConfig: no account row named '" + accountName_ + "' to update");
+    }
 }
 
 void Storage::saveAccount(const AccountRecord& account) {
@@ -583,6 +672,81 @@ void Storage::deleteAccount() {
         sqlite3_free(errmsg);
         throw std::runtime_error("deleteAccount: COMMIT failed: " + err);
     }
+}
+
+std::vector<AccountSummary> listAllAccounts(const std::string& path, const std::string& key) {
+    // Short-lived connection, not tied to any one account's Storage
+    // instance (see this function's own doc comment in Storage.h) - same
+    // open/key/schema sequence as Storage's constructor, minus the
+    // account_name scoping this call doesn't need. Applies the schema too
+    // (harmless no-op on an already-current database, and correctly
+    // creates an empty-but-valid database on a brand-new path - matches
+    // "zero accounts is a valid config").
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+        std::string err = sqlite3_errmsg(db);
+        sqlite3_close(db);
+        throw std::runtime_error("listAllAccounts: sqlite3_open failed: " + err);
+    }
+    char* errmsg = nullptr;
+    {
+        char* sql = sqlite3_mprintf("PRAGMA key = %Q", key.c_str());
+        int rc = sqlite3_exec(db, sql, nullptr, nullptr, &errmsg);
+        sqlite3_free(sql);
+        if (rc != SQLITE_OK) {
+            std::string err = errmsg ? errmsg : "unknown error";
+            sqlite3_free(errmsg);
+            sqlite3_close(db);
+            throw std::runtime_error("listAllAccounts: PRAGMA key failed: " + err);
+        }
+    }
+    if (sqlite3_exec(db, "SELECT count(*) FROM sqlite_master", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        sqlite3_close(db);
+        throw std::runtime_error("listAllAccounts: failed to open database (wrong key or corrupt file): " + err);
+    }
+    if (sqlite3_exec(db, "PRAGMA journal_mode = WAL", nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        sqlite3_close(db);
+        throw std::runtime_error("listAllAccounts: PRAGMA journal_mode=WAL failed: " + err);
+    }
+    sqlite3_busy_timeout(db, 5000);
+    try {
+        renameOldSyncedContactTableIfNeeded(db);
+    } catch (...) {
+        sqlite3_close(db);
+        throw;
+    }
+    if (sqlite3_exec(db, kSchemaSql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        sqlite3_close(db);
+        throw std::runtime_error("listAllAccounts: failed to apply schema: " + err);
+    }
+    try {
+        copyOldSyncedContactDataIfPresent(db);
+        migrateAccountConfigColumnsIfNeeded(db);
+    } catch (...) {
+        sqlite3_close(db);
+        throw;
+    }
+
+    std::vector<AccountSummary> result;
+    {
+        Stmt stmt(db, "SELECT account_name, e164, enabled, config_version FROM account ORDER BY account_name");
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            AccountSummary summary;
+            summary.account_name = columnText(stmt, 0);
+            summary.e164 = columnText(stmt, 1);
+            summary.enabled = sqlite3_column_int(stmt, 2) != 0;
+            summary.config_version = sqlite3_column_int64(stmt, 3);
+            result.push_back(std::move(summary));
+        }
+    }
+    sqlite3_close(db);
+    return result;
 }
 
 } // namespace signal2sip

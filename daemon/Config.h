@@ -12,26 +12,18 @@
 // annotation left on the same line as a real sip_extension= value). Put
 // comments on their own line above the setting they refer to instead.
 //
-// One process now serves N Signal accounts (each optionally with its own
-// SIP trunk) from a single file, all sharing one database (see
-// GlobalConfig/Storage's own doc comments) - one `[global]` section plus
-// a repeated `[account.<name>]` section per account.
-//
-// `<name>` is a purely arbitrary label you choose - any string valid in
-// an INI section header (letters/digits/hyphen/underscore, no spaces or
-// brackets). It carries no meaning to Signal or SIP; the daemon only uses
-// it as (1) this account's key in its internal accounts map, (2) the
-// prefix on every log line for this account (`[daemon][<name>] ...`),
-// (3) the `account_name` column value scoping this account's rows in the
-// shared database. The account's real identity is `e164=`/its derived
-// ACI, not `<name>` - so `[account.support-line]`, `[account.alice]`, and
-// `[account.380000000001]` are all equally valid, and don't need to
-// relate to the phone number at all. (Historically this project used the
-// e164 digits with no `+` as the label, purely as a convention when this
-// was the only naming idea around - not a requirement, and no longer
-// even the example used in this project's own test configs, which now
-// prefer names like `caller`/`listener` describing each account's role
-// instead.)
+// 2026-08-07: this file now only ever contains one `[global]` section -
+// every account's own config (SIP/deployment settings + enabled flag)
+// moved into the `account` table (see schema.sql's own comment on it),
+// editable live via `signal2sip-gendb <name> config set/enable/disable`
+// instead of hand-editing `[account.<name>]` sections here. One process
+// still serves N Signal accounts (each optionally with its own SIP
+// trunk) from a single shared database (see GlobalConfig/Storage's own
+// doc comments) - `<name>` (the account's key everywhere in the daemon:
+// the accounts map, log-line prefixes, the `account_name` column
+// scoping its rows) is just the database's account_name value now, same
+// "purely arbitrary label, no relation to e164 required" meaning it
+// always had.
 //
 // Was one account/one file per process (matching tg2sip-webrtc's own
 // model) - deliberately reversed since tg2sip has no real
@@ -93,14 +85,45 @@ struct GlobalConfig {
     // be as long as resolvedContactTtlSec above, since unlike a CDS
     // lookup this isn't separately rate-limited per-target.
     unsigned storageSyncIntervalSec = 43200;
+
+    // How often (seconds) main()'s loop re-reads every account's SIP/
+    // deployment config + enabled flag from the database (see
+    // AccountConfig's own doc comment - 2026-08-07 moved these out of
+    // this file's [account.<name>] sections into the `account` table,
+    // editable live via `signal2sip-gendb <name> config set/enable/
+    // disable`) and rebuilds any account whose config_version changed -
+    // see main.cpp's reloadConfig(). Deliberately NOT on the same ~200ms
+    // tick as the registration/socket watchdogs above - a config change
+    // is a human running a CLI command, not a time-critical failure
+    // condition, and polling every account's row that often at any real
+    // account count would be pointless DB load for something that
+    // changes maybe a few times a day. `gendb config set/enable/disable`
+    // also sends the running daemon SIGHUP on a best-effort basis (see
+    // gendb's own doc comment) for near-instant pickup without waiting
+    // out this interval - this is just the fallback/floor.
+    unsigned configPollIntervalSec = 30;
 };
 
+// 2026-08-07: every field below except `name` now lives in the `account`
+// table (see schema.sql's own comment on it), not a [account.<name>]
+// section in this file anymore - DaemonConfig::load() builds these by
+// querying the database (see Storage.h's listAllAccounts()/loadAccount()),
+// filtered to enabled=true. `name` itself is still just the DB's
+// account_name column value, same meaning as the old section-header
+// label.
 struct AccountConfig {
-    // The "<name>" in [account.<name>] - used as this account's key
-    // everywhere in the daemon (the accounts map, log-line prefixes,
-    // Storage's account_name scoping) and to derive PJSIP transport port
-    // defaults.
+    // This account's key everywhere in the daemon (the accounts map,
+    // log-line prefixes, Storage's account_name scoping) and to derive
+    // PJSIP transport port defaults.
     std::string name;
+
+    // The `account.config_version` value this AccountConfig was built
+    // from (see Storage.h's own doc comment on that column) - main.cpp's
+    // reloadConfig() compares this against a freshly re-loaded value on
+    // each poll/SIGHUP to detect a `gendb config set` change and rebuild
+    // just that one account. Not meaningful outside the daemon's own
+    // in-memory bookkeeping (gendb doesn't read this field).
+    int64_t configVersion = 0;
 
     // The account's REAL identity, not a label - the actual phone number
     // this Signal account is registered/linked under, in E.164 format
@@ -214,6 +237,17 @@ struct DaemonConfig {
     GlobalConfig global;
     std::vector<AccountConfig> accounts;
 
+    // Reads [global] from `path` (still the only thing this file
+    // contains), then queries the database at global.dbPath for every
+    // account with enabled=1 and builds `accounts` from each one's stored
+    // config (see AccountConfig's own doc comment) - applying the same
+    // validation DaemonConfig::load() always has (sip_srtp/sip_transport
+    // enum checks, the tls_ca_file/tls_insecure requirement, the :5061
+    // default port). A single bad account's config no longer aborts the
+    // whole load - see Config.cpp's own comment on why (this is now
+    // called from a periodic poll, not just startup, and one account with
+    // a bad config set via `gendb config set` shouldn't take every other
+    // account down with it).
     static DaemonConfig load(const std::string& path);
 };
 

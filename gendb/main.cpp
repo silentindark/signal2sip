@@ -15,28 +15,36 @@
 // clean first run (missing file, or missing/empty db_path/db_key with no
 // database file sitting at db_path yet) - see bootstrapGlobalConfigIfNeeded()
 // below; a fresh db_key is only ever invented when there is provably no
-// pre-existing encrypted database it could otherwise belong to. Its
-// [account.<name>] section does NOT need to exist yet either:
-// `register`/`link` can target a brand-new name, and on success gendb
-// appends the matching [account.<name>] e164=... section to the config
-// file itself - the one shared config signal2sip-daemon reads for every
-// account never needs hand-editing for any of this.
+// pre-existing encrypted database it could otherwise belong to. That's
+// the ONLY thing this file contains now - 2026-08-07 moved every
+// account's SIP/deployment config + enabled flag into the `account`
+// table itself (see schema.sql's own comment on it), editable live via
+// this CLI's `config`/`enable`/`disable` commands instead of hand-editing
+// [account.<name>] sections. `register`/`link` can still target a
+// brand-new account name with no existing database row at all - they
+// just create one now, instead of also appending a config-file section.
 //
 // Usage:
 //   signal2sip-gendb <account-name> register --e164 <e164> [sms|voice] [--config <path>]
 //   signal2sip-gendb <account-name> register-captcha <token> [--config <path>]
 //   signal2sip-gendb <account-name> verify <code> [--config <path>]
 //   signal2sip-gendb <account-name> link [--config <path>]
+//   signal2sip-gendb <account-name> enable|disable [--config <path>]
+//   signal2sip-gendb <account-name> config get|set|list [field] [value] [--config <path>]
+//   signal2sip-gendb list [--config <path>]
 
 #include <curl/curl.h>
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <csignal>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <unistd.h>
 
 #include <nlohmann/json.hpp>
 
@@ -168,8 +176,8 @@ constexpr const char* kDefaultDbPath = "/var/lib/signal2sip/signal2sip.db";
 // database file at db_path yet - otherwise there'd be no way to know a
 // fresh random passphrase actually opens whatever's really there, so it
 // refuses instead and tells the user to set the real db_key by hand.
-// Purely additive to the config file, like appendAccountSection() below -
-// never rewrites/touches an already-present db_path/db_key value.
+// Purely additive to the config file - never rewrites/touches an
+// already-present db_path/db_key value.
 void bootstrapGlobalConfigIfNeeded(const std::string& configPath) {
     GlobalConfig existing = loadGlobalConfigLenient(configPath);
     bool dbPathMissing = existing.dbPath.empty();
@@ -211,7 +219,7 @@ void bootstrapGlobalConfigIfNeeded(const std::string& configPath) {
 
 struct ResolvedAccount {
     AccountConfig account;
-    bool existedInConfig = false;
+    bool existedInDb = false;
 };
 
 ResolvedAccount resolveAccount(const DaemonConfig& config, const std::string& name) {
@@ -221,19 +229,6 @@ ResolvedAccount resolveAccount(const DaemonConfig& config, const std::string& na
     AccountConfig fresh;
     fresh.name = name;
     return ResolvedAccount{fresh, false};
-}
-
-// Appends a brand-new [account.<name>] section to the config file on
-// disk - only called after a `verify`/`link` that just created a real
-// account for a name the loaded config didn't have a section for yet.
-// Purely additive (never touches existing sections/comments/formatting),
-// matching how SIGHUP hot-reload already expects [account.<name>]
-// sections to come and go across edits to this same file.
-void appendAccountSection(const std::string& configPath, const std::string& name, const std::string& e164) {
-    std::ofstream f(configPath, std::ios::app);
-    if (!f) throw std::runtime_error("cannot append to config file: " + configPath);
-    f << "\n[account." << name << "]\n";
-    f << "e164=" << e164 << "\n";
 }
 
 void requireNoExistingAccount(Storage& storage, const std::string& name) {
@@ -301,7 +296,7 @@ void cmdRegister(const DaemonConfig& config, const std::string& accountName, con
     }
     ResolvedAccount resolved = resolveAccount(config, accountName);
     AccountConfig account = resolved.account;
-    if (!resolved.existedInConfig) {
+    if (!resolved.existedInDb) {
         if (e164Arg.empty()) {
             throw std::runtime_error("account '" + accountName +
                                      "' is not in the config yet - pass --e164 <e164> to register it");
@@ -416,8 +411,7 @@ void cmdRegisterCaptcha(const DaemonConfig& config, const std::string& accountNa
     std::cout << "  signal2sip-gendb " << accountName << " verify <code>\n";
 }
 
-void cmdVerify(const DaemonConfig& config, const std::string& configPath, const std::string& accountName,
-              const std::string& code) {
+void cmdVerify(const DaemonConfig& config, const std::string& accountName, const std::string& code) {
     Storage storage(config.global.dbPath, config.global.dbKey, accountName);
     requireNoExistingAccount(storage, accountName);
 
@@ -505,7 +499,6 @@ void cmdVerify(const DaemonConfig& config, const std::string& configPath, const 
     finished.flow = "standalone";
     saveFinishedAccount(storage, finished);
     deletePending(config.global, accountName);
-    if (!resolved.existedInConfig) appendAccountSection(configPath, accountName, account.e164);
 
     std::cout << "[verify] PASS: registered and saved account '" << accountName << "' (aci " << finished.aci
               << ")\n";
@@ -513,7 +506,7 @@ void cmdVerify(const DaemonConfig& config, const std::string& configPath, const 
 
 // ---- Flow B: device linking via QR ----
 
-void cmdLink(const DaemonConfig& config, const std::string& configPath, const std::string& accountName) {
+void cmdLink(const DaemonConfig& config, const std::string& accountName) {
     Storage storage(config.global.dbPath, config.global.dbKey, accountName);
     requireNoExistingAccount(storage, accountName);
 
@@ -594,7 +587,6 @@ void cmdLink(const DaemonConfig& config, const std::string& configPath, const st
     finished.accountEntropyPool = provisioned.accountEntropyPool;
     finished.mediaRootBackupKey = provisioned.mediaRootBackupKey;
     saveFinishedAccount(storage, finished);
-    if (!resolved.existedInConfig) appendAccountSection(configPath, accountName, finalE164);
 
     std::cout << "[link] PASS: linked and saved account '" << accountName << "' (aci " << finished.aci << ", device "
               << finished.deviceId << ")\n";
@@ -620,9 +612,8 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
     std::cout << "[unlink] removed all local data for account '" << accountName << "' (e164=" << account.e164
               << ")\n";
     std::cout << "[unlink] this was LOCAL ONLY - it does not unlink or delete the account on Signal's real servers.\n";
-    std::cout << "[unlink] the [account." << accountName
-              << "] section in the config file was left in place - remove it yourself (and SIGHUP the daemon, or "
-                 "restart it) if you don't want it to try starting this account again.\n";
+    std::cout << "[unlink] this account's row (and its enabled flag) was also just wiped along with everything "
+                 "else - re-run `register`/`link` to reuse this account name.\n";
 }
 
 // ---- Primary account lifecycle: unregister (soft) / reactivate ----
@@ -687,8 +678,8 @@ void cmdUnregister(const DaemonConfig& config, const std::string& accountName) {
               << ") is now dormant (fetchesMessages=false) - senders can no longer reach this number.\n";
     std::cout << "[unregister] this is REVERSIBLE and purely a server-side flag flip - no local data or "
                  "registration/identity keys were touched. Run `reactivate` to bring it back.\n";
-    std::cout << "[unregister] if signal2sip-daemon is currently running this account, stop it (or drop the "
-                 "[account." << accountName << "] section and SIGHUP) first - otherwise its already-open "
+    std::cout << "[unregister] if signal2sip-daemon is currently running this account, stop it (or run "
+                 "`signal2sip-gendb " << accountName << " disable`) first - otherwise its already-open "
                  "connection may keep the account looking active until it next reconnects.\n";
 }
 
@@ -781,6 +772,174 @@ void cmdDeleteAccount(const DaemonConfig& config, const std::string& accountName
     throw std::runtime_error("DELETE /v1/accounts/me failed with status " + std::to_string(response.status));
 }
 
+// ---- SIP/deployment config (2026-08-07: moved from signal2sip.conf's old
+// [account.<name>] sections into the `account` table's own columns - see
+// schema.sql's comment on that table and AccountConfig's doc comment in
+// Config.h for the full "why") ----
+
+std::string pidFilePath(const GlobalConfig& global) {
+    return dirName(global.dbPath) + "/signal2sip.pid";
+}
+
+// Best-effort: if signal2sip-daemon is currently running (a live pidfile
+// whose PID's /proc/<pid>/exe genuinely still resolves to a
+// signal2sip-daemon binary, not some unrelated process that happens to
+// have reused that PID after the daemon exited), send it SIGHUP so a
+// config/enable/disable change this command just made takes effect
+// immediately instead of waiting out GlobalConfig::configPollIntervalSec.
+// Purely a convenience - silently does nothing if the daemon isn't
+// running or the pidfile is stale; the periodic poll is the real
+// guarantee this change gets picked up. Reads /proc/<pid>/exe (a symlink
+// to the real binary path) rather than /proc/<pid>/comm - comm is
+// truncated to 15 bytes by the kernel, which would silently and
+// permanently mismatch "signal2sip-daemon" (18 bytes; confirmed live -
+// comm reads back as "signal2sip-daem").
+void signalDaemonBestEffort(const GlobalConfig& global) {
+    std::ifstream pidFile(pidFilePath(global));
+    if (!pidFile) return;
+    long pid = 0;
+    pidFile >> pid;
+    if (pid <= 0) return;
+
+    char exePath[4096];
+    ssize_t len = ::readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(), exePath, sizeof(exePath) - 1);
+    if (len <= 0) return; // no such process
+    std::string exe(exePath, len);
+    // "signal2sip-daemon" is 17 characters (miscounted as 18 in an
+    // earlier version of this check, live 2026-08-07 - that off-by-one
+    // made the suffix compare() always fail on length alone regardless
+    // of content, so this function silently never signaled anything).
+    static const std::string kDaemonName = "signal2sip-daemon";
+    if (exe.size() < kDaemonName.size() ||
+        exe.compare(exe.size() - kDaemonName.size(), kDaemonName.size(), kDaemonName) != 0) {
+        return; // stale pidfile - a different process now has this pid
+    }
+
+    if (::kill(static_cast<pid_t>(pid), SIGHUP) == 0) {
+        std::cout << "[gendb] signaled running signal2sip-daemon (pid " << pid << ") to reload now\n";
+    }
+}
+
+// One entry per editable SIP/deployment-config field - name (as used on
+// the CLI and matching the old .conf key names exactly, for muscle-memory
+// continuity) plus a get/set pair operating on the in-memory AccountRecord
+// (set validates the same way Config.cpp's accountConfigFromRecord() does
+// downstream, so a bad value is rejected here at write time rather than
+// silently breaking the daemon's next reload).
+struct ConfigField {
+    std::string name;
+    std::function<std::string(const AccountRecord&)> get;
+    std::function<void(AccountRecord&, const std::string&)> set;
+};
+
+const std::vector<ConfigField>& configFields() {
+    static const std::vector<ConfigField> fields = {
+        {"server_url", [](const AccountRecord& a) { return a.server_url; },
+         [](AccountRecord& a, const std::string& v) { a.server_url = v; }},
+        {"sip_host", [](const AccountRecord& a) { return a.sip_host; },
+         [](AccountRecord& a, const std::string& v) { a.sip_host = v; }},
+        {"sip_extension", [](const AccountRecord& a) { return a.sip_extension; },
+         [](AccountRecord& a, const std::string& v) { a.sip_extension = v; }},
+        {"sip_password", [](const AccountRecord& a) { return a.sip_password; },
+         [](AccountRecord& a, const std::string& v) { a.sip_password = v; }},
+        {"sip_bridge_destination", [](const AccountRecord& a) { return a.sip_bridge_destination; },
+         [](AccountRecord& a, const std::string& v) { a.sip_bridge_destination = v; }},
+        {"sip_bridge_did", [](const AccountRecord& a) { return a.sip_bridge_did; },
+         [](AccountRecord& a, const std::string& v) { a.sip_bridge_did = v; }},
+        {"sip_srtp", [](const AccountRecord& a) { return a.sip_srtp; },
+         [](AccountRecord& a, const std::string& v) {
+             if (v != "disabled" && v != "optional" && v != "mandatory") {
+                 throw std::runtime_error("sip_srtp must be disabled/optional/mandatory, got '" + v + "'");
+             }
+             a.sip_srtp = v;
+         }},
+        {"sip_transport", [](const AccountRecord& a) { return a.sip_transport; },
+         [](AccountRecord& a, const std::string& v) {
+             if (v != "udp" && v != "tls") {
+                 throw std::runtime_error("sip_transport must be udp/tls, got '" + v + "'");
+             }
+             a.sip_transport = v;
+         }},
+        {"sip_tls_ca_file", [](const AccountRecord& a) { return a.sip_tls_ca_file; },
+         [](AccountRecord& a, const std::string& v) { a.sip_tls_ca_file = v; }},
+        {"sip_tls_insecure", [](const AccountRecord& a) { return a.sip_tls_insecure ? "yes" : "no"; },
+         [](AccountRecord& a, const std::string& v) {
+             a.sip_tls_insecure = (v == "yes" || v == "true" || v == "1");
+         }},
+        {"outgoing_call_target", [](const AccountRecord& a) { return a.outgoing_call_target; },
+         [](AccountRecord& a, const std::string& v) { a.outgoing_call_target = v; }},
+    };
+    return fields;
+}
+
+const ConfigField& findConfigField(const std::string& name) {
+    for (const auto& f : configFields()) {
+        if (f.name == name) return f;
+    }
+    throw std::runtime_error(
+        "unknown config field '" + name +
+        "' - known fields: server_url, sip_host, sip_extension, sip_password, sip_bridge_destination, "
+        "sip_bridge_did, sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure, outgoing_call_target");
+}
+
+void cmdConfigGet(const DaemonConfig& config, const std::string& accountName, const std::string& field) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+    if (!field.empty()) {
+        std::cout << field << "=" << findConfigField(field).get(account) << "\n";
+        return;
+    }
+    for (const auto& f : configFields()) std::cout << f.name << "=" << f.get(account) << "\n";
+    std::cout << "enabled=" << (account.enabled ? "yes" : "no") << "\n";
+    std::cout << "config_version=" << account.config_version << "\n";
+}
+
+void cmdConfigSet(const DaemonConfig& config, const std::string& accountName, const std::string& field,
+                  const std::string& value) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+    findConfigField(field).set(account, value);
+    storage.saveAccountConfig(account);
+    std::cout << "[config] " << accountName << ": " << field << "=" << value << "\n";
+    signalDaemonBestEffort(config.global);
+}
+
+void cmdSetEnabled(const DaemonConfig& config, const std::string& accountName, bool enabled) {
+    Storage storage(config.global.dbPath, config.global.dbKey, accountName);
+    if (!storage.hasAccount()) {
+        throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
+    }
+    AccountRecord account = storage.loadAccount();
+    account.enabled = enabled;
+    storage.saveAccountConfig(account);
+    std::cout << "[" << (enabled ? "enable" : "disable") << "] account '" << accountName << "' is now "
+              << (enabled ? "enabled" : "disabled") << "\n";
+    signalDaemonBestEffort(config.global);
+}
+
+// Unlike DaemonConfig::load()'s `accounts` (enabled=1 only, and silently
+// skips an account whose config fails validation - see its own doc
+// comment), this shows every account row regardless of enabled/validity,
+// since the whole point of `list` is visibility into everything that
+// exists.
+void cmdListAccounts(const GlobalConfig& global) {
+    std::vector<AccountSummary> accounts = listAllAccounts(global.dbPath, global.dbKey);
+    if (accounts.empty()) {
+        std::cout << "(no accounts)\n";
+        return;
+    }
+    for (const AccountSummary& s : accounts) {
+        std::cout << s.account_name << "\te164=" << s.e164 << "\t" << (s.enabled ? "enabled" : "disabled")
+                  << "\tconfig_version=" << s.config_version << "\n";
+    }
+}
+
 void printUsage() {
     std::cerr
         << "usage:\n"
@@ -792,26 +951,41 @@ void printUsage() {
           "  signal2sip-gendb <account-name> unregister [--config <path>]\n"
           "  signal2sip-gendb <account-name> reactivate [--config <path>]\n"
           "  signal2sip-gendb <account-name> delete-account [--config <path>]\n"
+          "  signal2sip-gendb <account-name> enable|disable [--config <path>]\n"
+          "  signal2sip-gendb <account-name> config get [field] [--config <path>]\n"
+          "  signal2sip-gendb <account-name> config set <field> <value> [--config <path>]\n"
+          "  signal2sip-gendb list [--config <path>]\n"
           "\n"
           "`delete-account` is REAL and IRREVERSIBLE - it deletes the account from Signal's real servers\n"
           "(DELETE /v1/accounts/me) and frees the phone number for anyone to register, then wipes local data\n"
           "too on confirmed success. Unlike unregister, there is no undo.\n"
           "\n"
-          "`unlink` wipes this account's local data (keys, sessions, cached contacts) from the database. It is\n"
-          "LOCAL ONLY - it does not contact Signal's servers, so use it after the account is already gone on the\n"
-          "real side (a real unlink/delete-account done elsewhere), not as a way to perform that unlink itself.\n"
+          "`unlink` wipes this account's local data (keys, sessions, cached contacts, SIP/deployment config) from\n"
+          "the database. It is LOCAL ONLY - it does not contact Signal's servers, so use it after the account is\n"
+          "already gone on the real side (a real unlink/delete-account done elsewhere), not as a way to perform\n"
+          "that unlink itself.\n"
           "\n"
           "`unregister`/`reactivate` are the opposite: a REAL, reversible server-side flag flip\n"
           "(fetchesMessages) using the account's own stored credentials - senders can't reach an unregistered\n"
           "number until `reactivate` is run. Neither touches local data or requires re-verification.\n"
           "\n"
+          "`enable`/`disable` control whether signal2sip-daemon sets this account up at all - the running daemon\n"
+          "picks up a change within 30s (configurable via [global] config_poll_interval_sec), or immediately if\n"
+          "it finds the daemon's pid and can signal it (best-effort).\n"
+          "\n"
+          "`config get`/`config set` read/write this account's SIP/deployment settings (sip_host, sip_password,\n"
+          "sip_bridge_destination, sip_bridge_did, sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure,\n"
+          "outgoing_call_target, server_url) - these used to live in this file's own [account.<name>] sections,\n"
+          "now they're in the database, live-editable the same way enable/disable is. `config get` with no field\n"
+          "prints everything; `config set` picks up the running daemon the same way enable/disable does.\n"
+          "\n"
           "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf), same as\n"
-          "signal2sip-daemon. Its [global] section (db_path/db_key) is bootstrapped automatically on a clean\n"
-          "first run: db_path defaults to /var/lib/signal2sip/signal2sip.db, and db_key is freshly generated\n"
-          "and printed once (back it up - it's the passphrase for every account's encrypted keys) - but only\n"
-          "when no database file exists at db_path yet; otherwise gendb refuses rather than guess.\n"
-          "[account.<name>] does NOT need to exist yet either - `register --e164 ...`/`link` can target a\n"
-          "brand-new name, and gendb appends the matching section to the config file once the account is real.\n";
+          "signal2sip-daemon, and now only ever needs a [global] section (db_path/db_key) - bootstrapped\n"
+          "automatically on a clean first run: db_path defaults to /var/lib/signal2sip/signal2sip.db, and db_key\n"
+          "is freshly generated and printed once (back it up - it's the passphrase for every account's encrypted\n"
+          "keys) - but only when no database file exists at db_path yet; otherwise gendb refuses rather than\n"
+          "guess. `register --e164 ...`/`link` can target a brand-new account name with no existing database row\n"
+          "at all - they just create one.\n";
 }
 
 struct ParsedArgs {
@@ -834,6 +1008,12 @@ ParsedArgs parseArgs(int argc, char** argv) {
         } else {
             rest.push_back(arg);
         }
+    }
+    // `list` is the one command with no <account-name> - it lists every
+    // account, so there's nothing to scope it to.
+    if (rest.size() == 1 && rest[0] == "list") {
+        result.command = "list";
+        return result;
     }
     if (rest.size() < 2) throw std::runtime_error("missing <account-name> <command>");
     result.accountName = rest[0];
@@ -878,9 +1058,9 @@ int main(int argc, char** argv) {
             cmdRegisterCaptcha(config, args.accountName, args.positional[0]);
         } else if (args.command == "verify") {
             if (args.positional.empty()) throw std::runtime_error("verify needs a <code>");
-            cmdVerify(config, configPath, args.accountName, args.positional[0]);
+            cmdVerify(config, args.accountName, args.positional[0]);
         } else if (args.command == "link") {
-            cmdLink(config, configPath, args.accountName);
+            cmdLink(config, args.accountName);
         } else if (args.command == "unlink") {
             cmdUnlink(config, args.accountName);
         } else if (args.command == "unregister") {
@@ -889,6 +1069,24 @@ int main(int argc, char** argv) {
             cmdReactivate(config, args.accountName);
         } else if (args.command == "delete-account") {
             cmdDeleteAccount(config, args.accountName);
+        } else if (args.command == "enable") {
+            cmdSetEnabled(config, args.accountName, true);
+        } else if (args.command == "disable") {
+            cmdSetEnabled(config, args.accountName, false);
+        } else if (args.command == "config") {
+            if (args.positional.empty()) throw std::runtime_error("config needs a get/set subcommand");
+            const std::string& sub = args.positional[0];
+            if (sub == "get" || sub == "list") {
+                std::string field = args.positional.size() > 1 ? args.positional[1] : "";
+                cmdConfigGet(config, args.accountName, field);
+            } else if (sub == "set") {
+                if (args.positional.size() < 3) throw std::runtime_error("config set needs <field> <value>");
+                cmdConfigSet(config, args.accountName, args.positional[1], args.positional[2]);
+            } else {
+                throw std::runtime_error("config: unknown subcommand '" + sub + "' - use get/set");
+            }
+        } else if (args.command == "list") {
+            cmdListAccounts(config.global);
         } else {
             printUsage();
             exitCode = 1;

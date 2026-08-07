@@ -25,7 +25,40 @@ struct AccountRecord {
     std::optional<int64_t> registered_at;
     std::optional<int64_t> linked_at;
     std::optional<int64_t> prekeys_refreshed_at;
+
+    // SIP/deployment config (schema.sql's own comment on the `account`
+    // table has the full "why here, not the .conf file" rationale) -
+    // field names/defaults/meaning mirror AccountConfig (daemon/Config.h)
+    // exactly. Populated by loadAccount()'s SELECT, but saveAccount()
+    // never writes these - only saveAccountConfig() does.
+    std::string server_url;
+    std::string sip_host, sip_extension, sip_password;
+    std::string sip_bridge_destination, sip_bridge_did;
+    std::string sip_srtp = "disabled";
+    std::string sip_transport = "udp";
+    std::string sip_tls_ca_file;
+    bool sip_tls_insecure = false;
+    std::string outgoing_call_target;
+    bool enabled = true;
+    int64_t config_version = 0;
 };
+
+// Lightweight per-account summary for enumerating every account in the
+// database without needing a full loadAccount() per row - used by the
+// daemon (which accounts to run) and gendb's `list` command.
+struct AccountSummary {
+    std::string account_name;
+    std::string e164;
+    bool enabled = true;
+    int64_t config_version = 0;
+};
+
+// Enumerates every account row in the database, regardless of which
+// account any particular Storage instance is scoped to - opens its own
+// short-lived connection (same path/key as Storage's constructor).
+// Returns an empty vector for a brand-new/empty database (not an error -
+// matches Config.cpp's "zero accounts is a valid config" comment).
+std::vector<AccountSummary> listAllAccounts(const std::string& path, const std::string& key);
 
 struct IdentityKeypairRecord {
     Bytes private_key;
@@ -89,6 +122,15 @@ public:
     bool hasAccount();
     AccountRecord loadAccount();
     void saveAccount(const AccountRecord& account);
+
+    // Writes ONLY the SIP/deployment-config + enabled columns (never the
+    // Signal-identity ones saveAccount() owns) and bumps config_version by
+    // 1 in the same statement (`config_version = config_version + 1` in
+    // SQL - the passed-in account.config_version is never trusted/written,
+    // avoiding a read-then-write race against a concurrent writer). The
+    // account row must already exist (created via saveAccount() during
+    // register/link/verify) - this is an UPDATE, not an upsert.
+    void saveAccountConfig(const AccountRecord& account);
 
     // identity in {"aci", "pni"}
     void saveIdentityKeypair(const std::string& identity, const IdentityKeypairRecord& keypair);

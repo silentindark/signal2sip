@@ -32,7 +32,43 @@ CREATE TABLE IF NOT EXISTS account (
     profile_key             BLOB,
     registered_at            INTEGER,         -- unix seconds, standalone registration
     linked_at               INTEGER,         -- unix seconds, device-linking
-    prekeys_refreshed_at     INTEGER
+    prekeys_refreshed_at     INTEGER,
+
+    -- 2026-08-07: SIP/deployment config, moved here from signal2sip.conf's
+    -- old [account.<name>] sections so it's editable live via
+    -- `signal2sip-gendb <name> config set/get` (and eventually a TUI)
+    -- instead of SSH+text-editing+restart. [global] (db_path/db_key and a
+    -- few process-wide tuning knobs) is the only thing still read from the
+    -- file - see Config.h. Field names/defaults mirror AccountConfig
+    -- (Config.h) exactly; see that struct's own per-field doc comments for
+    -- what each one means. `saveAccount()` (Storage.cpp) deliberately never
+    -- touches these columns - only `saveAccountConfig()` does, so the
+    -- daemon's own routine identity-bookkeeping writes (e.g.
+    -- prekeys_refreshed_at) can never race with a concurrent
+    -- `gendb config set` and clobber config_version.
+    server_url               TEXT NOT NULL DEFAULT '',
+    sip_host                 TEXT NOT NULL DEFAULT '',
+    sip_extension             TEXT NOT NULL DEFAULT '',
+    sip_password              TEXT NOT NULL DEFAULT '',
+    sip_bridge_destination     TEXT NOT NULL DEFAULT '',
+    sip_bridge_did            TEXT NOT NULL DEFAULT '',
+    sip_srtp                 TEXT NOT NULL DEFAULT 'disabled', -- 'disabled' | 'optional' | 'mandatory'
+    sip_transport             TEXT NOT NULL DEFAULT 'udp',      -- 'udp' | 'tls'
+    sip_tls_ca_file            TEXT NOT NULL DEFAULT '',
+    sip_tls_insecure          INTEGER NOT NULL DEFAULT 0,
+    outgoing_call_target       TEXT NOT NULL DEFAULT '',
+    -- Whether the daemon should set this account up at all - the DB-side
+    -- replacement for "does a [account.<name>] section exist in the file".
+    -- Flipped via `signal2sip-gendb <name> enable`/`disable`.
+    enabled                  INTEGER NOT NULL DEFAULT 1,
+    -- Bumped by saveAccountConfig() on every write (SQL-side
+    -- `config_version = config_version + 1`, never trusted from the
+    -- caller - avoids a read-then-write race). The running daemon
+    -- remembers which version it last set an account up with (see
+    -- AccountConfig::configVersion, Config.h) and rebuilds that one
+    -- account (teardown+setup) when a poll/SIGHUP sees a mismatch - see
+    -- main.cpp's reloadConfig().
+    config_version            INTEGER NOT NULL DEFAULT 0
 );
 
 -- Identity keypairs: one row per (account_name, identity in {'aci','pni'}).

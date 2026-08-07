@@ -43,6 +43,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
@@ -606,6 +607,22 @@ private:
 class BridgeAccount : public pj::Account {
 public:
     std::atomic<bool> registered{false};
+
+    // The dedicated transport createAccountUdpTransport()/
+    // createAccountTlsTransport() made for this account (see
+    // AccountConfig::sipTransport's own doc comment for why every
+    // account needs its own). teardownAccount() closes it explicitly via
+    // this - found live 2026-08-07 (config-in-DB testing, repeated
+    // rebuild cycles): PJSIP transport IDs are a small fixed-size table
+    // that's NEVER auto-reclaimed just because the pj::Account/transport
+    // C++ wrapper objects using them were destroyed; only an explicit
+    // Endpoint::transportClose() actually frees the slot. Without this,
+    // every reload-triggered rebuild (config change, enable/disable)
+    // permanently leaked one transport slot until the whole process was
+    // restarted - confirmed live: real accounts hit "Too many objects of
+    // the specified type (PJ_ETOOMANY)" and silently lost SIP entirely
+    // after only a handful of rebuilds.
+    pj::TransportId transportId = PJSUA_INVALID_ID;
 
     // Set right after construction in setupAccount(), before this account
     // can possibly receive any real SIP traffic - lets onIncomingCall()
@@ -1182,6 +1199,36 @@ std::atomic<bool> g_reloadRequested{false};
 void onReloadSignal(int) { g_reloadRequested = true; }
 
 std::string g_configPath; // set once in main(), read by reloadConfig()
+
+// Same helper gendb/main.cpp has (kept independent rather than shared -
+// both are tiny, and pulling in a shared util header for one line isn't
+// worth it).
+std::string dirName(const std::string& path) {
+    auto pos = path.find_last_of('/');
+    return pos == std::string::npos ? std::string(".") : path.substr(0, pos);
+}
+
+// Written once at startup, removed on clean shutdown (see main()'s
+// shutdown path) - `gendb <name> config set/enable/disable` reads this to
+// find and SIGHUP the running daemon for near-instant config pickup
+// instead of waiting out GlobalConfig::configPollIntervalSec (see that
+// field's own doc comment). Same path gendb derives independently
+// (dirName(dbPath) + "/signal2sip.pid") - no config knob needed since
+// both processes already agree on dbPath.
+std::string pidFilePath(const GlobalConfig& global) {
+    return dirName(global.dbPath) + "/signal2sip.pid";
+}
+
+void writePidFile(const GlobalConfig& global) {
+    std::ofstream f(pidFilePath(global));
+    if (!f) {
+        std::cerr << "[daemon] warning: could not write pidfile at " << pidFilePath(global)
+                   << " - `gendb config set/enable/disable` won't be able to SIGHUP this process for instant "
+                      "pickup, it'll fall back to the periodic poll instead\n";
+        return;
+    }
+    f << ::getpid() << "\n";
+}
 GlobalConfig g_global;    // set once in main() from config.global, read by setupAccount()
 
 // Creates the shared Endpoint the first time any account needs it - either
@@ -1470,6 +1517,15 @@ void BridgeAccount::onIncomingCall(pj::OnIncomingCallParam& iprm) {
 // false (and leaves no trace in g_accounts) on failure.
 bool setupAccount(const AccountConfig& accountConfig) {
     try {
+        // Moved here (from a one-time up-front check in main()) so an
+        // account whose SIP config gets added later via `gendb config
+        // set`/enable (picked up by reloadConfig()'s poll/SIGHUP path,
+        // not just at startup) still brings the shared Endpoint up the
+        // first time it's actually needed - ensureSharedEndpoint() is
+        // idempotent (`if (g_ep) return;`), so this is a no-op on every
+        // account after the first SIP-using one.
+        if (accountConfig.hasSip()) ensureSharedEndpoint();
+
         AccountState& acct = *(g_accounts[accountConfig.name] = std::make_unique<AccountState>());
         acct.config = accountConfig;
 
@@ -1600,6 +1656,7 @@ bool setupAccount(const AccountConfig& accountConfig) {
                 }
 
                 sipAccount->acctState = &acct;
+                sipAccount->transportId = transportId;
                 sipAccount->create(acfg);
 
                 std::cout << "[daemon][" << accountConfig.name << "] waiting for SIP registration...\n";
@@ -1701,17 +1758,67 @@ void teardownAccount(const std::string& name) {
     acct.dispatchQueue.stopAndJoin();
     signal2sip_call_manager_destroy(acct.handle);
     acct.socket->close();
+
+    if (auto sipIt = g_sipAccounts.find(name); sipIt != g_sipAccounts.end() && g_ep) {
+        BridgeAccount& sipAccount = *sipIt->second;
+
+        // Graceful unregister (REGISTER Expires:0) before tearing anything
+        // else down - found live 2026-08-07 (config-in-DB work made
+        // teardown+setup routine, not just a rare restart): without this,
+        // Asterisk's AOR still holds the OLD contact (this project's real
+        // AORs all use max_contacts=1 + remove_existing=false - confirmed
+        // via `pjsip show aor` on .81), so the NEW registration a fresh
+        // setupAccount() immediately attempts gets rejected 403 Forbidden
+        // until the stale contact naturally expires - observed live taking
+        // the full ~5 minutes (default_expiration=3600 but PJSIP's own
+        // client re-registers well before that, so the real wait is
+        // whatever was left on the most recent re-register, not the full
+        // hour). setRegistration() is asynchronous (completion arrives via
+        // onRegState()), so wait briefly for it - best-effort: if it
+        // doesn't finish in time, teardown proceeds anyway and the
+        // registration watchdog on the next incarnation eventually
+        // recovers exactly as it did before this fix, just slower.
+        if (sipAccount.registered.load()) {
+            try {
+                sipAccount.setRegistration(false);
+                for (int i = 0; i < 20 && sipAccount.registered.load(); i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            } catch (pj::Error& err) {
+                std::cerr << "[daemon][" << name << "] graceful unregister failed (non-fatal): " << err.info()
+                           << "\n";
+            }
+        }
+
+        // Explicitly release this account's dedicated PJSIP transport slot -
+        // see BridgeAccount::transportId's own doc comment for why this is
+        // required, not just nice-to-have (a fixed-size table that's never
+        // auto-reclaimed otherwise).
+        if (sipAccount.transportId != PJSUA_INVALID_ID) {
+            try {
+                g_ep->transportClose(sipAccount.transportId);
+            } catch (pj::Error& err) {
+                std::cerr << "[daemon][" << name << "] transportClose failed (non-fatal): " << err.info() << "\n";
+            }
+        }
+    }
     g_sipAccounts.erase(name);
     g_accounts.erase(it);
 }
 
-// SIGHUP handler's actual work, run from the main loop (never from the
-// signal handler itself). Diffs the freshly-reread config against
-// g_accounts: accounts no longer present get torn down, accounts not yet
-// present get set up. Accounts present in both are left running untouched
-// - changing an existing account's settings (e.g. a new SIP password) is
-// not supported by a reload; that would need this account removed from
-// the config, reloaded, then re-added in a second reload.
+// Re-reads [global] from the config file plus every enabled account's
+// SIP/deployment config from the database (DaemonConfig::load() - see its
+// own doc comment) and diffs against g_accounts: accounts no longer
+// present (deleted, or disabled via `gendb <name> disable`) get torn
+// down, accounts not yet present (added, or just enabled) get set up. An
+// account present in both gets left running untouched UNLESS its
+// config_version (see schema.sql's own doc comment on that column)
+// doesn't match what it was last set up with - `gendb <name> config set`
+// bumps that column, so this is how an already-running account picks up
+// a changed sip_password/sip_host/etc without a manual disable+enable
+// round-trip. Called both from the SIGHUP handler below and from a
+// periodic timer in main()'s loop (see GlobalConfig::configPollIntervalSec's
+// own doc comment for why both exist).
 void reloadConfig(const std::string& configPath) {
     DaemonConfig newConfig;
     try {
@@ -1724,15 +1831,14 @@ void reloadConfig(const std::string& configPath) {
     // Accounts already running were constructed against the *old* g_global
     // (captured by value at construction time inside their own Storage),
     // so updating this doesn't retroactively change them - only new
-    // accounts brought up below see the new value. Consistent with
-    // "changing settings isn't supported by a reload" above.
+    // accounts brought up below see the new value.
     g_global = newConfig.global;
 
-    std::set<std::string> newNames;
-    for (const auto& accountConfig : newConfig.accounts) newNames.insert(accountConfig.name);
+    std::map<std::string, AccountConfig> newByName;
+    for (const auto& accountConfig : newConfig.accounts) newByName.emplace(accountConfig.name, accountConfig);
 
     for (auto it = g_accounts.begin(); it != g_accounts.end(); ) {
-        if (!newNames.count(it->first)) {
+        if (!newByName.count(it->first)) {
             std::cout << "[daemon] reload: removing account " << it->first << "\n";
             std::string name = it->first;
             ++it; // teardownAccount() erases g_accounts[name] itself
@@ -1742,9 +1848,16 @@ void reloadConfig(const std::string& configPath) {
         }
     }
 
-    for (const auto& accountConfig : newConfig.accounts) {
-        if (!g_accounts.count(accountConfig.name)) {
-            std::cout << "[daemon] reload: adding account " << accountConfig.name << "\n";
+    for (const auto& [name, accountConfig] : newByName) {
+        auto it = g_accounts.find(name);
+        if (it == g_accounts.end()) {
+            std::cout << "[daemon] reload: adding account " << name << "\n";
+            setupAccount(accountConfig);
+        } else if (it->second->config.configVersion != accountConfig.configVersion) {
+            std::cout << "[daemon] reload: config changed for account " << name << " (version "
+                       << it->second->config.configVersion << " -> " << accountConfig.configVersion
+                       << "), rebuilding\n";
+            teardownAccount(name);
             setupAccount(accountConfig);
         }
     }
@@ -1754,10 +1867,12 @@ void printUsage() {
     std::cerr
         << "usage: signal2sip-daemon [config-path]\n"
           "\n"
-          "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf) when no\n"
-          "path is given - see signal2sip-gendb --help to create one. Send SIGHUP to reload\n"
-          "[account.<name>] additions/removals without restarting; existing accounts' own settings are\n"
-          "not re-read on a reload, see reloadConfig()'s doc comment above.\n";
+          "Config file defaults to /etc/signal2sip/signal2sip.conf (else ./signal2sip.conf) when no path is\n"
+          "given, and only ever needs a [global] section - see signal2sip-gendb --help to create one. Every\n"
+          "account's SIP/deployment config + enabled flag lives in the database instead, editable live via\n"
+          "`signal2sip-gendb <name> config set/enable/disable` - picked up within [global]\n"
+          "config_poll_interval_sec (default 30s), or immediately via SIGHUP (which `gendb` sends automatically\n"
+          "on a best-effort basis). See reloadConfig()'s own doc comment for exactly what a reload does.\n";
 }
 
 } // namespace
@@ -1800,38 +1915,17 @@ int main(int argc, char** argv) {
         std::cerr << "[daemon] config error: " << e.what() << "\n";
         return 1;
     }
-    std::cout << "[daemon] loaded config from " << g_configPath << " for " << config.accounts.size()
-               << " account(s)\n";
+    std::cout << "[daemon] loaded [global] from " << g_configPath << ", " << config.accounts.size()
+               << " enabled account(s) from the database\n";
     g_global = config.global;
+    writePidFile(g_global);
 
     signal2sip_init_logging(); // process-wide, once, regardless of account count
 
-    // --- Shared PJSIP Endpoint, once, only if at least one account uses
-    // [sip.<name>] - see g_ep's own doc comment for why this is the one
-    // thing that stays a process-wide singleton instead of per-account.
-    // setNullDev() matches pjsip_ringrtc_echo_test.cpp's proven config;
-    // ptime/clockRate/forced-L16-mono-codec matches tg2sip-webrtc's
-    // sip.cpp (settings.raw_pcm()) exactly - same rationale:
-    // RingRtcSipBridge's ring-buffer ports are fixed 48kHz mono, so
-    // negotiating raw L16/48000/1 directly (instead of letting
-    // PJSIP/Asterisk pick from the full default codec list - narrowband
-    // PCMU needed a real resample_port conversion, and even wideband
-    // Opus is lossy-compressed and offered as stereo/2ch, a
-    // channel-count mismatch against these mono ports) removes every
-    // remaining source of rate/channel mismatch and codec-level
-    // encode/decode CPU overhead in the whole audio path. Found live:
-    // real degraded audio quality (described as sounding slowed-down)
-    // over PCMU with the resample_port conversion in place.
-    bool anySip = std::any_of(config.accounts.begin(), config.accounts.end(),
-                               [](const AccountConfig& a) { return a.hasSip(); });
-    if (anySip) {
-        // Just brings up the shared pjsua2 Endpoint itself - each
-        // account's own dedicated transport is created later in the
-        // per-account loop below (see g_ep's own doc comment).
-        ensureSharedEndpoint();
-    }
-
-    // --- Per-account setup (see setupAccount()'s own doc comment).
+    // --- Per-account setup (see setupAccount()'s own doc comment). Each
+    // call brings up the shared PJSIP Endpoint itself the first time it
+    // hits a SIP-using account (see ensureSharedEndpoint()'s own doc
+    // comment) - no separate up-front check needed here.
     for (const AccountConfig& accountConfig : config.accounts) {
         setupAccount(accountConfig);
     }
@@ -1841,9 +1935,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Set right before the loop starts (not 0) so the first real poll
+    // happens after a full configPollIntervalSec from here, not
+    // immediately - the per-account setup loop just above already
+    // applied the current config, there's nothing new to pick up yet.
+    int64_t lastConfigPollMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+
     while (g_running.load()) {
         if (g_reloadRequested.exchange(false)) {
-            std::cout << "[daemon] SIGHUP received, reloading config from " << g_configPath << "\n";
+            std::cout << "[daemon] SIGHUP received, reloading [global] from " << g_configPath
+                       << " and every account's config from the database\n";
             reloadConfig(g_configPath);
         }
 
@@ -1859,6 +1962,20 @@ int main(int argc, char** argv) {
         int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count();
+
+        // Config poll - see GlobalConfig::configPollIntervalSec's own doc
+        // comment for why this is a separate, much longer timer than the
+        // watchdogs below rather than checking every ~200ms tick. Same
+        // reloadConfig() the SIGHUP handler above calls - this is just an
+        // additional trigger, not a different code path, so a `gendb
+        // config set` still takes effect even if its best-effort SIGHUP
+        // never reached this process (daemon not running yet when it
+        // ran, stale/missing pidfile, etc).
+        if (nowMs - lastConfigPollMs >= static_cast<int64_t>(g_global.configPollIntervalSec) * 1000) {
+            lastConfigPollMs = nowMs;
+            reloadConfig(g_configPath);
+        }
+
         for (auto& [name, sipAccount] : g_sipAccounts) {
             // Don't fight the Signal websocket watchdog below: if that
             // account's credentials were rejected (401/403/4401 - see
@@ -1992,5 +2109,10 @@ int main(int argc, char** argv) {
     while (!g_accounts.empty()) {
         teardownAccount(g_accounts.begin()->first);
     }
+    // Best-effort - if this fails, gendb's own /proc/<pid>/comm check
+    // (signalDaemonBestEffort()) still won't mistakenly signal a
+    // recycled pid, it'll just harmlessly skip once until the daemon
+    // restarts and overwrites the stale file.
+    ::unlink(pidFilePath(g_global).c_str());
     return 0;
 }
