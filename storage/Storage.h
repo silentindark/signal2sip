@@ -57,8 +57,10 @@ struct ResolvedContactRecord {
 // populated whenever the contact record has one (i.e. for any genuinely
 // mutual real contact, regardless of CDS/PNP status).
 struct SyncedContactRecord {
+    std::string e164; // '' if this contact has no phone number
     std::string aci, pni;
     Bytes profile_key;
+    std::string given_name, family_name; // '' if unset/not synced
     int64_t synced_at = 0;
 };
 
@@ -118,14 +120,24 @@ public:
     void saveResolvedContact(const std::string& e164, const std::string& aci, const std::string& pni);
     std::optional<ResolvedContactRecord> loadResolvedContact(const std::string& e164);
 
-    // e164 must include the leading '+'. Overwrites any existing row for
-    // this e164 on every sync (StorageServiceSync's caller is expected to
+    // e164 may be "" (a contact with no phone number, e.g. added via
+    // QR/username - see schema.sql's partial-unique-index comment), but
+    // e164 and aci must not BOTH be "" (caller's responsibility - see
+    // main.cpp's syncStorageContacts(), the only real caller). Upserts by
+    // e164 if non-empty, else by aci - matches this row against whichever
+    // of the two identifies it (StorageServiceSync's caller is expected to
     // just re-save every contact it fetches each time - a real contact's
-    // own ACI/PNI/profileKey essentially never changes, but a wrong stale
-    // cache is worse than a redundant write).
+    // own ACI/PNI/profileKey/name essentially never changes, but a wrong
+    // stale cache is worse than a redundant write).
     void saveSyncedContact(const std::string& e164, const std::string& aci, const std::string& pni,
-                           const Bytes& profileKey);
+                           const Bytes& profileKey, const std::string& givenName, const std::string& familyName);
     std::optional<SyncedContactRecord> loadSyncedContact(const std::string& e164);
+
+    // Same table as loadSyncedContact() but keyed by aci instead of e164 -
+    // used to resolve an incoming Signal caller (RingRTC's remotePeerId,
+    // always an ACI) back to their synced phone number/name for the
+    // X-Signal-* SIP header passthrough (see main.cpp's startSipDial()).
+    std::optional<SyncedContactRecord> loadSyncedContactByAci(const std::string& aci);
 
     // Deletes every row for this account across every table (identity
     // keypairs, prekeys, sessions, remote identities, resolved/synced

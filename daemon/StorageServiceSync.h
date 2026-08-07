@@ -25,6 +25,8 @@ struct StorageContact {
     std::string pni;  // may be empty
     std::string e164; // may be empty (e.g. a username-only contact)
     Bytes profileKey; // may be empty
+    std::string givenName;  // ContactRecord.givenName - may be empty
+    std::string familyName; // ContactRecord.familyName - may be empty
 };
 
 // Fetches every CONTACT record from the account's real StorageService

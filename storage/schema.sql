@@ -121,12 +121,27 @@ CREATE TABLE IF NOT EXISTS resolved_contact (
 -- meaningful for an account with a real account_entropy_pool (i.e. a
 -- gendb-linked account, not a bare gendb-registered one with no real
 -- contacts to sync in the first place).
+--
+-- Surrogate `id` PK, not (account_name, e164) as originally shipped - see
+-- Storage.cpp's migrateSyncedContactPrimaryKeyIfNeeded() for the live-DB
+-- migration this required. A real contact can have an aci with no e164 at
+-- all (added via QR/username, no phone number ever shared), which the
+-- original e164-keyed PK couldn't represent without every such contact
+-- colliding on the same empty-string key. e164 and aci are each unique
+-- per account only when non-empty (the two partial indexes below) - a
+-- synced record can legitimately have either empty, just never both.
 CREATE TABLE IF NOT EXISTS synced_contact (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
     account_name    TEXT NOT NULL REFERENCES account(account_name),
-    e164            TEXT NOT NULL,
+    e164            TEXT NOT NULL,          -- '' if this contact has no phone number
     aci             TEXT NOT NULL,          -- '' if this contact record has none
     pni             TEXT NOT NULL,
     profile_key     BLOB NOT NULL,          -- empty if none
-    synced_at       INTEGER NOT NULL,       -- unix seconds
-    PRIMARY KEY (account_name, e164)
+    given_name      TEXT NOT NULL DEFAULT '', -- ContactRecord.givenName, '' if unset
+    family_name     TEXT NOT NULL DEFAULT '', -- ContactRecord.familyName, '' if unset
+    synced_at       INTEGER NOT NULL        -- unix seconds
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_synced_contact_e164
+    ON synced_contact(account_name, e164) WHERE e164 != '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_synced_contact_aci
+    ON synced_contact(account_name, aci) WHERE aci != '';

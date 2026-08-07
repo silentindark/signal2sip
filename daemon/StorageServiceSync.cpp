@@ -280,6 +280,12 @@ std::vector<StorageContact> fetchStorageContacts(AuthSocket& socket, const std::
         contact.pni = !c.pnibinary().empty() ? uuidBytesToStringOrEmpty(c.pnibinary()) : c.pni();
         contact.e164 = c.e164();
         contact.profileKey.assign(c.profilekey().begin(), c.profilekey().end());
+        // Already plaintext at this point (record was AES-GCM-decrypted
+        // above, same as every other ContactRecord field read here) - no
+        // separate profile-key decryption needed, unlike e.g. a profile's
+        // display-name fetched over GET /v1/profile/{uuid}.
+        contact.givenName = c.givenname();
+        contact.familyName = c.familyname();
         contacts.push_back(std::move(contact));
     }
     if (skipped > 0) {

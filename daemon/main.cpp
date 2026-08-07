@@ -349,9 +349,14 @@ void syncStorageContacts(AccountState& acct) {
         std::vector<StorageContact> contacts = fetchStorageContacts(*acct.socket, *acct.account.account_entropy_pool);
         int cachedCount = 0;
         for (const auto& contact : contacts) {
-            if (contact.e164.empty()) continue; // nothing to key resolveOutgoingTarget's cache by
+            // e164-less contacts (added via QR/username) are still worth
+            // caching by aci alone - see schema.sql's synced_contact
+            // comment - only a contact with neither identifier is truly
+            // unkeyable.
+            if (contact.e164.empty() && contact.aci.empty()) continue;
             try {
-                acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey);
+                acct.storage->saveSyncedContact(contact.e164, contact.aci, contact.pni, contact.profileKey,
+                                                contact.givenName, contact.familyName);
                 cachedCount++;
             } catch (const std::exception& e) {
                 // One bad row (e.g. a real DB constraint issue) shouldn't
@@ -364,7 +369,7 @@ void syncStorageContacts(AccountState& acct) {
             }
         }
         std::cout << "[daemon][" << acct.config.name << "] StorageService sync: " << contacts.size() << " contact(s), "
-                   << cachedCount << " cached (had an e164)\n";
+                   << cachedCount << " cached (had an e164 and/or aci)\n";
     } catch (const std::exception& e) {
         std::cerr << "[daemon][" << acct.config.name << "] StorageService sync failed (non-fatal): " << e.what()
                    << "\n";
@@ -793,6 +798,38 @@ void startSipDial(AccountState& acct) {
     pj::CallOpParam prm(true);
     prm.opt.audioCount = 1;
     prm.opt.videoCount = 0;
+
+    // Caller-info passthrough to the PBX, mirroring tg2sip-webrtc's proven
+    // X-TG-* header pattern (gateway.cpp's DialSip::operator()) so FreePBX
+    // can show/route on the real Signal caller's identity instead of just
+    // the bare "signal2sip-<account>" trunk name. UUID (the caller's ACI)
+    // is always known from RingRTC's remotePeerId; phone/name need a real
+    // synced contact record - only ever populated for a gendb-linked
+    // account with an actual contact list (see StorageServiceSync.h's own
+    // doc comment), so they're best-effort/optional.
+    if (!acct.remotePeerId.empty()) {
+        pj::SipHeader header;
+        header.hName = "X-Signal-UUID";
+        header.hValue = acct.remotePeerId;
+        prm.txOption.headers.push_back(header);
+
+        auto contact = acct.storage->loadSyncedContactByAci(acct.remotePeerId);
+        if (contact) {
+            if (!contact->e164.empty()) {
+                header.hName = "X-Signal-Phone";
+                header.hValue = contact->e164;
+                prm.txOption.headers.push_back(header);
+            }
+            std::string name = contact->given_name;
+            if (!contact->family_name.empty()) name += (name.empty() ? "" : " ") + contact->family_name;
+            if (!name.empty()) {
+                header.hName = "X-Signal-Name";
+                header.hValue = name;
+                prm.txOption.headers.push_back(header);
+            }
+        }
+    }
+
     try {
         call->makeCall(destUri, prm);
     } catch (pj::Error& err) {

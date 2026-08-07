@@ -91,6 +91,53 @@ std::optional<int64_t> columnInt64Opt(sqlite3_stmt* stmt, int index) {
     return sqlite3_column_int64(stmt, index);
 }
 
+bool tableExists(sqlite3* db, const char* name) {
+    Stmt stmt(db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?");
+    bindText(stmt, 1, name);
+    return sqlite3_step(stmt) == SQLITE_ROW;
+}
+
+// 2026-08-07 caller-ID passthrough work replaced synced_contact's original
+// PRIMARY KEY (account_name, e164) with a surrogate `id` (see schema.sql's
+// own comment on that table for why - an e164-only PK structurally can't
+// hold an ACI-only contact). Detects a database still on the old shape
+// (table exists but has no `id` column) and renames it aside so the fresh
+// CREATE TABLE IF NOT EXISTS in schema.sql creates the new shape; the
+// caller copies the old rows across afterward (see the constructor). No-op
+// on a brand-new database (table doesn't exist yet - kSchemaSql creates it
+// directly in the new shape) or one already migrated.
+void renameOldSyncedContactTableIfNeeded(sqlite3* db) {
+    if (!tableExists(db, "synced_contact")) return;
+    Stmt hasId(db, "SELECT 1 FROM pragma_table_info('synced_contact') WHERE name = 'id'");
+    if (sqlite3_step(hasId) == SQLITE_ROW) return; // already migrated
+
+    char* errmsg = nullptr;
+    if (sqlite3_exec(db, "ALTER TABLE synced_contact RENAME TO synced_contact_old_pk_migration", nullptr, nullptr,
+                      &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        throw std::runtime_error("failed to rename old synced_contact table for migration: " + err);
+    }
+}
+
+// Second half of the migration above - runs after kSchemaSql has created
+// the new-shape synced_contact, copying every row across. given_name/
+// family_name start empty for pre-existing rows (StorageServiceSync
+// backfills them on this account's next periodic sync).
+void copyOldSyncedContactDataIfPresent(sqlite3* db) {
+    if (!tableExists(db, "synced_contact_old_pk_migration")) return;
+    char* errmsg = nullptr;
+    const char* sql =
+        "INSERT INTO synced_contact (account_name, e164, aci, pni, profile_key, given_name, family_name, synced_at) "
+        "SELECT account_name, e164, aci, pni, profile_key, '', '', synced_at FROM synced_contact_old_pk_migration;"
+        "DROP TABLE synced_contact_old_pk_migration;";
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
+        std::string err = errmsg ? errmsg : "unknown error";
+        sqlite3_free(errmsg);
+        throw std::runtime_error("failed to migrate synced_contact data to new schema: " + err);
+    }
+}
+
 } // namespace
 
 Storage::Storage(const std::string& path, const std::string& key, const std::string& accountName)
@@ -154,12 +201,28 @@ Storage::Storage(const std::string& path, const std::string& key, const std::str
     }
     sqlite3_busy_timeout(db_, 5000);
 
+    try {
+        renameOldSyncedContactTableIfNeeded(db_);
+    } catch (const std::exception& e) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw;
+    }
+
     if (sqlite3_exec(db_, kSchemaSql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
         std::string err = errmsg ? errmsg : "unknown error";
         sqlite3_free(errmsg);
         sqlite3_close(db_);
         db_ = nullptr;
         throw std::runtime_error("failed to apply schema: " + err);
+    }
+
+    try {
+        copyOldSyncedContactDataIfPresent(db_);
+    } catch (const std::exception& e) {
+        sqlite3_close(db_);
+        db_ = nullptr;
+        throw;
     }
 }
 
@@ -397,33 +460,90 @@ std::optional<ResolvedContactRecord> Storage::loadResolvedContact(const std::str
 }
 
 void Storage::saveSyncedContact(const std::string& e164, const std::string& aci, const std::string& pni,
-                                const Bytes& profileKey) {
-    Stmt stmt(db_,
-        "INSERT INTO synced_contact (account_name, e164, aci, pni, profile_key, synced_at) VALUES (?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT (account_name, e164) DO UPDATE SET aci = excluded.aci, pni = excluded.pni, "
-        "profile_key = excluded.profile_key, synced_at = excluded.synced_at");
-    bindText(stmt, 1, accountName_);
-    bindText(stmt, 2, e164);
-    bindText(stmt, 3, aci);
-    bindText(stmt, 4, pni);
-    bindBlob(stmt, 5, profileKey);
-    sqlite3_bind_int64(stmt, 6, static_cast<int64_t>(std::time(nullptr)));
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        throw std::runtime_error(std::string("saveSyncedContact failed: ") + sqlite3_errmsg(db_));
+                                const Bytes& profileKey, const std::string& givenName,
+                                const std::string& familyName) {
+    // Not a single ON CONFLICT upsert: this table now has two independent
+    // partial-unique indexes (e164, aci - see schema.sql), and SQLite only
+    // supports one ON CONFLICT target per statement. Manually find whichever
+    // existing row (if any) this contact matches by e164 first, then aci,
+    // and UPDATE that row; INSERT a fresh one otherwise.
+    int64_t existingId = -1;
+    if (!e164.empty()) {
+        Stmt find(db_, "SELECT id FROM synced_contact WHERE account_name = ? AND e164 = ?");
+        bindText(find, 1, accountName_);
+        bindText(find, 2, e164);
+        if (sqlite3_step(find) == SQLITE_ROW) existingId = sqlite3_column_int64(find, 0);
+    }
+    if (existingId < 0 && !aci.empty()) {
+        Stmt find(db_, "SELECT id FROM synced_contact WHERE account_name = ? AND aci = ?");
+        bindText(find, 1, accountName_);
+        bindText(find, 2, aci);
+        if (sqlite3_step(find) == SQLITE_ROW) existingId = sqlite3_column_int64(find, 0);
+    }
+
+    int64_t now = static_cast<int64_t>(std::time(nullptr));
+    if (existingId >= 0) {
+        Stmt update(db_, "UPDATE synced_contact SET e164 = ?, aci = ?, pni = ?, profile_key = ?, given_name = ?, "
+                         "family_name = ?, synced_at = ? WHERE id = ?");
+        bindText(update, 1, e164);
+        bindText(update, 2, aci);
+        bindText(update, 3, pni);
+        bindBlob(update, 4, profileKey);
+        bindText(update, 5, givenName);
+        bindText(update, 6, familyName);
+        sqlite3_bind_int64(update, 7, now);
+        sqlite3_bind_int64(update, 8, existingId);
+        if (sqlite3_step(update) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("saveSyncedContact (update) failed: ") + sqlite3_errmsg(db_));
+        }
+        return;
+    }
+
+    Stmt insert(db_, "INSERT INTO synced_contact (account_name, e164, aci, pni, profile_key, given_name, "
+                     "family_name, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    bindText(insert, 1, accountName_);
+    bindText(insert, 2, e164);
+    bindText(insert, 3, aci);
+    bindText(insert, 4, pni);
+    bindBlob(insert, 5, profileKey);
+    bindText(insert, 6, givenName);
+    bindText(insert, 7, familyName);
+    sqlite3_bind_int64(insert, 8, now);
+    if (sqlite3_step(insert) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("saveSyncedContact (insert) failed: ") + sqlite3_errmsg(db_));
     }
 }
 
+namespace {
+SyncedContactRecord readSyncedContactRow(sqlite3_stmt* stmt) {
+    SyncedContactRecord result;
+    result.e164 = columnText(stmt, 0);
+    result.aci = columnText(stmt, 1);
+    result.pni = columnText(stmt, 2);
+    result.profile_key = columnBlob(stmt, 3);
+    result.given_name = columnText(stmt, 4);
+    result.family_name = columnText(stmt, 5);
+    result.synced_at = sqlite3_column_int64(stmt, 6);
+    return result;
+}
+} // namespace
+
 std::optional<SyncedContactRecord> Storage::loadSyncedContact(const std::string& e164) {
-    Stmt stmt(db_, "SELECT aci, pni, profile_key, synced_at FROM synced_contact WHERE account_name = ? AND e164 = ?");
+    Stmt stmt(db_, "SELECT e164, aci, pni, profile_key, given_name, family_name, synced_at FROM synced_contact "
+                   "WHERE account_name = ? AND e164 = ?");
     bindText(stmt, 1, accountName_);
     bindText(stmt, 2, e164);
     if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
-    SyncedContactRecord result;
-    result.aci = columnText(stmt, 0);
-    result.pni = columnText(stmt, 1);
-    result.profile_key = columnBlob(stmt, 2);
-    result.synced_at = sqlite3_column_int64(stmt, 3);
-    return result;
+    return readSyncedContactRow(stmt);
+}
+
+std::optional<SyncedContactRecord> Storage::loadSyncedContactByAci(const std::string& aci) {
+    Stmt stmt(db_, "SELECT e164, aci, pni, profile_key, given_name, family_name, synced_at FROM synced_contact "
+                   "WHERE account_name = ? AND aci = ?");
+    bindText(stmt, 1, accountName_);
+    bindText(stmt, 2, aci);
+    if (sqlite3_step(stmt) != SQLITE_ROW) return std::nullopt;
+    return readSyncedContactRow(stmt);
 }
 
 void Storage::deleteAccount() {
