@@ -121,7 +121,14 @@ struct AuthSocket::Impl {
         currentWsi = wsi;
 
         std::unique_lock<std::mutex> lock(connectMutex);
-        bool ok = connectCv.wait_for(lock, std::chrono::seconds(15),
+        // 20s, not 15s: some accounts' handshake to chat.signal.org
+        // routinely runs a bit past 15s (see the lws_set_timeout() call
+        // below for why giving up early used to cause a live flap loop) -
+        // this is no longer just a race-window tradeoff since an abandoned
+        // attempt now gets force-killed rather than left to complete in
+        // the background, so the only cost of a bigger number is a slower
+        // failure report on a genuinely dead connection.
+        bool ok = connectCv.wait_for(lock, std::chrono::seconds(20),
                                      [this] { return connected || connectFailed; });
         if (!ok) {
             // Mark this exact attempt abandoned (see abandonedWsi's own
@@ -130,6 +137,27 @@ struct AuthSocket::Impl {
             // than silently starting to use a connection this function
             // already told its caller failed.
             abandonedWsi = wsi;
+
+            // Actually kill the still-progressing handshake at the
+            // transport level instead of just walking away from it -
+            // otherwise it keeps handshaking unattended in the background
+            // and can still reach ESTABLISHED (isStaleWsi() catches that
+            // and refuses to use it, but not before the server has already
+            // briefly seen two live sessions for this device and kicked
+            // one with 4409 "Connected elsewhere" - live-observed
+            // 2026-08-08 as a self-sustaining ~30s flap loop on an account
+            // whose handshake routinely ran a bit past this function's own
+            // timeout). LWS_TO_KILL_ASYNC (not SYNC) because this runs on
+            // whatever thread called reconnect()/doConnect(), not the
+            // serviceThread that actually services this wsi via
+            // lws_service() - SYNC requires being that same thread.
+            // lws_cancel_service() wakes that loop so the kill happens
+            // promptly instead of waiting for its next poll timeout, same
+            // pattern enqueue() already uses above to hand off work
+            // cross-thread.
+            lws_set_timeout(wsi, PENDING_TIMEOUT_USER_OK, LWS_TO_KILL_ASYNC);
+            lws_cancel_service(context);
+
             throw std::runtime_error("timed out connecting to chat.signal.org");
         }
         if (connectFailed) throw std::runtime_error("websocket connect failed: " + connectError);
