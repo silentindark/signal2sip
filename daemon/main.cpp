@@ -36,6 +36,7 @@
 #include <deque>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -205,42 +206,92 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
 class EnvelopeDispatchQueue {
 public:
     void start() {
-        worker_ = std::thread([this] { run(); });
+        state_ = std::make_shared<State>();
+        worker_ = std::thread([state = state_] { run(state); });
     }
 
     void push(std::function<void()> work) {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queue_.push_back(std::move(work));
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->queue.push_back(std::move(work));
         }
-        cv_.notify_one();
+        state_->cv.notify_one();
     }
 
     // Drains whatever's queued, stops, and joins the worker - call once
     // from main()'s shutdown sequence, before destroying anything queued
     // work might reference.
+    //
+    // Bounded: run()'s loop only checks stopping *between* work items, so
+    // if the in-flight item is itself blocked (e.g. a network call inside a
+    // reconnect handler, observed live 2026-08-07 stalling shutdown for a
+    // full 30s until systemd SIGKILLed the whole daemon), an unbounded
+    // join() here blocks teardownAccount() for every account queued behind
+    // this one, and with enough accounts configured that alone can exceed
+    // systemd's TimeoutStopSec. If the worker hasn't finished within
+    // kJoinTimeout, give up on joining it and return anyway - the worker
+    // will still exit whenever its stuck call eventually returns.
+    //
+    // State is heap-allocated and kept alive via shared_ptr (captured by
+    // value in both the worker's and the waiter's lambdas) specifically so
+    // an abandoned join is memory-safe on *this* object's own bookkeeping:
+    // the caller is free to destroy this EnvelopeDispatchQueue (and the
+    // AccountState that owns it) right after stopAndJoin() returns, even
+    // though the worker thread may still be running - it keeps its own
+    // reference to State alive and touches nothing here once detached. The
+    // join itself happens on a dedicated waiter thread that takes ownership
+    // of worker_ by move, rather than racing worker_.join()/detach() from
+    // two threads against the same std::thread object, which would be UB.
+    //
+    // What this does NOT make safe: the in-flight work() item itself may
+    // still reference other AccountState fields (bridge, socket, storage)
+    // that teardownAccount() destroys right after this returns. That
+    // residual use-after-free risk, only reachable if a work item is still
+    // stuck past kJoinTimeout, is accepted as the lesser evil versus a
+    // guaranteed process-wide SIGKILL.
     void stopAndJoin() {
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->stopping = true;
         }
-        cv_.notify_one();
-        if (worker_.joinable()) worker_.join();
+        state_->cv.notify_one();
+        if (!worker_.joinable()) return;
+
+        static constexpr auto kJoinTimeout = std::chrono::seconds(5);
+        std::promise<void> joined;
+        std::future<void> joinedFuture = joined.get_future();
+        std::thread waiter([w = std::move(worker_), joined = std::move(joined)]() mutable {
+            w.join();
+            joined.set_value();
+        });
+        waiter.detach();
+
+        if (joinedFuture.wait_for(kJoinTimeout) != std::future_status::ready) {
+            std::cerr << "[daemon] envelope dispatch: worker still busy after "
+                      << kJoinTimeout.count() << "s, abandoning join to avoid blocking shutdown\n";
+        }
     }
 
 private:
-    void run() {
+    struct State {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::deque<std::function<void()>> queue;
+        bool stopping = false;
+    };
+
+    static void run(const std::shared_ptr<State>& state) {
         while (true) {
             std::function<void()> work;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-                if (queue_.empty()) {
-                    if (stopping_) return;
+                std::unique_lock<std::mutex> lock(state->mutex);
+                state->cv.wait(lock, [&state] { return state->stopping || !state->queue.empty(); });
+                if (state->queue.empty()) {
+                    if (state->stopping) return;
                     continue;
                 }
-                work = std::move(queue_.front());
-                queue_.pop_front();
+                work = std::move(state->queue.front());
+                state->queue.pop_front();
             }
             try {
                 work();
@@ -252,10 +303,7 @@ private:
         }
     }
 
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::deque<std::function<void()>> queue_;
-    bool stopping_ = false;
+    std::shared_ptr<State> state_;
     std::thread worker_;
 };
 
