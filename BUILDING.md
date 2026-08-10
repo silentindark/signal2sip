@@ -21,6 +21,10 @@ it clones each one as a sibling checkout next to this repo (`../libsignal`,
 `LIBSIGNAL_DIR`/`RINGRTC_DIR`/`PJPROJECT_DIR` cache variables to point
 elsewhere).
 
+See [`REQUIREMENTS.md`](REQUIREMENTS.md) for exactly what the build
+installs on your system (including the one package that comes from a
+third-party APT repo) and what the resulting binaries need at runtime.
+
 ## Running
 
 ```
