@@ -169,7 +169,7 @@ target_link_libraries(authsocket_test PRIVATE signal2sip_authsocket)
 
 # libsignal's C ABI (see /home/vlad/.claude/plans/jiggly-mapping-plum.md
 # Milestone B) - built via `cargo build -p libsignal-ffi` in the sibling
-# ~/GIT/vladonv/libsignal checkout. LIBSIGNAL_DIR lets that path be
+# ~/GIT/signal2sip/libsignal checkout. LIBSIGNAL_DIR lets that path be
 # overridden; signal_ffi.h is a checked-in generated file in that repo, not
 # a build artifact, so it's read straight from its source location.
 #
@@ -292,10 +292,10 @@ target_link_libraries(sip_bridge_codec_test PRIVATE PkgConfig::PJSIP)
 # RingRTC's Milestone D/E C ABI (see /home/vlad/.claude/plans/
 # jiggly-mapping-plum.md and this project's memory) - built via `cargo
 # build --features native --release` (no `prebuilt_webrtc`) in the
-# sibling ~/GIT/vladonv/ringrtc checkout, linking a from-source WebRTC
+# sibling ~/GIT/signal2sip/ringrtc checkout, linking a from-source WebRTC
 # static lib (`bin/gsync-webrtc` + `bin/build-desktop --webrtc-only -r`)
 # with the per-instance AUDIO_TRANSPORT fix baked in
-# (~/GIT/vladonv/webrtc/ringrtc/rffi/src/audio_device.cc - Signal's
+# (~/GIT/signal2sip/webrtc/ringrtc/rffi/src/audio_device.cc - Signal's
 # official prebuilt binary obviously doesn't have this). RELEASE, not
 # debug, purely to match what the original Signal-prebuilt path always
 # used - NOT because debug vs release was ever the cause of the "Failed
