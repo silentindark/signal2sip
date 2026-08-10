@@ -1,5 +1,5 @@
 // Hand-written header for RingRTC's Milestone E C ABI
-// (~/GIT/signal2sip/ringrtc/src/rust/src/cpp_ffi.rs) - kept in sync manually
+// (src/rust/src/cpp_ffi.rs in the sibling ../ringrtc checkout) - kept in sync manually
 // since that crate has no cbindgen setup of its own. Every function here
 // is a plain #[unsafe(no_mangle)] extern "C" fn, confirmed present with
 // `nm` against the built libringrtc.a.

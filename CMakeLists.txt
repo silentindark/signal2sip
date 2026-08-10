@@ -62,7 +62,7 @@ pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
 # release, to minimize unrelated behavior drift from the already-proven
 # 2.9 codepaths this project depends on elsewhere). /usr/local and
 # tg2sip-webrtc's own build are never touched by this.
-set(PJPROJECT_DIR "$ENV{HOME}/GIT/signal2sip/pjproject-tls/local-install" CACHE PATH
+set(PJPROJECT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pjproject-tls/local-install" CACHE PATH
     "Dedicated PJSIP 2.14.1+ install with OpenSSL 3 support - NOT /usr/local, which stays on 2.9 for tg2sip-webrtc")
 set(ENV{PKG_CONFIG_PATH} "${PJPROJECT_DIR}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 pkg_check_modules(PJSIP REQUIRED IMPORTED_TARGET libpjproject)
@@ -169,9 +169,10 @@ target_link_libraries(authsocket_test PRIVATE signal2sip_authsocket)
 
 # libsignal's C ABI (see /home/vlad/.claude/plans/jiggly-mapping-plum.md
 # Milestone B) - built via `cargo build -p libsignal-ffi` in the sibling
-# ~/GIT/signal2sip/libsignal checkout. LIBSIGNAL_DIR lets that path be
-# overridden; signal_ffi.h is a checked-in generated file in that repo, not
-# a build artifact, so it's read straight from its source location.
+# ../libsignal checkout (a directory up from this repo, not inside it -
+# see build-from-scratch.sh). LIBSIGNAL_DIR lets that path be overridden;
+# signal_ffi.h is a checked-in generated file in that repo, not a build
+# artifact, so it's read straight from its source location.
 #
 # signal_ffi.h is generated for C consumption and isn't quite valid C++:
 # two enums (SignalFfiPublicKeyType, SignalSvr2CredentialsResult) declare
@@ -190,7 +191,7 @@ target_link_libraries(authsocket_test PRIVATE signal2sip_authsocket)
 # C++ translation unit including it directly would silently C++-mangle
 # every declaration and then fail to link against those plain symbols.
 # Wrap the whole patched copy in extern "C" to match the real ABI.
-set(LIBSIGNAL_DIR "$ENV{HOME}/GIT/signal2sip/libsignal" CACHE PATH "Path to the libsignal checkout")
+set(LIBSIGNAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libsignal" CACHE PATH "Path to the libsignal checkout")
 file(READ ${LIBSIGNAL_DIR}/swift/Sources/SignalFfi/signal_ffi.h SIGNAL_FFI_H_CONTENT)
 string(REPLACE "enum SignalFfiPublicKeyType {" "enum SignalFfiPublicKeyType_Tag {" SIGNAL_FFI_H_CONTENT "${SIGNAL_FFI_H_CONTENT}")
 string(REPLACE "enum SignalSvr2CredentialsResult {" "enum SignalSvr2CredentialsResult_Tag {" SIGNAL_FFI_H_CONTENT "${SIGNAL_FFI_H_CONTENT}")
@@ -292,21 +293,22 @@ target_link_libraries(sip_bridge_codec_test PRIVATE PkgConfig::PJSIP)
 # RingRTC's Milestone D/E C ABI (see /home/vlad/.claude/plans/
 # jiggly-mapping-plum.md and this project's memory) - built via `cargo
 # build --features native --release` (no `prebuilt_webrtc`) in the
-# sibling ~/GIT/signal2sip/ringrtc checkout, linking a from-source WebRTC
-# static lib (`bin/gsync-webrtc` + `bin/build-desktop --webrtc-only -r`)
-# with the per-instance AUDIO_TRANSPORT fix baked in
-# (~/GIT/signal2sip/webrtc/ringrtc/rffi/src/audio_device.cc - Signal's
-# official prebuilt binary obviously doesn't have this). RELEASE, not
-# debug, purely to match what the original Signal-prebuilt path always
+# sibling ../ringrtc checkout (a directory up from this repo, not inside
+# it - see build-from-scratch.sh), linking a from-source WebRTC static lib
+# (`bin/gsync-webrtc` + `bin/build-desktop --webrtc-only -r`) with the
+# per-instance AUDIO_TRANSPORT fix baked in
+# (../webrtc/ringrtc/rffi/src/audio_device.cc, a sibling of ../ringrtc -
+# Signal's official prebuilt binary obviously doesn't have this). RELEASE,
+# not debug, purely to match what the original Signal-prebuilt path always
 # used - NOT because debug vs release was ever the cause of the "Failed
 # to setup SRTP crypto parameters" regression (that was tried as a
 # hypothesis and disproven: release reproduced the identical failure).
 # The actual cause was signal2sip-daemon's own link line reintroducing
 # the raw `webrtc` target's vendored libsrtp symbols alongside
 # webrtc_pjsip_safe - see the comment there.
-# native/ringrtc/signal2sip_ringrtc.h is hand-written (that crate has no
-# cbindgen setup) and kept in sync with cpp_ffi.rs manually.
-set(RINGRTC_DIR "$ENV{HOME}/GIT/signal2sip/ringrtc" CACHE PATH "Path to the ringrtc checkout")
+# ringrtc/signal2sip_ringrtc.h (this repo) is hand-written (that crate has
+# no cbindgen setup) and kept in sync with cpp_ffi.rs manually.
+set(RINGRTC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ringrtc" CACHE PATH "Path to the ringrtc checkout")
 add_library(ringrtc STATIC IMPORTED)
 set_target_properties(ringrtc PROPERTIES
     IMPORTED_LOCATION ${RINGRTC_DIR}/target/release/libringrtc.a

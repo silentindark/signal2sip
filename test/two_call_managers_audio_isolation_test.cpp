@@ -5,7 +5,7 @@
 // audio crossing over between them.
 //
 // Before today's fix, this was impossible in principle: ringrtc's own
-// C++ RFFI shim (~/GIT/signal2sip/webrtc/ringrtc/rffi/src/audio_device.cc,
+// C++ RFFI shim (../webrtc/ringrtc/rffi/src/audio_device.cc, a sibling checkout of ../ringrtc,
 // real upstream Signal code) kept its registered AudioTransport* in a
 // single process-wide global (AUDIO_TRANSPORT) that every
 // RingRTCAudioDeviceModule instance's RegisterAudioCallback() overwrote -

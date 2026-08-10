@@ -24,7 +24,7 @@
 // Concurrent calls across DIFFERENT accounts are fully supported (each
 // account has its own AuthSocket/ProtocolStores/RingRTC CallManager/
 // PJSIP Account) now that ringrtc's AUDIO_TRANSPORT global was made
-// per-instance (see ~/GIT/signal2sip/webrtc/ringrtc/rffi/src/audio_device.cc)
+// per-instance (see ../webrtc/ringrtc/rffi/src/audio_device.cc, a sibling checkout of ../ringrtc)
 // - two calls on two accounts no longer risk crossing audio.
 
 #include <algorithm>

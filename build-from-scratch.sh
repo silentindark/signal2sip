@@ -5,14 +5,14 @@
 # (OpenSSL-3-safe, isolated from any system/shared PJSIP install a box
 # might already have for something else, e.g. tg2sip-webrtc).
 #
-# Clones everything under ~/GIT/signal2sip/ to match CMakeLists.txt's own
-# default CACHE PATH values (LIBSIGNAL_DIR/RINGRTC_DIR/PJPROJECT_DIR) - no
-# -D overrides needed if this script is just run as-is.
+# Run this from wherever you cloned signal2sip/signal2sip - every
+# dependency gets cloned as a sibling checkout next to it (../ringrtc,
+# ../libsignal, ../pjproject-tls), matching CMakeLists.txt's own default
+# CACHE PATH values (LIBSIGNAL_DIR/RINGRTC_DIR/PJPROJECT_DIR, all relative
+# to CMAKE_CURRENT_SOURCE_DIR) - no -D overrides needed, and no assumption
+# about $HOME or any particular parent directory name.
 #
-# Needs, before running: a GH_TOKEN env var with at least read access to
-# the signal2sip/signal2sip repo (a fine-grained PAT is enough - this
-# script only ever clones/fetches it, never pushes). Everything else
-# (libsignal, ringrtc, webrtc, pjproject) is public.
+# Everything this clones (libsignal, ringrtc, webrtc, pjproject) is public.
 #
 # The webrtc step is genuinely heavy (depot_tools/gclient pulls WebRTC's
 # full third-party tree, tens of GB, then compiles it) - budget real time
@@ -21,8 +21,10 @@
 
 set -euo pipefail
 
-GIT_ROOT="$HOME/GIT/signal2sip"
-mkdir -p "$GIT_ROOT"
+# This script's own directory is the signal2sip checkout; dependencies go
+# one level up, as siblings of it - not a hardcoded ~/GIT/<anything>.
+SIGNAL2SIP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GIT_ROOT="$(dirname "$SIGNAL2SIP_DIR")"
 cd "$GIT_ROOT"
 
 # Pinned to what this project's own dev checkout uses as of 08-03 - bump
@@ -87,7 +89,7 @@ $SUDO apt-get install -y \
     libssl-dev libcurl4-openssl-dev libqrencode-dev \
     libwebsockets-dev nlohmann-json3-dev \
     protobuf-compiler libprotobuf-dev libsqlcipher-dev \
-    libclang-dev clang libpulse-dev
+    libclang-dev clang libpulse-dev libftxui-dev
 
 echo "=== [2/6] Rust toolchains (nightly for libsignal, 1.91.1 for ringrtc) ==="
 if ! command -v rustup >/dev/null 2>&1; then
@@ -143,12 +145,10 @@ if [ ! -f pjproject-tls/local-install/lib/pkgconfig/libpjproject.pc ]; then
 fi
 
 echo "=== [6/6] signal2sip itself ==="
-if [ ! -d signal2sip ]; then
-    : "${GH_TOKEN:?GH_TOKEN must be set to clone the signal2sip/signal2sip repo}"
-    git clone "https://oauth2:${GH_TOKEN}@github.com/signal2sip/signal2sip.git"
-fi
-mkdir -p signal2sip/build
-( cd signal2sip/build && cmake .. && cmake --build . -j"$(nproc)" )
+# No clone here - this script only runs from inside an existing
+# signal2sip checkout ($SIGNAL2SIP_DIR), so there's nothing to fetch.
+mkdir -p "$SIGNAL2SIP_DIR/build"
+( cd "$SIGNAL2SIP_DIR/build" && cmake .. && cmake --build . -j"$(nproc)" )
 
 echo "=== Done ==="
-ls -lh signal2sip/build/signal2sip-daemon signal2sip/build/signal2sip-gendb
+ls -lh "$SIGNAL2SIP_DIR/build/signal2sip-daemon" "$SIGNAL2SIP_DIR/build/signal2sip-gendb"
