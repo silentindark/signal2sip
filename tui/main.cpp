@@ -45,6 +45,13 @@
 // either, since there is nothing true to say about it from the database
 // alone. Revisit only if a lightweight "daemon periodically writes its
 // own last-known status" mechanism gets built later.
+//
+// All user-facing display text goes through i18n.h's tr()/format1(),
+// which picks a language from LC_ALL/LC_MESSAGES/LANG at startup (see
+// that header's own top comment) - config field identifiers and gendb
+// CLI arg values (sip_srtp/sip_transport/sip_tls_insecure/wizTransport)
+// are deliberately left untranslated, since those are real values sent
+// to signal2sip-gendb, not display text.
 
 #include <algorithm>
 #include <atomic>
@@ -68,9 +75,11 @@
 
 #include "daemon/Config.h"
 #include "storage/Storage.h"
+#include "tui/i18n.h"
 
 using namespace ftxui;
 using namespace signal2sip;
+using namespace signal2sip::i18n;
 
 namespace {
 
@@ -123,30 +132,24 @@ std::vector<ViewAccount> loadAccounts(const GlobalConfig& global, std::string& e
     return result;
 }
 
-std::string typeLabel(const ViewAccount& a) {
-    if (a.flow == "linked") return "linked";
-    if (a.flow == "standalone") return "primary";
-    return "?";
-}
-
 // Encryption status - see this file's own top comment for why
 // optional/disabled render identically (amber, "not guaranteed") while
 // only mandatory is green ("guaranteed"), and neither is ever red.
 Element mediaCell(const ViewAccount& a) {
     if (a.sip_host.empty()) return text("—") | color(kDim);
-    if (a.sip_srtp == "mandatory") return text("✓ mandatory") | color(kGood);
-    if (a.sip_srtp == "optional") return text("⚠ optional") | color(kAccent);
-    return text("⚠ disabled") | color(kAccent);
+    if (a.sip_srtp == "mandatory") return text(std::string("✓ ") + tr(Key::SrtpMandatory)) | color(kGood);
+    if (a.sip_srtp == "optional") return text(std::string("⚠ ") + tr(Key::SrtpOptional)) | color(kAccent);
+    return text(std::string("⚠ ") + tr(Key::StatusDisabled)) | color(kAccent);
 }
 
 Element enabledCell(const ViewAccount& a) {
-    if (a.enabled) return hbox({text("● ") | color(kGood), text("enabled")}) | color(kFg);
-    return hbox({text("● ") | color(kBorder), text("disabled")}) | color(kDim);
+    if (a.enabled) return hbox({text("● ") | color(kGood), text(tr(Key::StatusEnabled))}) | color(kFg);
+    return hbox({text("● ") | color(kBorder), text(tr(Key::StatusDisabled))}) | color(kDim);
 }
 
 Element typeCell(const ViewAccount& a) {
-    if (a.flow == "linked") return text("linked") | color(kLinked);
-    if (a.flow == "standalone") return text("primary") | color(kFg);
+    if (a.flow == "linked") return text(tr(Key::TypeLinked)) | color(kLinked);
+    if (a.flow == "standalone") return text(tr(Key::TypePrimary)) | color(kFg);
     return text("?") | color(kDim);
 }
 
@@ -168,20 +171,24 @@ std::string formatDate(const std::optional<int64_t>& epochSeconds) {
 Element signalingRow(const AccountRecord& a) {
     if (a.sip_host.empty()) return text("—") | color(kDim);
     if (a.sip_transport == "tls") return text("✓ TLS (sips:)") | color(kGood);
-    return text("⚠ UDP (не шифровано)") | color(kAccent);
+    return text(tr(Key::SignalingUdpInsecure)) | color(kAccent);
 }
 
 Element mediaRow(const AccountRecord& a) {
     if (a.sip_host.empty()) return text("—") | color(kDim);
-    if (a.sip_srtp == "mandatory") return text("✓ SRTP mandatory") | color(kGood);
-    if (a.sip_srtp == "optional") return text("⚠ SRTP не гарант. (optional)") | color(kAccent);
-    return text("⚠ SRTP не гарант. (disabled)") | color(kAccent);
+    if (a.sip_srtp == "mandatory") return text(std::string("✓ SRTP ") + tr(Key::SrtpMandatory)) | color(kGood);
+    std::string word = (a.sip_srtp == "optional") ? tr(Key::SrtpOptional) : tr(Key::StatusDisabled);
+    std::string prefix = tr(Key::MediaSrtpNotGuaranteedPrefix);
+    return text(prefix + "(" + word + ")") | color(kAccent);
 }
 
 // Screen 4 (SIP config editor) field list - `key` matches gendb's own
 // `config set <field>` names exactly (native/gendb/main.cpp's
 // configFields()), so edits round-trip through the same names on both
-// sides without a translation table to keep in sync.
+// sides without a translation table to keep in sync. `label` is
+// deliberately identical to `key`, and deliberately NOT run through
+// tr() - these are real field identifiers used with `signal2sip-gendb
+// config set`, not display text (see i18n.h's own top comment).
 struct ConfigFieldDef {
     std::string key;
     std::string label;
@@ -220,12 +227,12 @@ bool sipFieldsInUse(const std::map<std::string, std::string>& v) {
 std::vector<std::string> configErrors(const std::map<std::string, std::string>& v) {
     std::vector<std::string> errs;
     if (sipFieldsInUse(v)) {
-        if (v.at("sip_host").empty()) errs.push_back("sip_host обязателен, раз настраивается SIP");
-        if (v.at("sip_extension").empty()) errs.push_back("sip_extension обязателен, раз настраивается SIP");
-        if (v.at("sip_password").empty()) errs.push_back("sip_password обязателен, раз настраивается SIP");
+        if (v.at("sip_host").empty()) errs.push_back(tr(Key::ErrSipHostRequired));
+        if (v.at("sip_extension").empty()) errs.push_back(tr(Key::ErrSipExtensionRequired));
+        if (v.at("sip_password").empty()) errs.push_back(tr(Key::ErrSipPasswordRequired));
     }
     if (v.at("sip_transport") == "tls" && v.at("sip_tls_ca_file").empty() && v.at("sip_tls_insecure") != "yes") {
-        errs.push_back("sip_transport=tls требует sip_tls_ca_file или sip_tls_insecure=yes");
+        errs.push_back(tr(Key::ErrTlsRequiresCa));
     }
     return errs;
 }
@@ -237,7 +244,7 @@ std::vector<std::string> configErrors(const std::map<std::string, std::string>& 
 std::vector<std::string> configWarnings(const std::map<std::string, std::string>& v) {
     std::vector<std::string> warns;
     if (!v.at("sip_bridge_destination").empty() && !v.at("sip_bridge_did").empty()) {
-        warns.push_back("заданы и sip_bridge_destination, и sip_bridge_did - применится только sip_bridge_did");
+        warns.push_back(tr(Key::WarnBridgeBothSet));
     }
     return warns;
 }
@@ -316,9 +323,7 @@ int main(int argc, char** argv) {
     std::string configPath = resolveConfigPath(argc, argv);
     GlobalConfig global = loadGlobalConfigLenient(configPath);
     if (global.dbPath.empty() || global.dbKey.empty()) {
-        std::cerr << "signal2sip-tui: " << configPath
-                   << " has no usable [global] db_path/db_key - run signal2sip-gendb once first "
-                      "(it bootstraps [global] on a clean setup).\n";
+        std::cerr << "signal2sip-tui: " << configPath << tr(Key::StartupNoDbConfig);
         return 1;
     }
 
@@ -413,7 +418,7 @@ int main(int argc, char** argv) {
             combined += res.output;
             if (res.exitCode != 0) allOk = false;
         }
-        if (combined.empty()) combined = "(изменений нет)";
+        if (combined.empty()) combined = tr(Key::NoChanges);
         configSaveOutput = combined;
         configSaveOk = allOk;
         configSaveDone = true;
@@ -600,19 +605,19 @@ int main(int argc, char** argv) {
         Elements rows;
         rows.push_back(hbox({
                             text("") | size(WIDTH, EQUAL, 2),
-                            text("ИМЯ") | size(WIDTH, EQUAL, 18),
+                            text(tr(Key::ColName)) | size(WIDTH, EQUAL, 18),
                             text("E.164") | size(WIDTH, EQUAL, 16),
-                            text("ТИП") | size(WIDTH, EQUAL, 9),
-                            text("СТАТУС") | size(WIDTH, EQUAL, 12),
-                            text("МЕДИА") | flex,
+                            text(tr(Key::ColType)) | size(WIDTH, EQUAL, 9),
+                            text(tr(Key::ColStatus)) | size(WIDTH, EQUAL, 12),
+                            text(tr(Key::ColMedia)) | flex,
                         }) |
                         color(kDim));
         rows.push_back(separator() | color(kBorder));
 
         if (!loadError.empty()) {
-            rows.push_back(text("ошибка чтения БД: " + loadError) | color(kBad));
+            rows.push_back(text(tr(Key::DbReadError) + loadError) | color(kBad));
         } else if (accounts.empty()) {
-            rows.push_back(text("(нет аккаунтов - signal2sip-gendb <name> register/link)") | color(kDim));
+            rows.push_back(text(tr(Key::NoAccounts)) | color(kDim));
         }
 
         for (int i = 0; i < static_cast<int>(accounts.size()); i++) {
@@ -640,11 +645,11 @@ int main(int argc, char** argv) {
                             bgcolor(kBgAlt);
 
         Element footer = hbox({
-                              text(" ↑↓ выбор  "),
-                              text("↵ детали  "),
-                              text("n новый  "),
-                              text("r обновить  "),
-                              text("q выход  "),
+                              text(tr(Key::FooterSelect)),
+                              text(tr(Key::FooterDetails)),
+                              text(tr(Key::FooterNew)),
+                              text(tr(Key::FooterRefresh)),
+                              text(tr(Key::FooterQuit)),
                           }) |
                           color(kDim) | bgcolor(kBgAlt);
 
@@ -667,32 +672,34 @@ int main(int argc, char** argv) {
 
         idRows.push_back(kv("E.164", text(detail.e164) | color(kFg)));
         idRows.push_back(kv("ACI", text(detail.aci) | color(kDim)));
-        idRows.push_back(kv("Тип", detail.flow == "linked" ? text("linked") | color(kLinked)
-                                    : detail.flow == "standalone" ? text("primary") | color(kFg)
+        idRows.push_back(kv(tr(Key::ColType), detail.flow == "linked" ? text(tr(Key::TypeLinked)) | color(kLinked)
+                                    : detail.flow == "standalone" ? text(tr(Key::TypePrimary)) | color(kFg)
                                                                    : text("?") | color(kDim)));
-        idRows.push_back(kv(detail.flow == "linked" ? "Привязан" : "Зарегистрирован",
+        idRows.push_back(kv(detail.flow == "linked" ? tr(Key::DetailLinkedAt) : tr(Key::DetailRegisteredAt),
                             text(formatDate(detail.flow == "linked" ? detail.linked_at : detail.registered_at)) |
                                 color(kFg)));
 
         statusRows.push_back(
-            kv("Включён", detail.enabled ? hbox({text("● ") | color(kGood), text("да")}) | color(kFg)
-                                          : hbox({text("● ") | color(kBorder), text("нет")}) | color(kDim)));
+            kv(tr(Key::DetailEnabled), detail.enabled ? hbox({text("● ") | color(kGood), text(tr(Key::YesWord))}) |
+                                                             color(kFg)
+                                                       : hbox({text("● ") | color(kBorder), text(tr(Key::NoWord))}) |
+                                                             color(kDim)));
         if (detail.sip_host.empty()) {
-            statusRows.push_back(kv("SIP", text("— Signal-only, без SIP") | color(kDim)));
+            statusRows.push_back(kv("SIP", text(tr(Key::DetailSipNone)) | color(kDim)));
         } else {
             statusRows.push_back(kv("SIP", text(detail.sip_extension + "@" + detail.sip_host) | color(kFg)));
-            statusRows.push_back(kv("Сигнализация", signalingRow(detail)));
-            statusRows.push_back(kv("Медиа (RTP)", mediaRow(detail)));
+            statusRows.push_back(kv(tr(Key::DetailSignaling), signalingRow(detail)));
+            statusRows.push_back(kv(tr(Key::DetailMedia), mediaRow(detail)));
         }
 
         Elements body;
         if (!detailError.empty()) {
-            body.push_back(text("ошибка чтения аккаунта: " + detailError) | color(kBad));
+            body.push_back(text(tr(Key::AccountReadError) + detailError) | color(kBad));
         } else {
-            body.push_back(text("ИДЕНТИЧНОСТЬ") | color(kDim));
+            body.push_back(text(tr(Key::SectionIdentity)) | color(kDim));
             body.push_back(vbox(std::move(idRows)));
             body.push_back(text(""));
-            body.push_back(text("СТАТУС (из БД - не live-соединение)") | color(kDim));
+            body.push_back(text(tr(Key::SectionStatus)) | color(kDim));
             body.push_back(vbox(std::move(statusRows)));
         }
 
@@ -700,18 +707,18 @@ int main(int argc, char** argv) {
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
-                                text("  Аккаунт: " + detailName) | color(kDim),
+                                text(tr(Key::DetailTitlebar) + detailName) | color(kDim),
                             }) |
                             bgcolor(kBgAlt);
 
         Element footer = hbox({
-                              text(" c настроить SIP  "),
-                              text(detail.enabled ? "d выключить  " : "d включить  "),
+                              text(tr(Key::FooterConfigureSip)),
+                              text(detail.enabled ? tr(Key::FooterDisable) : tr(Key::FooterEnable)),
                               text("u unregister  "),
                           }) |
                           color(kDim) | bgcolor(kBgAlt);
-        Element footer2 = hbox({text(" x ") | color(kBad), text("удалить аккаунт  ") | color(kBad),
-                                text("esc назад  ") | color(kDim)}) |
+        Element footer2 = hbox({text(" x ") | color(kBad), text(tr(Key::FooterDeleteAccount)) | color(kBad),
+                                text(tr(Key::FooterBack)) | color(kDim)}) |
                           bgcolor(kBgAlt);
 
         return vbox({
@@ -731,30 +738,20 @@ int main(int argc, char** argv) {
     // warning shown BEFORE confirming matches what actually happens.
     auto actionTitle = [&](PendingAction action) -> std::string {
         switch (action) {
-            case PendingAction::Enable: return "включить " + detailName + "?";
-            case PendingAction::Disable: return "выключить " + detailName + "?";
-            case PendingAction::Unregister: return "unregister " + detailName + "?";
-            case PendingAction::DeleteAccount: return "⚠ удалить аккаунт " + detailName;
+            case PendingAction::Enable: return format1(Key::ActionEnableTitle, detailName);
+            case PendingAction::Disable: return format1(Key::ActionDisableTitle, detailName);
+            case PendingAction::Unregister: return format1(Key::ActionUnregisterTitle, detailName);
+            case PendingAction::DeleteAccount: return format1(Key::ActionDeleteTitle, detailName);
             case PendingAction::None: return "";
         }
         return "";
     };
     auto actionBody = [&](PendingAction action) -> std::string {
         switch (action) {
-            case PendingAction::Enable:
-                return "Демон снова поднимет Signal-сессию и SIP для этого аккаунта в течение 30с "
-                       "(или сразу по SIGHUP).";
-            case PendingAction::Disable:
-                return "Демон перестанет поднимать SIP и Signal-сессию для этого аккаунта в течение 30с "
-                       "(или сразу по SIGHUP). Входящие звонки перестанут доходить. Обратимо - enable "
-                       "вернёт как было.";
-            case PendingAction::Unregister:
-                return "Реальный, но обратимый серверный флаг (fetchesMessages=false) - номер станет "
-                       "недоступен для входящих Signal-сообщений до reactivate. Локальные данные не "
-                       "трогает.";
-            case PendingAction::DeleteAccount:
-                return "Необратимо. Реальный DELETE /v1/accounts/me на сервере Signal - номер "
-                       "освобождается для чужой регистрации, локальные ключи стираются при успехе.";
+            case PendingAction::Enable: return tr(Key::ActionEnableBody);
+            case PendingAction::Disable: return tr(Key::ActionDisableBody);
+            case PendingAction::Unregister: return tr(Key::ActionUnregisterBody);
+            case PendingAction::DeleteAccount: return tr(Key::ActionDeleteBody);
             case PendingAction::None: return "";
         }
         return "";
@@ -765,38 +762,40 @@ int main(int argc, char** argv) {
         Elements body;
 
         if (lastResult) {
-            body.push_back(text(lastResult->exitCode == 0 ? "✓ выполнено" : "✗ ошибка (код " +
-                                                                  std::to_string(lastResult->exitCode) + ")") |
+            body.push_back(text(lastResult->exitCode == 0 ? tr(Key::ResultDone)
+                                                            : format1(Key::ResultError, lastResult->exitCode)) |
                            color(lastResult->exitCode == 0 ? kGood : kBad));
             body.push_back(text(""));
             std::string out = lastResult->output;
             if (out.size() > 2000) out = out.substr(0, 2000) + "…"; // keep the dialog on-screen
             body.push_back(paragraphAlignLeft(out) | color(kDim));
             body.push_back(text(""));
-            body.push_back(text("любая клавиша - к списку") | color(kDim));
+            body.push_back(text(tr(Key::AnyKeyToList)) | color(kDim));
         } else {
             body.push_back(paragraphAlignLeft(actionBody(pending)) | color(kFg));
             if (severe) {
                 body.push_back(text(""));
-                body.push_back(hbox({text("введите имя аккаунта: ") | color(kDim),
+                body.push_back(hbox({text(tr(Key::TypeAccountName)) | color(kDim),
                                      text(typedConfirm) | color(kAccent),
                                      text("█") | color(kAccent)}));
             }
         }
 
-        Element dialogHead = text(" " + (lastResult ? ("Аккаунт: " + detailName) : actionTitle(pending))) |
+        Element dialogHead = text(" " + (lastResult ? (tr(Key::ConfirmAccountLabel) + detailName)
+                                                     : actionTitle(pending))) |
                               color(severe ? kBad : kAccent) | bgcolor(kBgAlt);
 
         Element dialogFooter;
         if (lastResult) {
-            dialogFooter = text(" любая клавиша - к списку ") | color(kDim) | bgcolor(kBgAlt);
+            dialogFooter = text(std::string(" ") + tr(Key::AnyKeyToList) + " ") | color(kDim) | bgcolor(kBgAlt);
         } else if (severe) {
-            dialogFooter = hbox({text(" esc отмена  "),
-                                 text(typedConfirm == detailName ? "enter удалить" : "(наберите имя полностью)") |
+            dialogFooter = hbox({text(tr(Key::FooterCancel)),
+                                 text(typedConfirm == detailName ? tr(Key::EnterDelete) : tr(Key::TypeNameInFull)) |
                                      color(typedConfirm == detailName ? kBad : kDim)}) |
                            color(kDim) | bgcolor(kBgAlt);
         } else {
-            dialogFooter = hbox({text(" esc отмена  "), text("y выполнить  ")}) | color(kDim) | bgcolor(kBgAlt);
+            dialogFooter =
+                hbox({text(tr(Key::FooterCancel)), text(tr(Key::FooterConfirm))}) | color(kDim) | bgcolor(kBgAlt);
         }
 
         Element dialog = vbox({
@@ -859,29 +858,29 @@ int main(int argc, char** argv) {
         }
         if (configSaveDone) {
             body.push_back(text(""));
-            body.push_back(text(configSaveOk ? "✓ сохранено" : "✗ ошибка сохранения") |
+            body.push_back(text(configSaveOk ? tr(Key::ConfigSaved) : tr(Key::ConfigSaveError)) |
                            color(configSaveOk ? kGood : kBad));
             std::string out = configSaveOutput;
             if (out.size() > 1500) out = out.substr(0, 1500) + "…";
             body.push_back(paragraphAlignLeft(out) | color(kDim));
             body.push_back(text(""));
-            body.push_back(text("любая клавиша - назад к аккаунту") | color(kDim));
+            body.push_back(text(tr(Key::AnyKeyBackToAccount)) | color(kDim));
         }
 
         Element titlebar = hbox({
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
-                                text("  Настройка SIP: " + detailName) | color(kDim),
+                                text(tr(Key::ConfigTitlebar) + detailName) | color(kDim),
                             }) |
                             bgcolor(kBgAlt);
 
         Element footer = hbox({
-                              text(" ↑↓/tab поле  "),
-                              text("текст: вводите  "),
-                              text("список: ↵ переключает  "),
-                              text("^O сохранить  "),
-                              text("esc назад  "),
+                              text(tr(Key::FooterField)),
+                              text(tr(Key::FooterTextType)),
+                              text(tr(Key::FooterListCycles)),
+                              text(tr(Key::FooterSave)),
+                              text(tr(Key::FooterBack)),
                           }) |
                           color(kDim) | bgcolor(kBgAlt);
 
@@ -985,88 +984,85 @@ int main(int argc, char** argv) {
 
         switch (wizardStep) {
             case WizardStep::ChooseType:
-                titleSuffix = "новый аккаунт";
-                body.push_back(fieldRow("имя аккаунта", wizName, wizField == 0));
-                body.push_back(fieldRow("способ", wizLink ? "link (QR)" : "register (SMS/звонок)", wizField == 1));
+                titleSuffix = tr(Key::WizardNewAccount);
+                body.push_back(fieldRow(tr(Key::FieldAccountName), wizName, wizField == 0));
+                body.push_back(fieldRow(tr(Key::FieldMethod), wizLink ? "link (QR)" : tr(Key::MethodRegister),
+                                        wizField == 1));
                 body.push_back(text(""));
-                body.push_back(text("имя - произвольная метка (буквы/цифры/-/_), Signal/SIP её не видят") |
-                               color(kDim));
+                body.push_back(text(tr(Key::WizardNameHint)) | color(kDim));
                 if (!wizError.empty()) {
                     body.push_back(text(""));
                     body.push_back(text("✗ " + wizError) | color(kBad));
                 }
-                footer = hbox({text(" ↑↓ поле  "), text("↵ переключить способ  "), text("^O далее  "),
-                              text("esc отмена  ")}) |
+                footer = hbox({text(tr(Key::FooterFieldPlain)), text(tr(Key::FooterToggleMethod)),
+                              text(tr(Key::FooterNext)), text(tr(Key::FooterCancel))}) |
                         color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::RegisterForm:
-                titleSuffix = "регистрация: " + wizName;
-                body.push_back(fieldRow("e164 (+380...)", wizE164, wizField == 0));
-                body.push_back(fieldRow("способ кода", wizTransport, wizField == 1));
+                titleSuffix = tr(Key::WizardRegistration) + wizName;
+                body.push_back(fieldRow("e164 (+...)", wizE164, wizField == 0));
+                body.push_back(fieldRow(tr(Key::FieldCodeMethod), wizTransport, wizField == 1));
                 if (!wizError.empty()) {
                     body.push_back(text(""));
                     body.push_back(text("✗ " + wizError) | color(kBad));
                 }
-                footer = hbox({text(" ↑↓ поле  "), text("↵ переключить способ кода  "), text("^O зарегистрировать  "),
-                              text("esc отмена  ")}) |
+                footer = hbox({text(tr(Key::FooterFieldPlain)), text(tr(Key::FooterToggleCodeMethod)),
+                              text(tr(Key::FooterRegister)), text(tr(Key::FooterCancel))}) |
                         color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::RegisterResult:
             case WizardStep::CaptchaResult:
-                titleSuffix = "результат: " + wizName;
+                titleSuffix = tr(Key::WizardResult) + wizName;
                 if (wizResult) {
-                    body.push_back(text(wizResult->exitCode == 0 ? "✓ выполнено" : "✗ ошибка (код " +
-                                                                        std::to_string(wizResult->exitCode) + ")") |
+                    body.push_back(text(wizResult->exitCode == 0 ? tr(Key::ResultDone)
+                                                                  : format1(Key::ResultError, wizResult->exitCode)) |
                                    color(wizResult->exitCode == 0 ? kGood : kBad));
                     body.push_back(text(""));
                     body.push_back(paragraphAlignLeft(wizResult->output) | color(kFg));
                 }
                 footer = wizardStep == WizardStep::RegisterResult
-                             ? hbox({text(" g captcha  "), text("v ввести код  "), text("esc к списку  ")}) |
+                             ? hbox({text(" g captcha  "), text(tr(Key::FooterEnterCode)),
+                                    text(tr(Key::FooterToList))}) |
                                    color(kDim) | bgcolor(kBgAlt)
-                             : hbox({text(" v ввести код  "), text("esc к списку  ")}) | color(kDim) |
-                                   bgcolor(kBgAlt);
+                             : hbox({text(std::string(" ") + tr(Key::FooterEnterCode)), text(tr(Key::FooterToList))}) |
+                                   color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::CaptchaForm:
-                titleSuffix = "captcha: " + wizName;
-                body.push_back(paragraphAlignLeft(
-                                   "Откройте в браузере: https://signalcaptchas.org/registration/generate.html - "
-                                   "решите капчу; она попробует перейти на signalcaptcha://<token> (переход не "
-                                   "сработает в обычном браузере, но токен останется виден в адресной строке).") |
-                               color(kDim));
+                titleSuffix = std::string("captcha: ") + wizName;
+                body.push_back(paragraphAlignLeft(tr(Key::CaptchaInstructions)) | color(kDim));
                 body.push_back(text(""));
-                body.push_back(fieldRow("токен", wizCaptchaToken, true));
-                footer = hbox({text(" вводите токен  "), text("^O отправить  "), text("esc отмена  ")}) |
+                body.push_back(fieldRow(tr(Key::FieldToken), wizCaptchaToken, true));
+                footer = hbox({text(tr(Key::FooterTypeToken)), text(tr(Key::FooterSubmit)),
+                              text(tr(Key::FooterCancel))}) |
                         color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::VerifyForm:
-                titleSuffix = "код подтверждения: " + wizName;
-                body.push_back(fieldRow("код из SMS/звонка", wizVerifyCode, true));
-                footer = hbox({text(" вводите код  "), text("^O подтвердить  "), text("esc отмена  ")}) |
+                titleSuffix = tr(Key::WizardVerify) + wizName;
+                body.push_back(fieldRow(tr(Key::FieldSmsCode), wizVerifyCode, true));
+                footer = hbox({text(tr(Key::FooterTypeCode)), text(tr(Key::FooterConfirmCode)),
+                              text(tr(Key::FooterCancel))}) |
                         color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::VerifyResult:
-                titleSuffix = "результат: " + wizName;
+                titleSuffix = tr(Key::WizardResult) + wizName;
                 if (wizResult) {
-                    body.push_back(text(wizResult->exitCode == 0 ? "✓ выполнено" : "✗ ошибка (код " +
-                                                                        std::to_string(wizResult->exitCode) + ")") |
+                    body.push_back(text(wizResult->exitCode == 0 ? tr(Key::ResultDone)
+                                                                  : format1(Key::ResultError, wizResult->exitCode)) |
                                    color(wizResult->exitCode == 0 ? kGood : kBad));
                     body.push_back(text(""));
                     body.push_back(paragraphAlignLeft(wizResult->output) | color(kFg));
                 }
-                footer = text(" любая клавиша - к списку ") | color(kDim) | bgcolor(kBgAlt);
+                footer = text(std::string(" ") + tr(Key::AnyKeyToList) + " ") | color(kDim) | bgcolor(kBgAlt);
                 break;
 
             case WizardStep::LinkWaiting: {
-                titleSuffix = "линковка: " + wizName;
-                body.push_back(text("Ожидание сканирования QR (до ~90с) - Signal на телефоне: Настройки → "
-                                    "Связанные устройства → Связать устройство") |
-                               color(kDim));
+                titleSuffix = tr(Key::WizardLinking) + wizName;
+                body.push_back(text(tr(Key::LinkWaitingInstructions)) | color(kDim));
                 body.push_back(text(""));
                 std::string out;
                 {
@@ -1074,20 +1070,21 @@ int main(int argc, char** argv) {
                     out = linkOutput;
                 }
                 pushLines(body, out);
-                footer = text(" esc отменить ожидание ") | color(kDim) | bgcolor(kBgAlt);
+                footer = text(tr(Key::FooterCancelWaiting)) | color(kDim) | bgcolor(kBgAlt);
                 break;
             }
 
             case WizardStep::LinkResult:
-                titleSuffix = "линковка: " + wizName;
+                titleSuffix = tr(Key::WizardLinking) + wizName;
                 if (wizResult) {
-                    body.push_back(text(wizResult->exitCode == 0 ? "✓ выполнено" : "✗ ошибка/отменено (код " +
-                                                                        std::to_string(wizResult->exitCode) + ")") |
+                    body.push_back(text(wizResult->exitCode == 0
+                                             ? tr(Key::ResultDone)
+                                             : format1(Key::ResultErrorCancelled, wizResult->exitCode)) |
                                    color(wizResult->exitCode == 0 ? kGood : kBad));
                     body.push_back(text(""));
                     pushLines(body, wizResult->output);
                 }
-                footer = text(" любая клавиша - к списку ") | color(kDim) | bgcolor(kBgAlt);
+                footer = text(std::string(" ") + tr(Key::AnyKeyToList) + " ") | color(kDim) | bgcolor(kBgAlt);
                 break;
         }
 
@@ -1095,7 +1092,7 @@ int main(int argc, char** argv) {
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
                                 text("● ") | color(kBorder),
-                                text("  Новый аккаунт: " + titleSuffix) | color(kDim),
+                                text(tr(Key::WizardTitlebar) + titleSuffix) | color(kDim),
                             }) |
                             bgcolor(kBgAlt);
 
@@ -1168,13 +1165,13 @@ int main(int argc, char** argv) {
             if (wizardStep == WizardStep::ChooseType) {
                 if (ctrlO) {
                     if (wizName.empty()) {
-                        wizError = "укажите имя аккаунта";
+                        wizError = tr(Key::ErrEnterAccountName);
                         return true;
                     }
                     bool taken = std::any_of(accounts.begin(), accounts.end(),
                                              [&](const ViewAccount& a) { return a.name == wizName; });
                     if (taken) {
-                        wizError = "аккаунт с таким именем уже существует";
+                        wizError = tr(Key::ErrAccountExists);
                         return true;
                     }
                     wizError.clear();
@@ -1215,7 +1212,7 @@ int main(int argc, char** argv) {
             if (wizardStep == WizardStep::RegisterForm) {
                 if (ctrlO) {
                     if (wizE164.empty()) {
-                        wizError = "укажите e164";
+                        wizError = tr(Key::ErrEnterE164);
                         return true;
                     }
                     wizError.clear();
