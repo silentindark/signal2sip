@@ -1,13 +1,1 @@
-node_modules/
-layer1/data/
-qr.png
-qr-artifact.html
-spike3/tone.wav
-spike3/recorded.wav
-spike4/tone-mono.wav
-spike4/pjproject-audio-build/
-spike4/pjsua-audio-test
-spike4/pjsip-echo-test
-gateway/pjproject-audio-build/
-gateway/pjsip-gateway
-native/build/
+build/
