@@ -21,11 +21,12 @@ calling, and a PJSIP ring-buffer audio bridge, all per-account.
 ## Building
 
 See [`build-from-scratch.sh`](build-from-scratch.sh) for a full from-source
-build of every dependency (libsignal-ffi, ringrtc+webrtc, a dedicated PJSIP),
-or `cmake -B build && cmake --build build -j` if those are already built
-under `~/GIT/signal2sip/{libsignal,ringrtc,pjproject-tls}` (see
-`CMakeLists.txt`'s `LIBSIGNAL_DIR`/`RINGRTC_DIR`/`PJPROJECT_DIR` cache
-variables to point elsewhere).
+build of every dependency (libsignal-ffi, ringrtc+webrtc, a dedicated PJSIP) -
+it clones each one as a sibling checkout next to this repo (`../libsignal`,
+`../ringrtc`, `../pjproject-tls`). If those are already built, just
+`cmake -B build && cmake --build build -j` (see `CMakeLists.txt`'s
+`LIBSIGNAL_DIR`/`RINGRTC_DIR`/`PJPROJECT_DIR` cache variables to point
+elsewhere).
 
 ## Running
 
@@ -34,5 +35,17 @@ signal2sip-gendb <account-name> register --e164 <e164> sms   # or: link
 signal2sip-daemon /etc/signal2sip/signal2sip.conf
 ```
 
-See `daemon/Config.h` for the config file format and `systemd/signal2sip-daemon.service`
-for a deployable unit.
+## Config
+
+`signal2sip.conf` only ever holds one `[global]` section (`db_path`,
+`db_key`, plus a few daemon-wide tuning knobs) - it's created automatically
+on first run of `signal2sip-gendb` if missing (default `db_path`
+`/var/lib/signal2sip/signal2sip.db`, a fresh `db_key` generated only when no
+database already exists at that path yet). Everything per-account (SIP
+trunk settings, enabled flag, deployment config) lives in the `account`
+table of that same SQLCipher database, not in the file - manage it live via
+`signal2sip-gendb <name> config get|set|list` / `enable|disable`, or
+interactively through `signal2sip-tui` (account list -> detail -> SIP config
+editor screen, which just drives the same `gendb config set` calls under the
+hood). No daemon restart required either way - see `daemon/Config.h` for the
+full format and `systemd/signal2sip-daemon.service` for a deployable unit.
