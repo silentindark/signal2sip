@@ -78,7 +78,7 @@ $SUDO apt-get update -y
 if ! apt-cache policy lld-21 2>/dev/null | grep -q "Candidate:.*[0-9]"; then
     $SUDO apt-get install -y wget gnupg
     CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
-    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | $SUDO gpg --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
+    wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | $SUDO gpg --batch --yes --dearmor -o /usr/share/keyrings/llvm-snapshot.gpg
     echo "deb [signed-by=/usr/share/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-21 main" | \
         $SUDO tee /etc/apt/sources.list.d/llvm.list >/dev/null
     $SUDO apt-get update -y
