@@ -89,11 +89,27 @@ const Color kBg = Color::RGB(0x0f, 0x12, 0x18);
 const Color kBgAlt = Color::RGB(0x17, 0x1b, 0x22);
 const Color kBorder = Color::RGB(0x2b, 0x32, 0x3d);
 const Color kFg = Color::RGB(0xda, 0xdd, 0xe3);
-const Color kDim = Color::RGB(0x6d, 0x75, 0x85);
+// +~15% over the concept mockup's original 0x6d/0x75/0x85 - that value
+// was barely legible on a plain terminal with no fancy theme. Applies
+// only to static UI chrome (nav hints, column headers, field labels) -
+// never to actual account data, which already uses kFg/status colors.
+const Color kDim = Color::RGB(0x7e, 0x87, 0x99);
 const Color kAccent = Color::RGB(0xe8, 0xa3, 0x3d);
 const Color kGood = Color::RGB(0x5c, 0xc9, 0xa7);
 const Color kBad = Color::RGB(0xe8, 0x68, 0x7a);
 const Color kLinked = Color::RGB(0x9e, 0xa6, 0xc9);
+
+// Footer/hint-bar key-binding renderer - "[KEY]" (bracketed, upper-case,
+// accent-colored) followed by its (already-translated) description in
+// dim text, e.g. keyHint("esc", tr(Key::FooterCancel)). Upper-casing is
+// purely cosmetic - key handling elsewhere in this file matches on
+// lower-case Event::Character (FTXUI reports the actual case typed),
+// unaffected by this.
+Element keyHint(const std::string& key, const std::string& desc, Color keyColor = kAccent) {
+    std::string upper = key;
+    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+    return hbox({text("[" + upper + "]") | color(keyColor), text(" " + desc + "  ") | color(kDim)});
+}
 
 struct ViewAccount {
     std::string name;
@@ -196,8 +212,10 @@ struct ConfigFieldDef {
     std::vector<std::string> options; // Enum only
 };
 
+// server_url is deliberately NOT in this list - it isn't a SIP setting
+// at all (it's Signal-side), so it lives in Screen 6 (renderSignalConfig
+// below) instead. See openSignalConfig()'s own comment.
 const std::vector<ConfigFieldDef> kConfigFields = {
-    {"server_url", "server_url", ConfigFieldDef::Kind::Text, {}},
     {"sip_host", "sip_host", ConfigFieldDef::Kind::Text, {}},
     {"sip_extension", "sip_extension", ConfigFieldDef::Kind::Text, {}},
     {"sip_password", "sip_password", ConfigFieldDef::Kind::Masked, {}},
@@ -374,8 +392,8 @@ int main(int argc, char** argv) {
     // Screen 4: SIP config editor. `editValues`/`originalValues` are both
     // keyed by ConfigFieldDef::key; `originalValues` is a snapshot taken
     // the moment the screen opens so saveConfig() only sends the fields
-    // that actually changed to gendb, instead of re-sending all 11 (which
-    // would also mean 11 separate config_version bumps / daemon reloads
+    // that actually changed to gendb, instead of re-sending all 10 (which
+    // would also mean 10 separate config_version bumps / daemon reloads
     // for a single-field edit).
     std::map<std::string, std::string> editValues;
     std::map<std::string, std::string> originalValues;
@@ -386,7 +404,6 @@ int main(int argc, char** argv) {
 
     auto openConfig = [&] {
         editValues.clear();
-        editValues["server_url"] = detail.server_url;
         editValues["sip_host"] = detail.sip_host;
         editValues["sip_extension"] = detail.sip_extension;
         editValues["sip_password"] = detail.sip_password;
@@ -422,6 +439,40 @@ int main(int argc, char** argv) {
         configSaveOutput = combined;
         configSaveOk = allOk;
         configSaveDone = true;
+    };
+
+    // Screen 6: Signal account settings - deliberately separate from
+    // Screen 4's SIP config editor. server_url isn't a SIP setting at
+    // all (it's Signal-side), and this is also the natural future home
+    // for SVR2 PIN management once that's built. Single field for now,
+    // so this doesn't need Screen 4's field-list/cursor machinery - same
+    // save-one-changed-field pattern via gendb `config set`, just for
+    // exactly one key.
+    std::string signalEditValue;
+    std::string signalOriginalValue;
+    bool signalSaveDone = false;
+    std::string signalSaveOutput;
+    bool signalSaveOk = true;
+
+    auto openSignalConfig = [&] {
+        signalEditValue = detail.server_url;
+        signalOriginalValue = signalEditValue;
+        signalSaveDone = false;
+        signalSaveOutput.clear();
+        screenIndex = 5;
+    };
+
+    auto saveSignalConfig = [&] {
+        if (signalEditValue == signalOriginalValue) {
+            signalSaveOutput = tr(Key::NoChanges);
+            signalSaveOk = true;
+        } else {
+            GendbResult res = runGendb(
+                gendbPath, {"--config", configPath, detailName, "config", "set", "server_url", signalEditValue});
+            signalSaveOutput = res.output;
+            signalSaveOk = res.exitCode == 0;
+        }
+        signalSaveDone = true;
     };
 
     // Screen 5: new-account wizard. Flow A (register/register-captcha/
@@ -644,14 +695,19 @@ int main(int argc, char** argv) {
                             }) |
                             bgcolor(kBgAlt);
 
-        Element footer = hbox({
-                              text(tr(Key::FooterSelect)),
-                              text(tr(Key::FooterDetails)),
-                              text(tr(Key::FooterNew)),
-                              text(tr(Key::FooterRefresh)),
-                              text(tr(Key::FooterQuit)),
+        // hflow (not hbox) for every footer/hint row in this file - a
+        // panel capped at kMaxPanelWidth (see the top-level Renderer)
+        // can be too narrow to fit every hint on one line, and hbox just
+        // clips instead of wrapping.
+        Element footer = hflow({
+                              text(" "),
+                              keyHint("↑↓", tr(Key::FooterSelect)),
+                              keyHint("↵", tr(Key::FooterDetails)),
+                              keyHint("n", tr(Key::FooterNew)),
+                              keyHint("r", tr(Key::FooterRefresh)),
+                              keyHint("q", tr(Key::FooterQuit)),
                           }) |
-                          color(kDim) | bgcolor(kBgAlt);
+                          bgcolor(kBgAlt);
 
         return vbox({
                    titlebar,
@@ -711,14 +767,18 @@ int main(int argc, char** argv) {
                             }) |
                             bgcolor(kBgAlt);
 
-        Element footer = hbox({
-                              text(tr(Key::FooterConfigureSip)),
-                              text(detail.enabled ? tr(Key::FooterDisable) : tr(Key::FooterEnable)),
-                              text("u unregister  "),
+        Element footer = hflow({
+                              text(" "),
+                              keyHint("c", tr(Key::FooterConfigureSip)),
+                              keyHint("s", tr(Key::FooterSignalSettings)),
+                              keyHint("d", detail.enabled ? tr(Key::FooterDisable) : tr(Key::FooterEnable)),
+                              keyHint("u", "unregister"),
                           }) |
-                          color(kDim) | bgcolor(kBgAlt);
-        Element footer2 = hbox({text(" x ") | color(kBad), text(tr(Key::FooterDeleteAccount)) | color(kBad),
-                                text(tr(Key::FooterBack)) | color(kDim)}) |
+                          bgcolor(kBgAlt);
+        Element footer2 = hflow({text(" "),
+                                hbox({text("[X]") | color(kBad), text(std::string(" ") + tr(Key::FooterDeleteAccount)) |
+                                                                      color(kBad)}),
+                                keyHint("esc", tr(Key::FooterBack))}) |
                           bgcolor(kBgAlt);
 
         return vbox({
@@ -789,13 +849,15 @@ int main(int argc, char** argv) {
         if (lastResult) {
             dialogFooter = text(std::string(" ") + tr(Key::AnyKeyToList) + " ") | color(kDim) | bgcolor(kBgAlt);
         } else if (severe) {
-            dialogFooter = hbox({text(tr(Key::FooterCancel)),
-                                 text(typedConfirm == detailName ? tr(Key::EnterDelete) : tr(Key::TypeNameInFull)) |
-                                     color(typedConfirm == detailName ? kBad : kDim)}) |
-                           color(kDim) | bgcolor(kBgAlt);
+            bool ready = typedConfirm == detailName;
+            dialogFooter = hflow({text(" "), keyHint("esc", tr(Key::FooterCancel)),
+                                 ready ? keyHint("enter", tr(Key::EnterDelete), kBad)
+                                       : text(tr(Key::TypeNameInFull)) | color(kDim)}) |
+                           bgcolor(kBgAlt);
         } else {
-            dialogFooter =
-                hbox({text(tr(Key::FooterCancel)), text(tr(Key::FooterConfirm))}) | color(kDim) | bgcolor(kBgAlt);
+            dialogFooter = hflow({text(" "), keyHint("esc", tr(Key::FooterCancel)),
+                                 keyHint("y", tr(Key::FooterConfirm))}) |
+                           bgcolor(kBgAlt);
         }
 
         Element dialog = vbox({
@@ -875,14 +937,15 @@ int main(int argc, char** argv) {
                             }) |
                             bgcolor(kBgAlt);
 
-        Element footer = hbox({
-                              text(tr(Key::FooterField)),
-                              text(tr(Key::FooterTextType)),
-                              text(tr(Key::FooterListCycles)),
-                              text(tr(Key::FooterSave)),
-                              text(tr(Key::FooterBack)),
+        Element footer = hflow({
+                              text(" "),
+                              keyHint("↑↓/tab", tr(Key::FooterField)),
+                              text(tr(Key::FooterTextType)) | color(kDim),
+                              keyHint("↵", tr(Key::FooterListCycles)),
+                              keyHint("^o", tr(Key::FooterSave)),
+                              keyHint("esc", tr(Key::FooterBack)),
                           }) |
-                          color(kDim) | bgcolor(kBgAlt);
+                          bgcolor(kBgAlt);
 
         return vbox({
                    titlebar,
@@ -892,6 +955,53 @@ int main(int argc, char** argv) {
                    footer,
                }) |
                border | color(errs.empty() ? kBorder : kBad) | bgcolor(kBg);
+    };
+
+    // Screen 6: Signal account settings (currently just server_url - see
+    // openSignalConfig()'s own comment on why this is a separate screen
+    // from Screen 4's SIP editor). Same single-active-field visual
+    // language as Screen 4, reduced to the one field there is.
+    auto renderSignalConfig = [&]() -> Element {
+        Elements body;
+        Element row = hbox({text("▸ ") | color(kAccent), text("server_url") | size(WIDTH, EQUAL, 24) | color(kDim),
+                            text((signalEditValue.empty() ? std::string("—") : signalEditValue) + "█") |
+                                color(kAccent)}) |
+                      bgcolor(Color::RGB(0x1c, 0x22, 0x2c));
+        body.push_back(row);
+        if (signalSaveDone) {
+            body.push_back(text(""));
+            body.push_back(text(signalSaveOk ? tr(Key::ConfigSaved) : tr(Key::ConfigSaveError)) |
+                           color(signalSaveOk ? kGood : kBad));
+            std::string out = signalSaveOutput;
+            if (out.size() > 1500) out = out.substr(0, 1500) + "…";
+            body.push_back(paragraphAlignLeft(out) | color(kDim));
+            body.push_back(text(""));
+            body.push_back(text(tr(Key::AnyKeyBackToAccount)) | color(kDim));
+        }
+
+        Element titlebar = hbox({
+                                text("● ") | color(kBorder),
+                                text("● ") | color(kBorder),
+                                text("● ") | color(kBorder),
+                                text(tr(Key::SignalConfigTitlebar) + detailName) | color(kDim),
+                            }) |
+                            bgcolor(kBgAlt);
+
+        Element footer = hflow({
+                              text(tr(Key::SignalConfigTypeText)) | color(kDim),
+                              keyHint("^o", tr(Key::FooterSave)),
+                              keyHint("esc", tr(Key::FooterBack)),
+                          }) |
+                          bgcolor(kBgAlt);
+
+        return vbox({
+                   titlebar,
+                   separator() | color(kBorder),
+                   vbox(std::move(body)) | flex | size(HEIGHT, GREATER_THAN, 3) | bgcolor(kBg) | color(kFg),
+                   separator() | color(kBorder),
+                   footer,
+               }) |
+               border | color(kBorder) | bgcolor(kBg);
     };
 
     // Screen 5: new-account wizard. One small field-row helper shared by
@@ -930,6 +1040,19 @@ int main(int argc, char** argv) {
                 out += in[i];
             }
             return out;
+        };
+        // Display-column count of a UTF-8 string built only from the
+        // block-drawing glyphs printQrAscii() uses (all single-column,
+        // none wide/combining) plus plain ASCII spaces - counts codepoints
+        // (bytes that aren't UTF-8 continuation bytes), not raw
+        // std::string::size() bytes, since each block glyph is a 3-byte
+        // UTF-8 sequence but occupies exactly one terminal column.
+        auto utf8ColumnWidth = [](const std::string& s) {
+            int n = 0;
+            for (unsigned char c : s) {
+                if ((c & 0xC0) != 0x80) n++;
+            }
+            return n;
         };
         auto emitPlainLines = [&](Elements& body, const std::string& segment) {
             std::string clean = stripAnsi(segment);
@@ -971,7 +1094,15 @@ int main(int argc, char** argv) {
             while (pos <= qrBlock.size()) {
                 size_t nl = qrBlock.find('\n', pos);
                 std::string line = (nl == std::string::npos) ? qrBlock.substr(pos) : qrBlock.substr(pos, nl - pos);
-                body.push_back(text(line) | color(Color::Black) | bgcolor(Color::White));
+                // Cap the white background to the QR's own rendered width
+                // instead of the default vbox behavior of stretching a
+                // text() child to the full panel width - otherwise the
+                // white quiet-zone box trails off into a wide rectangle
+                // past the code's right edge. The rest of the row then
+                // falls through to the surrounding vbox's own bgcolor(kBg)
+                // below, giving a square white box on the dark background.
+                body.push_back(text(line) | color(Color::Black) | bgcolor(Color::White) |
+                               size(WIDTH, EQUAL, utf8ColumnWidth(line)));
                 if (nl == std::string::npos) break;
                 pos = nl + 1;
             }
@@ -994,9 +1125,9 @@ int main(int argc, char** argv) {
                     body.push_back(text(""));
                     body.push_back(text("✗ " + wizError) | color(kBad));
                 }
-                footer = hbox({text(tr(Key::FooterFieldPlain)), text(tr(Key::FooterToggleMethod)),
-                              text(tr(Key::FooterNext)), text(tr(Key::FooterCancel))}) |
-                        color(kDim) | bgcolor(kBgAlt);
+                footer = hflow({text(" "), keyHint("↑↓", tr(Key::FooterField)), keyHint("↵", tr(Key::FooterToggleMethod)),
+                              keyHint("^o", tr(Key::FooterNext)), keyHint("esc", tr(Key::FooterCancel))}) |
+                        bgcolor(kBgAlt);
                 break;
 
             case WizardStep::RegisterForm:
@@ -1007,9 +1138,10 @@ int main(int argc, char** argv) {
                     body.push_back(text(""));
                     body.push_back(text("✗ " + wizError) | color(kBad));
                 }
-                footer = hbox({text(tr(Key::FooterFieldPlain)), text(tr(Key::FooterToggleCodeMethod)),
-                              text(tr(Key::FooterRegister)), text(tr(Key::FooterCancel))}) |
-                        color(kDim) | bgcolor(kBgAlt);
+                footer = hflow({text(" "), keyHint("↑↓", tr(Key::FooterField)),
+                              keyHint("↵", tr(Key::FooterToggleCodeMethod)), keyHint("^o", tr(Key::FooterRegister)),
+                              keyHint("esc", tr(Key::FooterCancel))}) |
+                        bgcolor(kBgAlt);
                 break;
 
             case WizardStep::RegisterResult:
@@ -1023,11 +1155,12 @@ int main(int argc, char** argv) {
                     body.push_back(paragraphAlignLeft(wizResult->output) | color(kFg));
                 }
                 footer = wizardStep == WizardStep::RegisterResult
-                             ? hbox({text(" g captcha  "), text(tr(Key::FooterEnterCode)),
-                                    text(tr(Key::FooterToList))}) |
-                                   color(kDim) | bgcolor(kBgAlt)
-                             : hbox({text(std::string(" ") + tr(Key::FooterEnterCode)), text(tr(Key::FooterToList))}) |
-                                   color(kDim) | bgcolor(kBgAlt);
+                             ? hflow({text(" "), keyHint("g", "captcha"), keyHint("v", tr(Key::FooterEnterCode)),
+                                    keyHint("esc", tr(Key::FooterToList))}) |
+                                   bgcolor(kBgAlt)
+                             : hflow({text(" "), keyHint("v", tr(Key::FooterEnterCode)),
+                                    keyHint("esc", tr(Key::FooterToList))}) |
+                                   bgcolor(kBgAlt);
                 break;
 
             case WizardStep::CaptchaForm:
@@ -1035,17 +1168,17 @@ int main(int argc, char** argv) {
                 body.push_back(paragraphAlignLeft(tr(Key::CaptchaInstructions)) | color(kDim));
                 body.push_back(text(""));
                 body.push_back(fieldRow(tr(Key::FieldToken), wizCaptchaToken, true));
-                footer = hbox({text(tr(Key::FooterTypeToken)), text(tr(Key::FooterSubmit)),
-                              text(tr(Key::FooterCancel))}) |
-                        color(kDim) | bgcolor(kBgAlt);
+                footer = hflow({text(tr(Key::FooterTypeToken)) | color(kDim), keyHint("^o", tr(Key::FooterSubmit)),
+                              keyHint("esc", tr(Key::FooterCancel))}) |
+                        bgcolor(kBgAlt);
                 break;
 
             case WizardStep::VerifyForm:
                 titleSuffix = tr(Key::WizardVerify) + wizName;
                 body.push_back(fieldRow(tr(Key::FieldSmsCode), wizVerifyCode, true));
-                footer = hbox({text(tr(Key::FooterTypeCode)), text(tr(Key::FooterConfirmCode)),
-                              text(tr(Key::FooterCancel))}) |
-                        color(kDim) | bgcolor(kBgAlt);
+                footer = hflow({text(tr(Key::FooterTypeCode)) | color(kDim), keyHint("^o", tr(Key::FooterConfirm)),
+                              keyHint("esc", tr(Key::FooterCancel))}) |
+                        bgcolor(kBgAlt);
                 break;
 
             case WizardStep::VerifyResult:
@@ -1070,7 +1203,7 @@ int main(int argc, char** argv) {
                     out = linkOutput;
                 }
                 pushLines(body, out);
-                footer = text(tr(Key::FooterCancelWaiting)) | color(kDim) | bgcolor(kBgAlt);
+                footer = hflow({text(" "), keyHint("esc", tr(Key::FooterCancelWaiting))}) | bgcolor(kBgAlt);
                 break;
             }
 
@@ -1106,12 +1239,24 @@ int main(int argc, char** argv) {
                border | color(kBorder) | bgcolor(kBg);
     };
 
+    // Cap the panel's own width on very large terminals instead of
+    // stretching a curses-style account manager edge to edge across a
+    // whole wide monitor - same idea as most TUI tools (htop, etc)
+    // staying a fixed comfortable width and just centering with blank
+    // space on either side once the terminal's wider than that. Screen 2
+    // (confirm dialog) already centers/caps itself via its own fixed-
+    // width dialog box, so it's excluded here to avoid double-centering
+    // it inside an even narrower column.
+    constexpr int kMaxPanelWidth = 110;
     Component root = Renderer([&] {
-        if (screenIndex == 0) return renderList();
-        if (screenIndex == 1) return renderDetail();
-        if (screenIndex == 2) return renderConfirm();
-        if (screenIndex == 3) return renderConfig();
-        return renderWizard();
+        Element content;
+        if (screenIndex == 0) content = renderList();
+        else if (screenIndex == 1) content = renderDetail();
+        else if (screenIndex == 2) return renderConfirm();
+        else if (screenIndex == 3) content = renderConfig();
+        else if (screenIndex == 5) content = renderSignalConfig();
+        else content = renderWizard();
+        return hbox({filler(), content | size(WIDTH, LESS_THAN, kMaxPanelWidth), filler()}) | bgcolor(kBg);
     });
 
     root = CatchEvent(root, [&](Event event) {
@@ -1383,6 +1528,41 @@ int main(int argc, char** argv) {
             return false;
         }
 
+        if (screenIndex == 5) {
+            if (signalSaveDone) {
+                // Same dismiss-and-refresh pattern as Screen 4's save
+                // result - any key returns to the detail screen with a
+                // freshly re-read account (server_url may have changed).
+                signalSaveDone = false;
+                screenIndex = 1;
+                try {
+                    Storage storage(global.dbPath, global.dbKey, detailName);
+                    detail = storage.loadAccount();
+                } catch (const std::exception& e) {
+                    detailError = e.what();
+                }
+                reload();
+                return true;
+            }
+            if (event == Event::Escape) {
+                screenIndex = 1; // discard edits, same as Screen 4
+                return true;
+            }
+            if (event == Event::Special(std::string(1, static_cast<char>(15)))) {
+                saveSignalConfig();
+                return true;
+            }
+            if (event == Event::Backspace) {
+                if (!signalEditValue.empty()) signalEditValue.pop_back();
+                return true;
+            }
+            if (event.is_character()) {
+                signalEditValue += event.character();
+                return true;
+            }
+            return false;
+        }
+
         if (screenIndex == 2) {
             if (lastResult) {
                 // Any key dismisses the result and returns to the list -
@@ -1473,6 +1653,10 @@ int main(int argc, char** argv) {
             openConfig();
             return true;
         }
+        if (event == Event::Character('s')) {
+            openSignalConfig();
+            return true;
+        }
         return false;
     });
 
@@ -1492,5 +1676,12 @@ int main(int argc, char** argv) {
         if (pidToKill > 0) ::kill(pidToKill, SIGTERM);
         linkThread.join();
     }
+    // ScreenInteractive::Fullscreen() doesn't use the terminal's alternate
+    // screen buffer, so without this the last-drawn frame (borders, QR,
+    // whatever screen was open) just sits there after quitting instead of
+    // leaving a clean terminal behind. Plain ANSI clear + cursor-home -
+    // deliberately not also clearing scrollback (`\x1b[3J`), only what's
+    // currently visible.
+    std::cout << "\x1b[2J\x1b[H" << std::flush;
     return 0;
 }
