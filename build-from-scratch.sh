@@ -56,12 +56,27 @@ WEBRTC_PATCH_COMMIT="4f5e63d65e606c9f7745e9a754e4f273023b63a8"
 # upstream pjsip/pjproject's own 2.14.1 tag directly - carries one real
 # patch on top: ssl_set_peer_name() (pjlib/src/pj/ssl_sock_ossl.c)
 # SIGSEGVs during the TLS handshake whenever sip_host is a hostname
-# (not an IP literal), a genuine PJSIP bug still present in 2.17 and
-# current master (confirmed live via gdb, and by diffing upstream's own
-# history - not fixed by any upstream commit). See
-# signal2sip/pjproject-tls#1 for the full writeup; verified fixed
-# 2026-08-10 with a real hostname-based TLS registration against
-# DPDZK's Asterisk.
+# (not an IP literal), a genuine PJSIP bug present in every version
+# checked from 2.14.1 through current master (confirmed live via gdb,
+# and by diffing upstream's own history - not fixed by any upstream
+# commit). See signal2sip/pjproject-tls#1 for the full writeup;
+# verified fixed 2026-08-10 with a real hostname-based TLS registration
+# against DPDZK's Asterisk.
+#
+# A 2.17 migration was attempted the same day (branch
+# signal2sip-2.17-sni-fix still exists, carries this same SNI fix plus
+# two cherry-picked upstream fixes - pjlib pool allocator hardening
+# 2a161e3b0, pjmedia/conference race fixes db33371d6+93410b161) but was
+# reverted: real calls (SIP side not answering) reliably SIGABRT the
+# daemon with a "double free or corruption" inside pjmedia's conference
+# bridge port-removal path (conf_port_on_destroy -> pj_pool_destroy_int),
+# root-caused as far as a likely trigger - RingRtcSipBridge's
+# audio_input_/audio_output_ ports get added then almost immediately
+# removed when the PBX side doesn't answer, racing 2.17's rewritten
+# async (op-queue + group-lock-deferred) port removal in a way neither
+# of those two upstream fixes fully covers - but not fixed. Stay on
+# 2.14.1 until that's actually root-caused; don't re-attempt the 2.17
+# move by just bumping this tag without addressing that first.
 PJPROJECT_TAG="2.14.1"
 PJPROJECT_BRANCH="signal2sip-2.14.1-sni-fix"
 

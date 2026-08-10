@@ -1,11 +1,47 @@
 #!/usr/bin/env python3
-"""Renames every plain-C global symbol BoringSSL's monolithic crypto module
-(bcm.o - the FIPS "BoringCrypto Module" object, which alone accounts for
-~450 of these) exports in ringrtc's prebuilt libwebrtc.a to a
-webrtcvendored_ prefix, plus every other archive member that references any
-of them, so a binary statically linking BOTH this archive AND system
-OpenSSL (libcrypto.so.3, dynamically) cannot have its own OpenSSL-API calls
-silently resolve into WebRTC's bundled BoringSSL instead.
+"""Renames every plain-C global symbol that the REAL system OpenSSL
+(libssl.so.3/libcrypto.so.3, queried directly rather than guessed) also
+exports - anywhere in ringrtc's prebuilt libwebrtc.a, not just its bcm.o
+crypto module (the FIPS "BoringCrypto Module" object, which alone
+accounts for ~450 of these) - to a webrtcvendored_ prefix, plus every
+other archive member that references any of them, so a binary statically
+linking BOTH this archive AND system OpenSSL (dynamically) cannot have
+its own OpenSSL-API calls silently resolve into WebRTC's bundled
+BoringSSL instead.
+
+Originally only harvested target symbols from bcm.o (crypto primitives:
+AES_*, EVP_*, BN_*, ...) - broadened 2026-08-10 after a second, separate
+collision hit the SSL/TLS protocol layer instead: PJSIP 2.17 re-enabled a
+previously-dead SSL_SESSION_free(ssl_sess) call in ssl_sock_ossl.c's
+init_openssl() (commented out in 2.14.1, "reenabled since OpenSSL 1.0.x
+has been EOL since 2019" upstream), and SSL_SESSION_free turned out to
+still be a plain, un-isolated T symbol in libwebrtc_pjsip_safe.a -
+defined in BoringSSL's third_party/boringssl/src/ssl/ (protocol-level
+C++ code, e.g. ssl_session.cc), a completely different part of the
+vendored copy than bcm.o. `nm` on the same archive turned up dozens more
+never-isolated SSL_*/SSL_CTX_*/SSL_SESSION_* names from that same ssl/
+directory - not a one-off, a whole uncovered class.
+
+First attempt at broadening this matched against a hand-written list of
+OpenSSL API prefixes (SSL_, EVP_, X509_, ...) - wrong approach, proven
+live: PJSIP's get_cert_info() calls GENERAL_NAMES_free() (plural - stack
+of GENERAL_NAME), which the prefix list's "GENERAL_NAME_" (singular)
+entry didn't match, so it stayed un-isolated and PJSIP's call bound
+straight into WebRTC's own (self-consistently renamed, but ABI-
+incompatible with system OpenSSL) GENERAL_NAMES_free - "free(): invalid
+pointer" heap corruption, confirmed via a live debug build's backtrace
+(get_cert_info -> GENERAL_NAMES_free -> webrtcvendored_ASN1_item_free ->
+glibc malloc detecting the corrupted chunk). A prefix list is exactly as
+complete as whoever wrote it remembered to make it, and OpenSSL's real
+API surface has too many pluralized/irregular names (GENERAL_NAMES_free,
+DIST_POINTS_free, POLICYQUALINFO_free, sk_X509_NAME_free, ...) to
+enumerate by hand reliably - already caught missing one on the very
+first real test. Fixed properly: query the actual system
+libssl.so.3/libcrypto.so.3 (via `nm -D`) for what they really export,
+and isolate exactly the WebRTC-archive symbols that are ALSO real system
+OpenSSL exports - no guessing, no prefix list to keep in sync, and
+structurally can't miss an irregular name the way a hand-written list
+can.
 
 Root cause (found 2026-08-06 investigating a real bug: StorageServiceSync.cpp's
 aesGcmDecrypt() - plain #include <openssl/evp.h>, EVP_aes_256_gcm() et al. -
@@ -23,21 +59,23 @@ resolution over the system library. Same root-cause class as this project's
 already-known libsrtp collision (see isolate_webrtc_srtp_symbols.py) - just
 hitting the AES-GCM/EVP surface instead of libsrtp's.
 
-Unlike the srtp case (17 known, individually-named vendored files), bcm.o
-is a single ~1.7MB monolithic object exporting ~850 global symbols (BoringSSL
-deliberately compiles its whole FIPS module boundary as one translation
-unit), of which ~450 are plain C names that are also real public OpenSSL API
-names (AES_*, BN_*, EC_*, EVP_*, DSA_*, DH_*, RSA_*, SHA*, ...) - the
-C++-mangled bssl::-namespaced ones are already collision-safe and are left
-alone. ~100 other members elsewhere in the archive hold their own internal,
-undefined references to these same names (WebRTC/BoringSSL code calling its
-own EVP_* etc. internally) and must be redefined in lockstep with bcm.o's
-definitions, or the archive becomes internally inconsistent. Rather than
-hand-enumerate those ~100 (fragile - would silently rot as ringrtc ships new
-webrtc.a builds), this operates on every one of the archive's ~2700 members
-unconditionally: extract, nm, redefine only if it references or (unexpectedly)
-also defines a target symbol, otherwise leave untouched. Slower than the
-srtp script's targeted approach but self-updating.
+Unlike the srtp case (17 known, individually-named vendored files),
+BoringSSL's public-API-shaped plain-C symbols are spread across a large,
+unpredictable set of members - bcm.o alone (BoringSSL's monolithic FIPS
+module boundary, one translation unit) exports ~850 global symbols, and
+the ssl/asn1/x509 protocol layers add many more from a different set of
+members entirely - the C++-mangled bssl::-namespaced ones throughout are
+already collision-safe and left alone. Rather than hand-enumerate which
+members hold these (fragile - already missed a whole class once, then
+missed an irregular name inside that class on the very next attempt),
+this scans every one of the archive's ~2700 members unconditionally in a
+first pass to collect target symbols (any plain-C name the archive
+defines that the real system libssl.so.3/libcrypto.so.3 also exports),
+then a second pass to redefine only members that reference or define
+one, leaving everything else untouched. Slower than the srtp script's
+targeted approach but self-updating and can't drift out of sync with
+what system OpenSSL actually exports, since it asks that library
+directly instead of trusting a list.
 
 Intended to run AFTER isolate_webrtc_srtp_symbols.py (chained in CMakeLists.txt)
 since the two touch an overlapping pair of members (aes_gcm_ossl.o,
@@ -54,8 +92,9 @@ while verifying the WebRTC fix actually worked - `nm -D` on the rebuilt
 daemon still didn't show EVP_aes_256_gcm resolving from libcrypto.so.3
 after isolating WebRTC's copy, because libsignal_ffi.a's copy - earlier on
 the link line than the real -lcrypto - silently took over instead. Same
-fix, same script: the bcm-module lookup below tries both known member
-names, picks whichever one the given archive actually has.
+fix, same script - querying real system OpenSSL's exports finds
+aws-lc-rs's plain-C names the same way it finds WebRTC's, no per-archive
+special-casing needed.
 
 Usage: isolate_webrtc_boringssl_symbols.py <input .a> <output .a>
 """
@@ -67,10 +106,38 @@ from pathlib import Path
 MAGIC = b"!<arch>\n"
 HDR_LEN = 60
 
-# Both known names for the BoringSSL-family "monolithic crypto module"
-# object file - WebRTC's own BoringSSL vendoring names it bcm.o, aws-lc-rs
-# (used by libsignal_ffi.a) names its equivalent bcm.cc.o.
-BCM_MEMBER_NAME_CANDIDATES = ("bcm.o", "bcm.cc.o")
+# The real system libraries a signal2sip binary actually dynamically
+# links against for OpenSSL - queried directly (see
+# system_openssl_exports() below) rather than guessed, so isolation
+# targets are exactly what could really collide, no more and no less.
+SYSTEM_OPENSSL_LIBS = ("libssl.so.3", "libcrypto.so.3")
+
+
+def find_system_lib(soname):
+    out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith(soname + " ") and "=>" in line:
+            return line.split("=>", 1)[1].strip()
+    print(f"ERROR: {soname} not found via `ldconfig -p` - is it installed?", file=sys.stderr)
+    sys.exit(1)
+
+
+def system_openssl_exports():
+    """Every symbol real system OpenSSL actually exports (defined, dynamic) -
+    the true collision surface, instead of a hand-maintained prefix guess."""
+    exports = set()
+    for soname in SYSTEM_OPENSSL_LIBS:
+        path = find_system_lib(soname)
+        out = subprocess.run(["nm", "-D", "--defined-only", path],
+                             capture_output=True, text=True, check=True).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] in "TtWwDdBbRr":
+                # Versioned symbols look like "ASN1_item_free@@OPENSSL_3.0.0" -
+                # strip the version suffix to match the archive's plain names.
+                exports.add(parts[2].split("@")[0])
+    return exports
 
 
 def parse_members(data):
@@ -123,40 +190,49 @@ def main():
     data = src_path.read_bytes()
     members = parse_members(data)
 
-    bcm_candidates = [m for m in members if m["name"] in BCM_MEMBER_NAME_CANDIDATES]
-    if len(bcm_candidates) != 1:
-        print(f"ERROR: expected exactly 1 member named one of {BCM_MEMBER_NAME_CANDIDATES}, "
-              f"found {len(bcm_candidates)}", file=sys.stderr)
-        sys.exit(1)
-    bcm = bcm_candidates[0]
-    bcm_member_name = bcm["name"]
+    system_syms = system_openssl_exports()
+    print(f"{len(system_syms)} symbols exported by real system "
+          f"{'/'.join(SYSTEM_OPENSSL_LIBS)}", file=sys.stderr)
+
+    def is_target_symbol(name):
+        # Only plain C names collide with system OpenSSL's public API - the
+        # C++-mangled bssl::-namespaced symbols are already safe (see
+        # isolate_webrtc_srtp_symbols.py's identical skip for the same
+        # reason). Isolate exactly what the real system library exports,
+        # not a guessed prefix - see this file's top-of-file comment for
+        # why a prefix list already proved unreliable.
+        return not name.startswith("_Z") and name in system_syms
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
 
-        bcm_probe = tmp / "bcm_probe.o"
-        bcm_probe.write_bytes(data[bcm["offset"]:bcm["offset"] + bcm["size"]])
-        bcm_defined, _ = nm_defined_and_undefined(bcm_probe)
-        # Only plain C names collide with system OpenSSL's public API - the
-        # C++-mangled bssl::-namespaced symbols are already safe (see
-        # isolate_webrtc_srtp_symbols.py's identical skip for the same reason).
-        target_syms = {s for s in bcm_defined if not s.startswith("_Z")}
-        print(f"{bcm_member_name}: {len(bcm_defined)} global symbols, "
-              f"{len(target_syms)} plain-C ones targeted for isolation", file=sys.stderr)
-
-        redefine_map = tmp / "redefine.map"
-        redefine_map.write_text("".join(f"{s} webrtcvendored_{s}\n" for s in sorted(target_syms)))
-
-        # Scan every member (not just bcm.o) for references to the target
-        # symbols - either as the definer (bcm.o itself) or as an internal
-        # undefined reference (WebRTC/BoringSSL code calling its own EVP_*
-        # etc.) - and redefine-syms only those, leaving everything else in
-        # the ~2700-member archive byte-identical.
-        touched = {}
+        # Single pass over every member: extract once, nm once, cache both
+        # its (defined, undefined) sets and its extracted path for reuse in
+        # the redefine step below - avoids re-extracting/re-nm'ing anything.
+        per_member = []
+        target_syms = set()
         for i, m in enumerate(members):
             p = tmp / f"mem_{i}.o"
             p.write_bytes(data[m["offset"]:m["offset"] + m["size"]])
             d, u = nm_defined_and_undefined(p)
+            per_member.append((m, p, d, u))
+            target_syms |= {s for s in d if is_target_symbol(s)}
+
+        print(f"{len(members)} members scanned, {len(target_syms)} plain-C "
+              f"OpenSSL/BoringSSL-API-shaped symbols targeted for isolation",
+              file=sys.stderr)
+
+        redefine_map = tmp / "redefine.map"
+        redefine_map.write_text("".join(f"{s} webrtcvendored_{s}\n" for s in sorted(target_syms)))
+
+        # A member is touched if it references any target symbol - either
+        # as the definer (e.g. bcm.o, or an ssl/ member like ssl_session.o)
+        # or as an internal undefined reference (WebRTC/BoringSSL code
+        # calling its own EVP_*/SSL_* etc. internally) - and gets
+        # redefine-syms'd; everything else in the ~2700-member archive
+        # stays byte-identical.
+        touched = {}
+        for m, p, d, u in per_member:
             if (d | u) & target_syms:
                 touched[m["hdr_offset"]] = p
 
