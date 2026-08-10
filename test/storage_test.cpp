@@ -146,7 +146,7 @@ int main() {
 
         storage.saveResolvedContact("+380000000099", "44444444-4444-4444-4444-444444444444", "");
         storage.saveSyncedContact("+380000000098", "55555555-5555-5555-5555-555555555555", "",
-                                  bytesFrom("profile-key-bytes"));
+                                  bytesFrom("profile-key-bytes"), "Test", "Contact");
         check(storage.loadResolvedContact("+380000000099").has_value(), "resolved_contact present before delete");
         check(storage.loadSyncedContact("+380000000098").has_value(), "synced_contact present before delete");
 
