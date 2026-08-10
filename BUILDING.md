@@ -21,6 +21,14 @@ it clones each one as a sibling checkout next to this repo (`../libsignal`,
 `LIBSIGNAL_DIR`/`RINGRTC_DIR`/`PJPROJECT_DIR` cache variables to point
 elsewhere).
 
+By default signal2sip itself builds Release, stripped of debug symbols
+(`daemon`/`gendb`/`tui` all carry a `-s` link flag scoped to Release only -
+see `CMakeLists.txt`). Pass `--debug` to build it with symbols kept
+instead: `./build-from-scratch.sh --debug`, or manually
+`cmake -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build -j`. Only
+signal2sip's own code is affected - libsignal-ffi/ringrtc/webrtc are
+always built release either way, regardless of this flag.
+
 See [`REQUIREMENTS.md`](REQUIREMENTS.md) for exactly what the build
 installs on your system (including the one package that comes from a
 third-party APT repo) and what the resulting binaries need at runtime.

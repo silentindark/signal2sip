@@ -18,8 +18,29 @@
 # full third-party tree, tens of GB, then compiles it) - budget real time
 # and disk (100GB+ free is a safe bet) for that one step specifically;
 # everything else here is comparatively quick.
+#
+# Usage: build-from-scratch.sh [--debug]
+#   --debug   build signal2sip itself with debug symbols kept (see
+#             CMAKE_BUILD_TYPE below) instead of the default stripped
+#             Release build.
 
 set -euo pipefail
+
+# --debug builds signal2sip itself (only - libsignal-ffi/ringrtc/webrtc
+# stay release either way, see below) with CMAKE_BUILD_TYPE=Debug instead
+# of the default Release, which keeps debug symbols instead of stripping
+# them (CMakeLists.txt's `-s` link option is scoped to
+# $<$<CONFIG:Release>:-s> for exactly this reason - see its own comment).
+CMAKE_BUILD_TYPE="Release"
+for arg in "$@"; do
+    case "$arg" in
+        --debug) CMAKE_BUILD_TYPE="Debug" ;;
+        *)
+            echo "usage: $0 [--debug]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # This script's own directory is the signal2sip checkout; dependencies go
 # one level up, as siblings of it - not a hardcoded ~/GIT/<anything>.
@@ -148,7 +169,7 @@ echo "=== [6/6] signal2sip itself ==="
 # No clone here - this script only runs from inside an existing
 # signal2sip checkout ($SIGNAL2SIP_DIR), so there's nothing to fetch.
 mkdir -p "$SIGNAL2SIP_DIR/build"
-( cd "$SIGNAL2SIP_DIR/build" && cmake .. && cmake --build . -j"$(nproc)" )
+( cd "$SIGNAL2SIP_DIR/build" && cmake -DCMAKE_BUILD_TYPE="$CMAKE_BUILD_TYPE" .. && cmake --build . -j"$(nproc)" )
 
 echo "=== Done ==="
 ls -lh "$SIGNAL2SIP_DIR/build/signal2sip-daemon" "$SIGNAL2SIP_DIR/build/signal2sip-gendb"
