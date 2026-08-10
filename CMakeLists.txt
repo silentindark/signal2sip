@@ -62,7 +62,7 @@ pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
 # release, to minimize unrelated behavior drift from the already-proven
 # 2.9 codepaths this project depends on elsewhere). /usr/local and
 # tg2sip-webrtc's own build are never touched by this.
-set(PJPROJECT_DIR "$ENV{HOME}/GIT/vladonv/pjproject-tls/local-install" CACHE PATH
+set(PJPROJECT_DIR "$ENV{HOME}/GIT/signal2sip/pjproject-tls/local-install" CACHE PATH
     "Dedicated PJSIP 2.14.1+ install with OpenSSL 3 support - NOT /usr/local, which stays on 2.9 for tg2sip-webrtc")
 set(ENV{PKG_CONFIG_PATH} "${PJPROJECT_DIR}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 pkg_check_modules(PJSIP REQUIRED IMPORTED_TARGET libpjproject)
@@ -190,7 +190,7 @@ target_link_libraries(authsocket_test PRIVATE signal2sip_authsocket)
 # C++ translation unit including it directly would silently C++-mangle
 # every declaration and then fail to link against those plain symbols.
 # Wrap the whole patched copy in extern "C" to match the real ABI.
-set(LIBSIGNAL_DIR "$ENV{HOME}/GIT/vladonv/libsignal" CACHE PATH "Path to the libsignal checkout")
+set(LIBSIGNAL_DIR "$ENV{HOME}/GIT/signal2sip/libsignal" CACHE PATH "Path to the libsignal checkout")
 file(READ ${LIBSIGNAL_DIR}/swift/Sources/SignalFfi/signal_ffi.h SIGNAL_FFI_H_CONTENT)
 string(REPLACE "enum SignalFfiPublicKeyType {" "enum SignalFfiPublicKeyType_Tag {" SIGNAL_FFI_H_CONTENT "${SIGNAL_FFI_H_CONTENT}")
 string(REPLACE "enum SignalSvr2CredentialsResult {" "enum SignalSvr2CredentialsResult_Tag {" SIGNAL_FFI_H_CONTENT "${SIGNAL_FFI_H_CONTENT}")
@@ -306,7 +306,7 @@ target_link_libraries(sip_bridge_codec_test PRIVATE PkgConfig::PJSIP)
 # webrtc_pjsip_safe - see the comment there.
 # native/ringrtc/signal2sip_ringrtc.h is hand-written (that crate has no
 # cbindgen setup) and kept in sync with cpp_ffi.rs manually.
-set(RINGRTC_DIR "$ENV{HOME}/GIT/vladonv/ringrtc" CACHE PATH "Path to the ringrtc checkout")
+set(RINGRTC_DIR "$ENV{HOME}/GIT/signal2sip/ringrtc" CACHE PATH "Path to the ringrtc checkout")
 add_library(ringrtc STATIC IMPORTED)
 set_target_properties(ringrtc PROPERTIES
     IMPORTED_LOCATION ${RINGRTC_DIR}/target/release/libringrtc.a

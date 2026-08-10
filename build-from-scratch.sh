@@ -5,12 +5,12 @@
 # (OpenSSL-3-safe, isolated from any system/shared PJSIP install a box
 # might already have for something else, e.g. tg2sip-webrtc).
 #
-# Clones everything under ~/GIT/vladonv/ to match native/CMakeLists.txt's
-# own default CACHE PATH values (LIBSIGNAL_DIR/RINGRTC_DIR/PJPROJECT_DIR) -
-# no -D overrides needed if this script is just run as-is.
+# Clones everything under ~/GIT/signal2sip/ to match CMakeLists.txt's own
+# default CACHE PATH values (LIBSIGNAL_DIR/RINGRTC_DIR/PJPROJECT_DIR) - no
+# -D overrides needed if this script is just run as-is.
 #
 # Needs, before running: a GH_TOKEN env var with at least read access to
-# the private vladonv/signal2sip repo (a fine-grained PAT is enough - this
+# the signal2sip/signal2sip repo (a fine-grained PAT is enough - this
 # script only ever clones/fetches it, never pushes). Everything else
 # (libsignal, ringrtc, webrtc, pjproject) is public.
 #
@@ -21,14 +21,14 @@
 
 set -euo pipefail
 
-GIT_ROOT="$HOME/GIT/vladonv"
+GIT_ROOT="$HOME/GIT/signal2sip"
 mkdir -p "$GIT_ROOT"
 cd "$GIT_ROOT"
 
 # Pinned to what this project's own dev checkout uses as of 08-03 - bump
 # these deliberately, not by accident, if upstream/the forks move on.
 LIBSIGNAL_COMMIT="97801d22dcf9f5bf714f7b8fa3212cdc973ae1c8"
-WEBRTC_PATCH_COMMIT="0afdc03505cde0fcf72a545df51fcb4b7b6c5931"
+WEBRTC_PATCH_COMMIT="4f5e63d65e606c9f7745e9a754e4f273023b63a8"
 PJPROJECT_TAG="2.14.1"
 
 # depot_tools (gclient/gn/ninja) - required by ringrtc's own
@@ -62,7 +62,7 @@ $SUDO apt-get update -y
 
 # lld-21 specifically, NOT the plain distro `lld` package: its version
 # varies by Debian release, and bookworm's own (14.0.6) mislinks
-# signal2sip-daemon into a pre-main() segfault - see native/CMakeLists.txt's
+# signal2sip-daemon into a pre-main() segfault - see CMakeLists.txt's
 # PIN_LLD21 comment and project_signal2sip_debian12_daemon_crash memory.
 # apt.llvm.org ships the same Clang/LLVM 21 packages on every Debian
 # release, same approach tg2sip-webrtc's own CI already uses for its
@@ -107,7 +107,7 @@ git -C libsignal checkout "$LIBSIGNAL_COMMIT"
 
 echo "=== [4/6] ringrtc + webrtc from source (release), with our patches ==="
 if [ ! -d ringrtc ]; then
-    git clone https://github.com/vladonv/ringrtc.git
+    git clone https://github.com/signal2sip/ringrtc.git
 fi
 git -C ringrtc fetch origin
 git -C ringrtc checkout main
@@ -125,7 +125,7 @@ mkdir -p ringrtc/out
 # against, we just want this one patch added to it.
 git -C ringrtc/src/webrtc/src fetch origin
 if ! git -C ringrtc/src/webrtc/src cat-file -e "$WEBRTC_PATCH_COMMIT" 2>/dev/null; then
-    echo "ERROR: $WEBRTC_PATCH_COMMIT not found in the webrtc checkout - check vladonv/webrtc is what gsync-webrtc actually pulled (config/webrtc.gclient.common)."
+    echo "ERROR: $WEBRTC_PATCH_COMMIT not found in the webrtc checkout - check signal2sip/webrtc is what gsync-webrtc actually pulled (config/webrtc.gclient.common)."
     exit 1
 fi
 git -C ringrtc/src/webrtc/src cherry-pick "$WEBRTC_PATCH_COMMIT"
@@ -144,11 +144,11 @@ fi
 
 echo "=== [6/6] signal2sip itself ==="
 if [ ! -d signal2sip ]; then
-    : "${GH_TOKEN:?GH_TOKEN must be set to clone the private vladonv/signal2sip repo}"
-    git clone "https://oauth2:${GH_TOKEN}@github.com/vladonv/signal2sip.git"
+    : "${GH_TOKEN:?GH_TOKEN must be set to clone the signal2sip/signal2sip repo}"
+    git clone "https://oauth2:${GH_TOKEN}@github.com/signal2sip/signal2sip.git"
 fi
-mkdir -p signal2sip/native/build
-( cd signal2sip/native/build && cmake .. && cmake --build . -j"$(nproc)" )
+mkdir -p signal2sip/build
+( cd signal2sip/build && cmake .. && cmake --build . -j"$(nproc)" )
 
 echo "=== Done ==="
-ls -lh signal2sip/native/build/signal2sip-daemon signal2sip/native/build/signal2sip-gendb
+ls -lh signal2sip/build/signal2sip-daemon signal2sip/build/signal2sip-gendb
