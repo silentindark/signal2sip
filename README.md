@@ -9,3 +9,7 @@ calling, and a PJSIP ring-buffer audio bridge, all per-account.
 
 See [`BUILDING.md`](BUILDING.md) for the repo layout, build, run, and
 config instructions.
+
+Licensed under [AGPL-3.0](LICENSE) - see
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for why (statically
+linking Signal's own AGPL-3.0 `libsignal`/`ringrtc`).
