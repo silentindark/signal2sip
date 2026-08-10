@@ -58,3 +58,39 @@ interactively through `signal2sip-tui` (account list -> detail -> SIP config
 editor screen, which just drives the same `gendb config set` calls under the
 hood). No daemon restart required either way - see `daemon/Config.h` for the
 full format and `systemd/signal2sip-daemon.service` for a deployable unit.
+
+### SIP trunk (`sip_host`): ports and the TLS/SNI hostname bug
+
+**Ports:** `sip_host` with no explicit `:port` uses the plain SIP default
+(5060) for `sip_transport=udp`; for `sip_transport=tls` (`sips:`),
+`Config.cpp` explicitly defaults it to `:5061` (Asterisk's usual TLS
+listener port) if no port was given. Either way, adding an explicit
+`:<port>` to `sip_host` (e.g. `sip_host=192.0.2.10:5063`) always wins -
+this isn't a fixed pair of choices, just the fallback when you don't
+specify one.
+
+**`sip_host` as a hostname (not just an IP) now works for
+`sip_transport=tls`, as of the `signal2sip-2.14.1-sni-fix` branch of
+[`signal2sip/pjproject-tls`](https://github.com/signal2sip/pjproject-tls)
+that `build-from-scratch.sh` builds from.** This was a real PJSIP bug,
+not a signal2sip limitation: `pjlib/src/pj/ssl_sock_ossl.c`'s
+`ssl_set_peer_name()` segfaulted during the TLS handshake's SNI setup
+(`SSL_set_tlsext_host_name`) specifically when the configured remote was
+a hostname rather than an IP, because it passed a `pj_str_t` that isn't
+null-terminated directly into an API that reads it as a plain C string.
+Confirmed live via `gdb` backtrace (`asock_on_connect_complete` ->
+`ssl_set_peer_name` -> crash), reproduced 100% of the time on a hostname
+and gone 100% of the time on the equivalent IP; confirmed present in
+2.14.1, 2.17, and current pjsip/pjproject `master` (`ssl_set_peer_name`
+itself was untouched by any upstream commit across that whole range, so
+just upgrading PJSIP would not have fixed it). Full writeup, root cause,
+and the fix itself: [signal2sip/pjproject-tls#1](https://github.com/signal2sip/pjproject-tls/issues/1).
+Verified fixed 2026-08-10 with a real hostname-based TLS registration
+against DPDZK's Asterisk, no crash, daemon stable.
+
+If you're building against a different/older PJSIP checkout that
+doesn't have this patch, using an IP literal in `sip_host` sidesteps the
+crash entirely and costs nothing functionally either way: signal2sip's
+TLS trust model is `sip_tls_ca_file` (pin the exact server certificate)
+or explicit `sip_tls_insecure=yes`, never SNI/hostname-based
+verification.

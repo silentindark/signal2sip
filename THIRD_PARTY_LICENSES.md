@@ -14,7 +14,7 @@ under what terms, so that's verifiable rather than asserted.
 | [`libsignal`](https://github.com/signalapp/libsignal) | **AGPL-3.0** | Official Signal Protocol implementation - the reason this project is AGPL-3.0. |
 | [`ringrtc`](https://github.com/signal2sip/ringrtc) (fork of [signalapp/ringrtc](https://github.com/signalapp/ringrtc)) | **AGPL-3.0** | Same reasoning as libsignal. |
 | [`webrtc`](https://github.com/signal2sip/webrtc) (fork of Google's WebRTC) | BSD-3-Clause | Permissive - imposes no copyleft obligation on its own. |
-| [`pjproject`](https://github.com/pjsip/pjproject) 2.14.1 | **GPL-2.0-or-later** | The "or later" option makes it combinable with GPLv3-family code (GPLv3 §13 explicitly permits linking with AGPLv3-licensed works); the combined binary as a whole is governed by AGPL-3.0, the strictest license among the three copyleft components. |
+| [`pjproject-tls`](https://github.com/signal2sip/pjproject-tls) 2.14.1 (fork of [pjsip/pjproject](https://github.com/pjsip/pjproject), one real patch on top - a TLS/SNI crash fix, see that repo's `signal2sip-2.14.1-sni-fix` branch and [issue #1](https://github.com/signal2sip/pjproject-tls/issues/1)) | **GPL-2.0-or-later** | The "or later" option makes it combinable with GPLv3-family code (GPLv3 §13 explicitly permits linking with AGPLv3-licensed works); the combined binary as a whole is governed by AGPL-3.0, the strictest license among the three copyleft components. |
 
 Because AGPL-3.0's copyleft (including its network-use clause, §13) covers
 the combined work, this applies regardless of which of these three you'd

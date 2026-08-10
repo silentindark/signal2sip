@@ -52,7 +52,18 @@ cd "$GIT_ROOT"
 # these deliberately, not by accident, if upstream/the forks move on.
 LIBSIGNAL_COMMIT="97801d22dcf9f5bf714f7b8fa3212cdc973ae1c8"
 WEBRTC_PATCH_COMMIT="4f5e63d65e606c9f7745e9a754e4f273023b63a8"
+# signal2sip/pjproject-tls's signal2sip-2.14.1-sni-fix branch, not
+# upstream pjsip/pjproject's own 2.14.1 tag directly - carries one real
+# patch on top: ssl_set_peer_name() (pjlib/src/pj/ssl_sock_ossl.c)
+# SIGSEGVs during the TLS handshake whenever sip_host is a hostname
+# (not an IP literal), a genuine PJSIP bug still present in 2.17 and
+# current master (confirmed live via gdb, and by diffing upstream's own
+# history - not fixed by any upstream commit). See
+# signal2sip/pjproject-tls#1 for the full writeup; verified fixed
+# 2026-08-10 with a real hostname-based TLS registration against
+# DPDZK's Asterisk.
 PJPROJECT_TAG="2.14.1"
+PJPROJECT_BRANCH="signal2sip-2.14.1-sni-fix"
 
 # depot_tools (gclient/gn/ninja) - required by ringrtc's own
 # bin/gsync-webrtc / bin/build-desktop for the WebRTC step below. Found
@@ -155,9 +166,9 @@ git -C ringrtc/src/webrtc/src cherry-pick "$WEBRTC_PATCH_COMMIT"
 ( cd ringrtc && bin/build-desktop --webrtc-only -r )
 ( cd ringrtc/src/rust && OUTPUT_DIR="$GIT_ROOT/ringrtc/out" cargo build --features native --release )
 
-echo "=== [5/6] Dedicated PJSIP $PJPROJECT_TAG (OpenSSL 3-safe) ==="
+echo "=== [5/6] Dedicated PJSIP $PJPROJECT_TAG (OpenSSL 3-safe, +SNI fix) ==="
 if [ ! -d pjproject-tls ]; then
-    git clone --branch "$PJPROJECT_TAG" --depth 1 https://github.com/pjsip/pjproject.git pjproject-tls
+    git clone --branch "$PJPROJECT_BRANCH" --depth 1 https://github.com/signal2sip/pjproject-tls.git pjproject-tls
 fi
 if [ ! -f pjproject-tls/local-install/lib/pkgconfig/libpjproject.pc ]; then
     ( cd pjproject-tls && ./aconfigure --prefix="$GIT_ROOT/pjproject-tls/local-install" \
