@@ -25,6 +25,10 @@ See [`REQUIREMENTS.md`](REQUIREMENTS.md) for exactly what the build
 installs on your system (including the one package that comes from a
 third-party APT repo) and what the resulting binaries need at runtime.
 
+See [`TESTING.md`](TESTING.md) for what each of the verification
+binaries under `test/` is for and how to run it - several are "live"
+and hit real Signal/SIP infrastructure with real credentials.
+
 ## Running
 
 ```
