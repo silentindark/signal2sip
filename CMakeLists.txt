@@ -105,7 +105,7 @@ find_package(ftxui REQUIRED)
 # same .proto sources (pulled from signalapp/Signal-Android, see
 # ../PROTOCOL.md), compiled fresh for C++ instead of loaded at runtime via
 # protobufjs.
-set(SIGNAL_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
+set(SIGNAL_PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/proto)
 set(SIGNAL_PROTO_FILES
     ${SIGNAL_PROTO_DIR}/SignalService.proto
     ${SIGNAL_PROTO_DIR}/WebSocketResources.proto
