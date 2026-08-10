@@ -242,7 +242,7 @@ target_link_libraries(signal2sip_signal PUBLIC signal2sip_storage signal2sip_pad
 
 add_executable(signal_roundtrip_test test/signal_roundtrip_test.cpp)
 target_link_libraries(signal_roundtrip_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
-    nlohmann_json::nlohmann_json)
+    signal2sip_config nlohmann_json::nlohmann_json)
 
 # Local-only (no chat.signal.org) unit test for the DecryptionErrorMessage
 # session-recovery feature - just signal2sip_signal, no AuthSocket/proto/
@@ -252,14 +252,15 @@ target_link_libraries(decryption_error_message_test PRIVATE signal2sip_signal)
 
 add_executable(refresh_prekeys_test test/refresh_prekeys_test.cpp)
 target_link_libraries(refresh_prekeys_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_proto
-    nlohmann_json::nlohmann_json)
+    signal2sip_config nlohmann_json::nlohmann_json)
 
 # Live verification for Cdsi.h (see that file's own doc comment) - needs
 # AuthSocket only to fetch the short-lived directory-service token
 # (GET /v2/directory/auth); CDSI itself is a separate libsignal `net`
 # transport, not signal2sip's usual chat.signal.org websocket.
 add_executable(cdsi_lookup_test test/cdsi_lookup_test.cpp)
-target_link_libraries(cdsi_lookup_test PRIVATE signal2sip_signal signal2sip_authsocket nlohmann_json::nlohmann_json)
+target_link_libraries(cdsi_lookup_test PRIVATE signal2sip_signal signal2sip_authsocket signal2sip_config
+    nlohmann_json::nlohmann_json)
 
 # One-off scratch helper (see the file's own doc comment) - not linked into
 # anything else, exists purely to feed refresh_prekeys_test/cdsi_lookup_test
