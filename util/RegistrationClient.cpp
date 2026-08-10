@@ -4,13 +4,19 @@
 
 #include <stdexcept>
 
+#include "../daemon/Config.h"
+
 namespace signal2sip {
 
 namespace {
 
 // Same CA cert every native TLS client in this project pins - see
-// main.cpp's AuthSocket construction.
-constexpr const char* kCaCertPath = "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem";
+// main.cpp's AuthSocket construction. Resolved once (stat() call) and
+// cached, since doRequest() runs it on every request.
+const std::string& caCertPath() {
+    static const std::string path = resolveCaCertPath();
+    return path;
+}
 
 size_t writeCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     static_cast<std::string*>(userdata)->append(ptr, size * nmemb);
@@ -28,7 +34,7 @@ HttpResponse doRequest(const std::string& serverHost, const std::string& method,
     struct curl_slist* headers = nullptr;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CAINFO, kCaCertPath);
+    curl_easy_setopt(curl, CURLOPT_CAINFO, caCertPath().c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);

@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../daemon/Config.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/Cdsi.h"
 
@@ -50,7 +51,7 @@ int main(int argc, char** argv) try {
     // transport) - this is only to fetch the short-lived directory-
     // service token GET /v2/directory/auth requires, via the account's
     // normal persistent credentials.
-    AuthSocket socket(username, password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+    AuthSocket socket(username, password, resolveCaCertPath(),
                        [](const std::string&, const std::string&, const Bytes&) {});
     socket.connect();
     std::cout << "PASS: connected to chat.signal.org\n";

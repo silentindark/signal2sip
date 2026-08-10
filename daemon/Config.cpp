@@ -127,6 +127,11 @@ std::string resolveConfigPath(int argc, char** argv) {
     return "./signal2sip.conf";
 }
 
+std::string resolveCaCertPath() {
+    if (fileExists("/etc/signal2sip/certs/signal-root-ca.pem")) return "/etc/signal2sip/certs/signal-root-ca.pem";
+    return "./certs/signal-root-ca.pem";
+}
+
 DaemonConfig DaemonConfig::load(const std::string& path) {
     IniMap ini = parseIni(path);
 

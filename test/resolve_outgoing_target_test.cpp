@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iostream>
 
+#include "../daemon/Config.h"
 #include "../daemon/ContactResolver.h"
 
 using namespace signal2sip;
@@ -25,7 +26,7 @@ int main(int argc, char** argv) try {
     std::string username =
         account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
     AuthSocket socket(username, account.password,
-                       "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+                       resolveCaCertPath(),
                        [](const std::string&, const std::string&, const Bytes&) {});
     auto t0 = std::chrono::steady_clock::now();
     socket.connect();

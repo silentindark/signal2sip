@@ -72,73 +72,6 @@ using json = nlohmann::json;
 
 namespace {
 
-std::string readFile(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) throw std::runtime_error("cannot open " + path);
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
-}
-
-Bytes b64(const json& j, const char* key) { return base64Decode(j.at(key).get<std::string>()); }
-
-// One-time fallback for this milestone's two already-registered accounts
-// (+380000000001, +380000000002) - imports the Node prototype's JSON
-// files the exact same way signal_roundtrip_test.cpp's migrateAccount()
-// already proved correct. Real gendb-created accounts (Milestone C,
-// still not implemented) will never hit this - storage.hasAccount() is
-// already true for them.
-void migrateFromNodePrototype(Storage& storage, const std::string& e164) {
-    std::string base = "/home/vlad/GIT/vladonv/signal2sip/layer1/data/accounts/" + e164;
-    json account = json::parse(readFile(base + ".json"));
-
-    AccountRecord record;
-    record.e164 = account.at("e164").get<std::string>();
-    record.aci = account.at("aci").get<std::string>();
-    record.pni = account.at("pni").get<std::string>();
-    record.device_id = account.at("deviceId").get<int>();
-    record.password = account.at("password").get<std::string>();
-    record.registration_id = account.at("registrationId").get<int64_t>();
-    record.pni_registration_id = account.at("pniRegistrationId").get<int64_t>();
-    storage.saveAccount(record);
-
-    storage.saveIdentityKeypair(
-        "aci", IdentityKeypairRecord{b64(account.at("aciIdentityKeyPair"), "privateKey"),
-                                     b64(account.at("aciIdentityKeyPair"), "publicKey")});
-
-    const auto& signedPreKey = account.at("aciSignedPreKey");
-    storage.saveSignedPrekey("aci",
-                              SignedPrekeyRecord{signedPreKey.at("keyId").get<int64_t>(), b64(signedPreKey, "record")});
-
-    const auto& kyberPreKey = account.at("aciPqLastResortPreKey");
-    storage.saveKyberPrekey("aci",
-                             KyberPrekeyRecord{kyberPreKey.at("keyId").get<int64_t>(), b64(kyberPreKey, "record")});
-
-    // Remote identity trust imports fine (needed for RingRTC's SRTP key
-    // derivation - see CallSignaling.cpp's handleCallMessage) - but
-    // deliberately NOT importing the double-ratchet session records
-    // themselves: found live that a caller's migrated session for the
-    // real device (3) plus two stale ones (1, 2 - left over from earlier
-    // re-linkings of the same account, both accepted with 200 OK by the
-    // server but delivered nowhere) resulted in the callee never
-    // receiving anything at all, no error, no envelope, nothing - some
-    // combination of stale device fan-out and/or session state
-    // divergence between two independently-snapshotted JSON exports
-    // (never fully root-caused; not worth it once the fix was obvious).
-    // Skipping session import forces CallMessageSender's normal
-    // fetchAndEstablishSessions() fallback on the first real send,
-    // getting a byte-fresh device list + prekey bundle straight from the
-    // server instead of trusting a potentially-stale local cache.
-    std::ifstream sessionsFile(base + "-sessions.json");
-    if (sessionsFile) {
-        json sessions = json::parse(readFile(base + "-sessions.json"));
-        for (auto& [address, keyB64] : sessions.at("identities").items()) {
-            storage.saveRemoteIdentity(address, base64Decode(keyB64.get<std::string>()));
-        }
-    }
-    std::cout << "[daemon] migrated " << e164 << " from Node prototype JSON files\n";
-}
-
 // Generates and uploads fresh signed+Kyber prekeys for both identities,
 // saving them to Storage too - matches refresh_prekeys_test.cpp exactly,
 // except it also persists locally (that test only uploads, proving the
@@ -1578,10 +1511,6 @@ bool setupAccount(const AccountConfig& accountConfig) {
         acct.config = accountConfig;
 
         acct.storage = std::make_unique<Storage>(g_global.dbPath, g_global.dbKey, accountConfig.name);
-        if (!acct.storage->hasAccount()) {
-            migrateFromNodePrototype(*acct.storage, accountConfig.e164);
-        }
-
         acct.account = acct.storage->loadAccount();
         acct.stores = std::make_unique<ProtocolStores>(*acct.storage, "aci");
         acct.localServiceId = acct.account.aci;
@@ -1596,7 +1525,7 @@ bool setupAccount(const AccountConfig& accountConfig) {
                                     ? acct.account.aci
                                     : (acct.account.aci + "." + std::to_string(acct.account.device_id));
         acct.socket = std::make_unique<AuthSocket>(
-            username, acct.account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+            username, acct.account.password, resolveCaCertPath(),
             [&acct](const std::string& verb, const std::string& path, const Bytes& body) {
                 onPush(acct, verb, path, body);
             });

@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "../daemon/Config.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/Crypto.h"
 #include "../signal/ProtocolStores.h"
@@ -110,7 +111,7 @@ int main(int argc, char** argv) {
 
     ProtocolStores stores(storage, "aci");
 
-    AuthSocket socket(username, account.password, "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem",
+    AuthSocket socket(username, account.password, resolveCaCertPath(),
                       [](const std::string&, const std::string&, const Bytes&) {});
     socket.connect();
     std::cout << "PASS: connected to chat.signal.org as " << account.e164 << "\n";

@@ -42,6 +42,13 @@ namespace signal2sip {
 
 std::string resolveConfigPath(int argc, char** argv);
 
+// Same fallback order as resolveConfigPath() above: /etc/signal2sip/... for
+// an installed deployment, else a path relative to the current working
+// directory for a dev checkout. Single source of truth for the CA cert
+// every native TLS client in this project pins (AuthSocket, gendb,
+// RegistrationClient) - was 8 separate hardcoded absolute paths before.
+std::string resolveCaCertPath();
+
 // [global] - one per file, shared by every account.
 struct GlobalConfig {
     std::string dbPath;  // required - one SQLCipher file shared by all accounts

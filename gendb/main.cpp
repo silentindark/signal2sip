@@ -63,9 +63,6 @@ using json = nlohmann::json;
 
 namespace {
 
-// Same CA cert every native TLS client in this project pins.
-constexpr const char* kCaCertPath = "/home/vlad/GIT/vladonv/signal2sip/layer1/certs/signal-root-ca.pem";
-
 // The name a linked device shows up as in the real Signal app's Linked
 // Devices list (see DeviceNameCipher.h). Not user-configurable yet - every
 // account this project links gets the same name, which is fine since
@@ -513,7 +510,7 @@ void cmdLink(const DaemonConfig& config, const std::string& accountName) {
     ResolvedAccount resolved = resolveAccount(config, accountName);
     AccountConfig account = resolved.account;
 
-    ProvisioningClient provisioning(kCaCertPath);
+    ProvisioningClient provisioning(resolveCaCertPath());
     std::cout << "[link] connecting to provisioning socket...\n";
     ProvisionMessageResult provisioned = provisioning.waitForProvisionMessage();
     std::cout << "[link] decrypted provisioning message OK for " << provisioned.e164 << ", finishing linking...\n";
@@ -638,7 +635,7 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
 void putFetchesMessages(Storage& storage, const AccountRecord& account, bool fetchesMessages) {
     std::string username =
         account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
-    AuthSocket socket(username, account.password, kCaCertPath,
+    AuthSocket socket(username, account.password, resolveCaCertPath(),
                       [](const std::string&, const std::string&, const Bytes&) {});
     socket.connect();
 
@@ -738,7 +735,7 @@ void cmdDeleteAccount(const DaemonConfig& config, const std::string& accountName
 
     std::string username =
         account.device_id == 1 ? account.aci : (account.aci + "." + std::to_string(account.device_id));
-    AuthSocket socket(username, account.password, kCaCertPath,
+    AuthSocket socket(username, account.password, resolveCaCertPath(),
                       [](const std::string&, const std::string&, const Bytes&) {});
     socket.connect();
 
