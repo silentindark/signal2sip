@@ -186,8 +186,24 @@ if [ ! -d pjproject-tls ]; then
     git clone --branch "$PJPROJECT_BRANCH" --depth 1 https://github.com/signal2sip/pjproject-tls.git pjproject-tls
 fi
 if [ ! -f pjproject-tls/local-install/lib/pkgconfig/libpjproject.pc ]; then
+    # -O2 (not -O3): more conservative optimization level for a
+    # production dependency - less prone to aggressive
+    # vectorization/loop-transform passes exercising latent UB in PJSIP's
+    # C89 pj_str_t-heavy code than -O3 is.
+    # -fno-omit-frame-pointer + -g: keep real stack unwinding available.
+    # The 2026-08-10 SNI-crash "confirmation" backtrace (see project
+    # memory project_signal2sip_pjsip_sni_bug.md) turned out to be
+    # symbol-poor and self-described as "corrupted" precisely because
+    # this step built PJSIP with none of that - frame pointers were
+    # already omitted by GCC's own -O-and-above default, and there were
+    # no debug symbols at all. This -g info flows into PJSIP's static
+    # libs and then into signal2sip-daemon's own link step, which
+    # already strips it back out for Release builds only
+    # (CMakeLists.txt's `-s` link option, scoped to
+    # $<$<CONFIG:Release>:-s>) - so this costs nothing in the shipped
+    # Release binary and gives a real backtrace on `--debug` builds.
     ( cd pjproject-tls && ./aconfigure --prefix="$GIT_ROOT/pjproject-tls/local-install" \
-        --disable-sound CFLAGS="-O3 -DNDEBUG -fPIC" )
+        --disable-sound CFLAGS="-O2 -DNDEBUG -fPIC -fno-omit-frame-pointer -g" )
     ( cd pjproject-tls && make dep && make -j"$(nproc)" && make install )
 fi
 
