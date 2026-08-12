@@ -51,6 +51,7 @@
 #include "AccountFinisher.h"
 #include "DeviceNameCipher.h"
 #include "ProvisioningClient.h"
+#include "RegistrationServiceClient.h"
 #include "../daemon/Config.h"
 #include "../signal/AuthSocket.h"
 #include "../signal/FfiUtil.h"
@@ -308,31 +309,21 @@ void cmdRegister(const DaemonConfig& config, const std::string& accountName, con
     Storage storage(config.global.dbPath, config.global.dbKey, account.name);
     requireNoExistingAccount(storage, account.name);
 
-    RegistrationClient client(serverHostFor(account));
-
     std::cout << "[register] creating verification session for " << account.e164 << "\n";
-    json sessionBody = {{"number", account.e164}, {"pushToken", nullptr}, {"mcc", nullptr}, {"mnc", nullptr}};
-    HttpResponse sessionResp = client.request("POST", "/v1/verification/session", sessionBody.dump());
-    std::cout << "[register] session response: " << sessionResp.status << " " << sessionResp.body << "\n";
-    if (sessionResp.status != 200) {
-        std::cout << "[register] FAIL: could not create session\n";
-        return;
-    }
+    RegistrationServiceClient client;
+    RegistrationSessionState session = client.createSession(account.e164);
+    std::cout << "[register] session created (id " << client.sessionId()
+              << "), allowedToRequestCode=" << session.allowedToRequestCode << "\n";
 
-    json session = json::parse(sessionResp.body);
-    std::string sessionId = session.at("id").get<std::string>();
-    std::vector<std::string> requestedInformation;
-    if (session.contains("requestedInformation")) {
-        for (auto& v : session.at("requestedInformation")) requestedInformation.push_back(v.get<std::string>());
-    }
-    bool allowedToRequestCode = session.value("allowedToRequestCode", false);
     std::string ourPassword = base64NoPadding(randomBytes(18));
 
     // Saved right away, even if we can't request a code yet -
     // register-captcha needs this sessionId to resume instead of starting
     // a brand new session.
-    savePending(config.global, account.name, PendingRegistration{account.e164, sessionId, ourPassword, transport});
+    savePending(config.global, account.name,
+               PendingRegistration{account.e164, client.sessionId(), ourPassword, transport});
 
+    const auto& requestedInformation = session.requestedInformation;
     bool needsCaptcha = std::find(requestedInformation.begin(), requestedInformation.end(), "captcha") !=
                        requestedInformation.end();
     if (needsCaptcha) {
@@ -350,20 +341,13 @@ void cmdRegister(const DaemonConfig& config, const std::string& accountName, con
         std::cout << "[register] FAIL: server requires a push challenge (no push token available headlessly).\n";
         return;
     }
-    if (!allowedToRequestCode) {
+    if (!session.allowedToRequestCode) {
         std::cout << "[register] FAIL: server says allowedToRequestCode=false, cannot proceed.\n";
         return;
     }
 
     std::cout << "[register] requesting " << transport << " verification code...\n";
-    json codeBody = {{"transport", transport}, {"client", "signal2sip"}};
-    HttpResponse codeResp =
-        client.request("POST", "/v1/verification/session/" + sessionId + "/code", codeBody.dump());
-    std::cout << "[register] code request response: " << codeResp.status << " " << codeResp.body << "\n";
-    if (codeResp.status != 200) {
-        std::cout << "[register] FAIL: could not request verification code\n";
-        return;
-    }
+    client.requestVerificationCode(transport);
 
     std::cout << "[register] PASS: code requested via " << transport << " - once received, run:\n";
     std::cout << "  signal2sip-gendb " << account.name << " verify <code>\n";
@@ -373,36 +357,21 @@ void cmdRegisterCaptcha(const DaemonConfig& config, const std::string& accountNa
     token = cleanCaptchaToken(token);
     if (token.empty()) throw std::runtime_error("captcha token is empty after cleanup");
 
-    ResolvedAccount resolved = resolveAccount(config, accountName);
     PendingRegistration pending = loadPending(config.global, accountName);
-    RegistrationClient client(serverHostFor(resolved.account));
 
-    std::cout << "[captcha] submitting captcha token for session " << pending.sessionId << "\n";
-    json patchBody = {
-        {"captcha", token}, {"pushToken", nullptr}, {"pushChallenge", nullptr}, {"mcc", nullptr}, {"mnc", nullptr}};
-    HttpResponse patchResp =
-        client.request("PATCH", "/v1/verification/session/" + pending.sessionId, patchBody.dump());
-    std::cout << "[captcha] response: " << patchResp.status << " " << patchResp.body << "\n";
-    if (patchResp.status != 200) {
-        std::cout << "[captcha] FAIL: captcha rejected\n";
-        return;
-    }
+    std::cout << "[captcha] resuming session " << pending.sessionId << "\n";
+    RegistrationServiceClient client;
+    client.resumeSession(pending.sessionId, pending.e164);
 
-    json session = json::parse(patchResp.body);
-    if (!session.value("allowedToRequestCode", false)) {
+    std::cout << "[captcha] submitting captcha token...\n";
+    RegistrationSessionState session = client.submitCaptcha(token);
+    if (!session.allowedToRequestCode) {
         std::cout << "[captcha] FAIL: still not allowed to request a code after captcha\n";
         return;
     }
 
     std::cout << "[captcha] captcha accepted, requesting " << pending.transport << " verification code...\n";
-    json codeBody = {{"transport", pending.transport}, {"client", "signal2sip"}};
-    HttpResponse codeResp =
-        client.request("POST", "/v1/verification/session/" + pending.sessionId + "/code", codeBody.dump());
-    std::cout << "[captcha] code request response: " << codeResp.status << " " << codeResp.body << "\n";
-    if (codeResp.status != 200) {
-        std::cout << "[captcha] FAIL: could not request verification code\n";
-        return;
-    }
+    client.requestVerificationCode(pending.transport);
 
     std::cout << "[captcha] PASS: code requested via " << pending.transport << " - once received, run:\n";
     std::cout << "  signal2sip-gendb " << accountName << " verify <code>\n";
@@ -420,24 +389,13 @@ void cmdVerify(const DaemonConfig& config, const std::string& accountName, const
     if (account.e164.empty()) account.e164 = pending.e164;
     requireE164NotUsedByOtherAccount(config, accountName, account.e164);
 
-    RegistrationClient client(serverHostFor(account));
+    std::cout << "[verify] resuming session " << pending.sessionId << "\n";
+    RegistrationServiceClient client;
+    client.resumeSession(pending.sessionId, account.e164);
 
-    std::cout << "[verify] submitting code for session " << pending.sessionId << "\n";
-    json verifyBody = {{"code", code}};
-    HttpResponse verifyResp =
-        client.request("PUT", "/v1/verification/session/" + pending.sessionId + "/code", verifyBody.dump());
-    std::cout << "[verify] response: " << verifyResp.status << " " << verifyResp.body << "\n";
-
-    json session;
-    try {
-        session = json::parse(verifyResp.body);
-    } catch (const std::exception&) {
-        std::cout << "[verify] FAIL: could not parse session response\n";
-        return;
-    }
-    // A 409 here can still mean "already verified from a prior attempt" -
-    // trust the parsed .verified field over the status code.
-    if (!session.value("verified", false)) {
+    std::cout << "[verify] submitting code...\n";
+    bool verified = client.submitVerificationCode(code);
+    if (!verified) {
         std::cout << "[verify] FAIL: session not marked verified after submitting code\n";
         return;
     }
@@ -449,43 +407,20 @@ void cmdVerify(const DaemonConfig& config, const std::string& accountName, const
     int64_t pniRegistrationId = randomRegistrationId();
     GeneratedPrekeys prekeys = generatePrekeys(aciIdentity.privateKey, pniIdentity.privateKey);
 
-    json body = {
-        {"sessionId", pending.sessionId},
-        {"recoveryPassword", nullptr},
-        {"accountAttributes",
-        {{"fetchesMessages", true},
-         {"registrationId", registrationId},
-         {"pniRegistrationId", pniRegistrationId},
-         {"name", nullptr},
-         {"capabilities", capabilitiesJson()},
-         // No profileKey yet at this point - unrestricted is the simpler
-         // valid choice for a fresh account (matches register-verify.js).
-         {"unrestrictedUnidentifiedAccess", true},
-         {"discoverableByPhoneNumber", true}}},
-        {"aciIdentityKey", base64NoPadding(aciIdentity.publicKey)},
-        {"pniIdentityKey", base64NoPadding(pniIdentity.publicKey)},
-        {"aciSignedPreKey", signedPreKeyJson(prekeys.aciSignedPreKey)},
-        {"pniSignedPreKey", signedPreKeyJson(prekeys.pniSignedPreKey)},
-        {"aciPqLastResortPreKey", kyberPreKeyJson(prekeys.aciKyberPreKey)},
-        {"pniPqLastResortPreKey", kyberPreKeyJson(prekeys.pniKyberPreKey)},
-        {"gcmToken", nullptr},
-        {"skipDeviceTransfer", true},
-        {"requireAtomic", true},
-    };
-
-    std::cout << "[verify] POST /v1/registration ...\n";
-    HttpResponse regResp = client.request("POST", "/v1/registration", body.dump(), account.e164, pending.password);
-    std::cout << "[verify] response: " << regResp.status << " " << regResp.body << "\n";
-    if (regResp.status != 200) {
-        std::cout << "[verify] FAIL: registration rejected\n";
+    std::cout << "[verify] registering account...\n";
+    RegisteredAccount registered;
+    try {
+        registered = client.registerAccount(pending.password, registrationId, pniRegistrationId, aciIdentity,
+                                            pniIdentity, prekeys);
+    } catch (const std::exception& e) {
+        std::cout << "[verify] FAIL: registration rejected: " << e.what() << "\n";
         return;
     }
 
-    json parsed = json::parse(regResp.body);
     FinishedAccount finished;
     finished.e164 = account.e164;
-    finished.aci = parsed.at("uuid").get<std::string>();
-    finished.pni = parsed.at("pni").get<std::string>();
+    finished.aci = registered.aci;
+    finished.pni = registered.pni;
     finished.password = pending.password;
     finished.deviceId = 1;
     finished.registrationId = registrationId;

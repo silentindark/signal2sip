@@ -484,6 +484,7 @@ add_library(signal2sip_gendb STATIC
     gendb/ProvisioningClient.cpp
     gendb/AccountFinisher.cpp
     gendb/DeviceNameCipher.cpp
+    gendb/RegistrationServiceClient.cpp
 )
 target_include_directories(signal2sip_gendb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_gendb PUBLIC signal2sip_signal signal2sip_storage signal2sip_proto
