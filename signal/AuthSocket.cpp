@@ -36,6 +36,15 @@ struct AuthSocket::Impl {
     bool connectFailed = false;
     std::string connectError;
 
+    // Hand-off state for running lws_client_connect_via_info() on the
+    // serviceThread instead of whatever thread called connect()/
+    // reconnect() - see doConnect()'s own comment for why this exists.
+    std::mutex connectRequestMutex;
+    std::condition_variable connectRequestCv;
+    bool connectRequestPending = false;
+    bool connectRequestDone = false;
+    bool connectRequestOk = false;
+
     // Together, currentWsi/abandonedWsi/isStaleWsi() answer "does this
     // callback belong to the attempt doConnect() is actually still
     // waiting on" - two DIFFERENT staleness signals, both needed, each
@@ -87,16 +96,15 @@ struct AuthSocket::Impl {
 
     static int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t len);
 
-    // Shared by connect() (first-time setup) and reconnect() (after a
-    // drop) - both just need a fresh WebSocket handshake against the
-    // already-created lws_context. Blocks until the handshake completes
-    // or throws on failure/timeout.
-    void doConnect() {
+    // Runs the actual lws_client_connect_via_info() call - only ever
+    // called from the serviceThread, via the LWS_CALLBACK_EVENT_WAIT_
+    // CANCELLED hook below. See doConnect()'s comment for why this can't
+    // just be called directly from doConnect()'s own (foreign) thread.
+    void performPendingConnectIfNeeded() {
         {
-            std::lock_guard<std::mutex> lock(connectMutex);
-            connected = false;
-            connectFailed = false;
-            connectError.clear();
+            std::unique_lock<std::mutex> reqLock(connectRequestMutex);
+            if (!connectRequestPending) return;
+            connectRequestPending = false;
         }
 
         lws_client_connect_info connectInfo{};
@@ -110,8 +118,53 @@ struct AuthSocket::Impl {
         connectInfo.protocol = kProtocols[0].name;
         connectInfo.pwsi = &wsi;
 
-        if (!lws_client_connect_via_info(&connectInfo)) {
-            throw std::runtime_error("lws_client_connect_via_info failed");
+        bool ok = lws_client_connect_via_info(&connectInfo) != nullptr;
+
+        {
+            std::lock_guard<std::mutex> reqLock(connectRequestMutex);
+            connectRequestOk = ok;
+            connectRequestDone = true;
+        }
+        connectRequestCv.notify_all();
+    }
+
+    // Shared by connect() (first-time setup) and reconnect() (after a
+    // drop) - both just need a fresh WebSocket handshake against the
+    // already-created lws_context. Blocks until the handshake completes
+    // or throws on failure/timeout.
+    void doConnect() {
+        {
+            std::lock_guard<std::mutex> lock(connectMutex);
+            connected = false;
+            connectFailed = false;
+            connectError.clear();
+        }
+
+        // lws_client_connect_via_info() mutates lws's own internal vhost/
+        // wsi/timer-list state, which lws only ever expects to be touched
+        // from the single thread that calls lws_service() on this context
+        // - calling it directly from here (whatever thread called
+        // connect()/reconnect(), not serviceThread) raced that loop and
+        // was the real cause of a recurring double-free/heap-corruption
+        // crash-loop in production, diagnosed 2026-08-12 from real
+        // coredumps (crashed inside libwebsockets itself, both as a
+        // direct "double free or corruption" abort and as a later
+        // assert(sul->cb) failure in its timer-list code - both from the
+        // same underlying corruption). Hand the actual call off to
+        // serviceThread via the LWS_CALLBACK_EVENT_WAIT_CANCELLED hook
+        // (fires on serviceThread every time lws_cancel_service() wakes
+        // lws_service()'s poll wait - the same cross-thread wake
+        // enqueue() already uses below, just synchronous here), then
+        // block until it's done.
+        {
+            std::unique_lock<std::mutex> reqLock(connectRequestMutex);
+            connectRequestDone = false;
+            connectRequestPending = true;
+            lws_cancel_service(context);
+            connectRequestCv.wait(reqLock, [this] { return connectRequestDone; });
+            if (!connectRequestOk) {
+                throw std::runtime_error("lws_client_connect_via_info failed");
+            }
         }
         // lws writes the fresh handle into `wsi` synchronously above (only
         // the handshake itself is async) - mirror it into the atomic right
@@ -413,6 +466,16 @@ int AuthSocket::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user
                 std::lock_guard<std::mutex> lock(self->outgoingMutex);
                 if (!self->outgoing.empty()) lws_callback_on_writable(wsi);
             }
+            break;
+        }
+        case LWS_CALLBACK_EVENT_WAIT_CANCELLED: {
+            // Fires on serviceThread (the thread actually calling
+            // lws_service()) every time lws_cancel_service() wakes its
+            // poll wait - the safe place to run lws_client_connect_via_info()
+            // requested by doConnect() on some other thread. See
+            // performPendingConnectIfNeeded()'s and doConnect()'s own
+            // comments for why this hand-off exists.
+            self->performPendingConnectIfNeeded();
             break;
         }
         default:
