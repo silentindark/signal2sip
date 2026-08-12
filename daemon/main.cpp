@@ -1528,7 +1528,8 @@ bool setupAccount(const AccountConfig& accountConfig) {
             username, acct.account.password, resolveCaCertPath(),
             [&acct](const std::string& verb, const std::string& path, const Bytes& body) {
                 onPush(acct, verb, path, body);
-            });
+            },
+            accountConfig.signalProxy, accountConfig.signalCensorshipCircumvention);
         acct.sender = std::make_unique<CallMessageSender>(*acct.socket, *acct.stores, acct.account.aci,
                                                            static_cast<uint32_t>(acct.account.device_id));
 

@@ -116,6 +116,9 @@ AccountConfig accountConfigFromRecord(const std::string& name, const AccountReco
 
     account.outgoingCallTarget = record.outgoing_call_target;
 
+    account.signalProxy = record.signal_proxy;
+    account.signalCensorshipCircumvention = record.signal_censorship_circumvention;
+
     return account;
 }
 

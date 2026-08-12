@@ -228,6 +228,18 @@ const std::vector<ConfigFieldDef> kConfigFields = {
     {"outgoing_call_target", "outgoing_call_target", ConfigFieldDef::Kind::Text, {}},
 };
 
+// Screen 6 (Signal account settings) field list - same ConfigFieldDef/
+// gendb-key-as-label convention as kConfigFields above, just the Signal-
+// side settings that don't belong in Screen 4's SIP editor. signal_proxy
+// and signal_censorship_circumvention added 2026-08-12 alongside the
+// AuthSocket libsignal-net-chat migration (see project memory:
+// signal2sip-censorship-circumvention / signal2sip-authsocket-ffi-migration).
+const std::vector<ConfigFieldDef> kSignalConfigFields = {
+    {"server_url", "server_url", ConfigFieldDef::Kind::Text, {}},
+    {"signal_proxy", "signal_proxy", ConfigFieldDef::Kind::Text, {}},
+    {"signal_censorship_circumvention", "signal_censorship_circumvention", ConfigFieldDef::Kind::Bool, {}},
+};
+
 // "SIP is being configured for this account at all" - true once any of
 // the three identity fields has something in it. Drives the required-
 // field markers (concept mockup: "обозначать обязательные поля").
@@ -442,36 +454,42 @@ int main(int argc, char** argv) {
     };
 
     // Screen 6: Signal account settings - deliberately separate from
-    // Screen 4's SIP config editor. server_url isn't a SIP setting at
-    // all (it's Signal-side), and this is also the natural future home
-    // for SVR2 PIN management once that's built. Single field for now,
-    // so this doesn't need Screen 4's field-list/cursor machinery - same
-    // save-one-changed-field pattern via gendb `config set`, just for
-    // exactly one key.
-    std::string signalEditValue;
-    std::string signalOriginalValue;
+    // Screen 4's SIP config editor (none of kSignalConfigFields are SIP
+    // settings), and the natural future home for SVR2 PIN management once
+    // that's built. Same field-list/cursor/save-only-changed-fields
+    // pattern as Screen 4 (kConfigFields/editValues/editField/saveConfig
+    // above), just against kSignalConfigFields instead.
+    std::map<std::string, std::string> signalEditValues;
+    std::map<std::string, std::string> signalOriginalValues;
+    int signalEditField = 0;
     bool signalSaveDone = false;
     std::string signalSaveOutput;
     bool signalSaveOk = true;
 
     auto openSignalConfig = [&] {
-        signalEditValue = detail.server_url;
-        signalOriginalValue = signalEditValue;
+        signalEditValues["server_url"] = detail.server_url;
+        signalEditValues["signal_proxy"] = detail.signal_proxy;
+        signalEditValues["signal_censorship_circumvention"] = detail.signal_censorship_circumvention ? "yes" : "no";
+        signalOriginalValues = signalEditValues;
+        signalEditField = 0;
         signalSaveDone = false;
         signalSaveOutput.clear();
         screenIndex = 5;
     };
 
     auto saveSignalConfig = [&] {
-        if (signalEditValue == signalOriginalValue) {
-            signalSaveOutput = tr(Key::NoChanges);
-            signalSaveOk = true;
-        } else {
+        std::string combined;
+        bool allOk = true;
+        for (const auto& f : kSignalConfigFields) {
+            if (signalEditValues[f.key] == signalOriginalValues[f.key]) continue;
             GendbResult res = runGendb(
-                gendbPath, {"--config", configPath, detailName, "config", "set", "server_url", signalEditValue});
-            signalSaveOutput = res.output;
-            signalSaveOk = res.exitCode == 0;
+                gendbPath, {"--config", configPath, detailName, "config", "set", f.key, signalEditValues[f.key]});
+            combined += res.output;
+            if (res.exitCode != 0) allOk = false;
         }
+        if (combined.empty()) combined = tr(Key::NoChanges);
+        signalSaveOutput = combined;
+        signalSaveOk = allOk;
         signalSaveDone = true;
     };
 
@@ -957,17 +975,27 @@ int main(int argc, char** argv) {
                border | color(errs.empty() ? kBorder : kBad) | bgcolor(kBg);
     };
 
-    // Screen 6: Signal account settings (currently just server_url - see
-    // openSignalConfig()'s own comment on why this is a separate screen
-    // from Screen 4's SIP editor). Same single-active-field visual
-    // language as Screen 4, reduced to the one field there is.
+    // Screen 6: Signal account settings - see openSignalConfig()'s own
+    // comment on why this is a separate screen from Screen 4's SIP
+    // editor. Same multi-field visual language as Screen 4's renderConfig().
     auto renderSignalConfig = [&]() -> Element {
+        Elements rows;
+        for (int i = 0; i < static_cast<int>(kSignalConfigFields.size()); i++) {
+            const ConfigFieldDef& f = kSignalConfigFields[i];
+            bool active = (i == signalEditField);
+            std::string display = signalEditValues.at(f.key);
+            if (display.empty()) display = "—";
+            if (active) display += "█";
+
+            Element label = text(f.label) | size(WIDTH, EQUAL, 32) | color(kDim);
+            Element value = text(display) | color(active ? kAccent : kFg);
+            Element row = hbox({text(active ? "▸ " : "  ") | color(kAccent), label, value});
+            if (active) row = row | bgcolor(Color::RGB(0x1c, 0x22, 0x2c));
+            rows.push_back(row);
+        }
+
         Elements body;
-        Element row = hbox({text("▸ ") | color(kAccent), text("server_url") | size(WIDTH, EQUAL, 24) | color(kDim),
-                            text((signalEditValue.empty() ? std::string("—") : signalEditValue) + "█") |
-                                color(kAccent)}) |
-                      bgcolor(Color::RGB(0x1c, 0x22, 0x2c));
-        body.push_back(row);
+        body.push_back(vbox(std::move(rows)));
         if (signalSaveDone) {
             body.push_back(text(""));
             body.push_back(text(signalSaveOk ? tr(Key::ConfigSaved) : tr(Key::ConfigSaveError)) |
@@ -988,7 +1016,9 @@ int main(int argc, char** argv) {
                             bgcolor(kBgAlt);
 
         Element footer = hflow({
+                              keyHint("↑↓/tab", tr(Key::FooterField)),
                               text(tr(Key::SignalConfigTypeText)) | color(kDim),
+                              keyHint("↵", tr(Key::FooterListCycles)),
                               keyHint("^o", tr(Key::FooterSave)),
                               keyHint("esc", tr(Key::FooterBack)),
                           }) |
@@ -1552,12 +1582,31 @@ int main(int argc, char** argv) {
                 saveSignalConfig();
                 return true;
             }
+            if (event == Event::ArrowDown || event == Event::Tab) {
+                signalEditField = (signalEditField + 1) % static_cast<int>(kSignalConfigFields.size());
+                return true;
+            }
+            if (event == Event::ArrowUp || event == Event::TabReverse) {
+                signalEditField = (signalEditField - 1 + static_cast<int>(kSignalConfigFields.size())) %
+                                   static_cast<int>(kSignalConfigFields.size());
+                return true;
+            }
+
+            const ConfigFieldDef& sf = kSignalConfigFields[signalEditField];
+            std::string& sValue = signalEditValues[sf.key];
+            if (sf.kind == ConfigFieldDef::Kind::Bool) {
+                if (event == Event::Return) {
+                    sValue = (sValue == "yes") ? "no" : "yes";
+                    return true;
+                }
+                return false;
+            }
             if (event == Event::Backspace) {
-                if (!signalEditValue.empty()) signalEditValue.pop_back();
+                if (!sValue.empty()) sValue.pop_back();
                 return true;
             }
             if (event.is_character()) {
-                signalEditValue += event.character();
+                sValue += event.character();
                 return true;
             }
             return false;

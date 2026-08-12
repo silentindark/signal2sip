@@ -237,6 +237,11 @@ struct AccountConfig {
     // only answers incoming calls.
     std::string outgoingCallTarget;
 
+    // See AuthSocket.h's own doc comment for what these mean - passed
+    // straight through to AuthSocket's constructor.
+    std::string signalProxy;
+    bool signalCensorshipCircumvention = false;
+
     bool hasSip() const { return !sipHost.empty(); }
 };
 

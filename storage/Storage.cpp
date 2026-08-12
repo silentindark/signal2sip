@@ -178,6 +178,8 @@ void migrateAccountConfigColumnsIfNeeded(sqlite3* db) {
     addColumnIfMissing(db, "account", "sip_tls_ca_file", "TEXT NOT NULL DEFAULT ''");
     addColumnIfMissing(db, "account", "sip_tls_insecure", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(db, "account", "outgoing_call_target", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "signal_proxy", "TEXT NOT NULL DEFAULT ''");
+    addColumnIfMissing(db, "account", "signal_censorship_circumvention", "INTEGER NOT NULL DEFAULT 0");
     addColumnIfMissing(db, "account", "enabled", "INTEGER NOT NULL DEFAULT 1");
     addColumnIfMissing(db, "account", "config_version", "INTEGER NOT NULL DEFAULT 0");
 }
@@ -289,6 +291,7 @@ AccountRecord Storage::loadAccount() {
         "registered_at, linked_at, prekeys_refreshed_at, "
         "server_url, sip_host, sip_extension, sip_password, sip_bridge_destination, sip_bridge_did, "
         "sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure, outgoing_call_target, "
+        "signal_proxy, signal_censorship_circumvention, "
         "enabled, config_version "
         "FROM account WHERE account_name = ?");
     bindText(stmt, 1, accountName_);
@@ -321,8 +324,10 @@ AccountRecord Storage::loadAccount() {
     account.sip_tls_ca_file = columnText(stmt, 22);
     account.sip_tls_insecure = sqlite3_column_int(stmt, 23) != 0;
     account.outgoing_call_target = columnText(stmt, 24);
-    account.enabled = sqlite3_column_int(stmt, 25) != 0;
-    account.config_version = sqlite3_column_int64(stmt, 26);
+    account.signal_proxy = columnText(stmt, 25);
+    account.signal_censorship_circumvention = sqlite3_column_int(stmt, 26) != 0;
+    account.enabled = sqlite3_column_int(stmt, 27) != 0;
+    account.config_version = sqlite3_column_int64(stmt, 28);
     return account;
 }
 
@@ -330,7 +335,8 @@ void Storage::saveAccountConfig(const AccountRecord& account) {
     Stmt stmt(db_,
         "UPDATE account SET server_url = ?, sip_host = ?, sip_extension = ?, sip_password = ?, "
         "sip_bridge_destination = ?, sip_bridge_did = ?, sip_srtp = ?, sip_transport = ?, "
-        "sip_tls_ca_file = ?, sip_tls_insecure = ?, outgoing_call_target = ?, enabled = ?, "
+        "sip_tls_ca_file = ?, sip_tls_insecure = ?, outgoing_call_target = ?, "
+        "signal_proxy = ?, signal_censorship_circumvention = ?, enabled = ?, "
         "config_version = config_version + 1 "
         "WHERE account_name = ?");
     bindText(stmt, 1, account.server_url);
@@ -344,8 +350,10 @@ void Storage::saveAccountConfig(const AccountRecord& account) {
     bindText(stmt, 9, account.sip_tls_ca_file);
     sqlite3_bind_int(stmt, 10, account.sip_tls_insecure ? 1 : 0);
     bindText(stmt, 11, account.outgoing_call_target);
-    sqlite3_bind_int(stmt, 12, account.enabled ? 1 : 0);
-    bindText(stmt, 13, accountName_);
+    bindText(stmt, 12, account.signal_proxy);
+    sqlite3_bind_int(stmt, 13, account.signal_censorship_circumvention ? 1 : 0);
+    sqlite3_bind_int(stmt, 14, account.enabled ? 1 : 0);
+    bindText(stmt, 15, accountName_);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         throw std::runtime_error(std::string("saveAccountConfig failed: ") + sqlite3_errmsg(db_));
     }

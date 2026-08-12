@@ -5,15 +5,24 @@
 // Some Signal-Server endpoints (e.g. PUT /v2/keys) only exist as an
 // HTTP-over-websocket call - there is no plain REST equivalent - so this is
 // a required transport, not a convenience wrapper.
+//
+// Implemented on top of libsignal's own C FFI chat-connection client
+// (libsignal-net-chat, signal_authenticated_chat_connection_* in
+// signal_ffi.h) as of 2026-08-12 - previously a hand-rolled libwebsockets
+// client. Switched after a real production threading bug in the old
+// implementation (see AuthSocket.cpp's own history) led to discovering
+// this FFI surface is Signal-iOS's own sole, production chat transport and
+// already has proxy/censorship-circumvention support built in, which the
+// hand-rolled version would have had to reimplement from scratch (see
+// project memory: signal2sip-authsocket-ffi-migration). This class's own
+// public API is unchanged by that migration - every existing caller needed
+// zero changes.
 
 #include <cstdint>
 #include <functional>
 #include <string>
 
 #include "../storage/Storage.h"
-
-struct lws_context;
-struct lws;
 
 namespace signal2sip {
 
@@ -24,13 +33,25 @@ public:
         Bytes body;
     };
 
-    // onPush is invoked (from the socket's background thread) for every
-    // server-pushed request (incoming envelopes, queue-empty, etc.) -
-    // matches AuthSocket's onPush in the Node prototype. This class acks
-    // every push automatically before invoking the callback, same as
-    // there.
+    // onPush is invoked (from a libsignal-net worker thread - see
+    // AuthSocket.cpp's own note on this) for every server-pushed message
+    // (this class acks each one automatically before invoking the
+    // callback, same as the old implementation and the Node prototype it
+    // was originally ported from).
+    //
+    // signalProxy: "" (default) = no proxy, else "host" or "host:port"
+    // (default port 443) - a transparent TCP/TLS relay to chat.signal.org,
+    // matching real Signal clients' manual "Proxy" setting (the
+    // `org.signal.tls` scheme - see project memory:
+    // signal2sip-censorship-circumvention for the full protocol writeup).
+    // censorshipCircumvention: matches real clients' separate "Censorship
+    // circumvention" toggle (automatic SNI domain fronting via Signal's
+    // own Fastly/Google Cloud Run infrastructure) - independent of
+    // signalProxy, both can be set at once though that's not a real
+    // client's usual configuration.
     AuthSocket(std::string username, std::string password, std::string caCertPath,
-               std::function<void(const std::string& verb, const std::string& path, const Bytes& body)> onPush);
+               std::function<void(const std::string& verb, const std::string& path, const Bytes& body)> onPush,
+               std::string signalProxy = "", bool censorshipCircumvention = false);
     ~AuthSocket();
 
     AuthSocket(const AuthSocket&) = delete;
@@ -40,19 +61,18 @@ public:
     // on failure/timeout).
     void connect();
 
-    // True once the WebSocket upgrade has completed and the connection
-    // hasn't been closed since - cleared from the background service
-    // thread's LWS_CALLBACK_CLIENT_CLOSED handler. Poll this instead of
-    // assuming a connect()ed socket stays connected forever; chat.signal.org
-    // (or the network path to it) can and does drop the connection with no
-    // warning.
+    // True once the connection has completed and hasn't been closed
+    // since - cleared from the ChatListener's connection_interrupted
+    // callback. Poll this instead of assuming a connect()ed socket stays
+    // connected forever; chat.signal.org (or the network path to it) can
+    // and does drop the connection with no warning.
     bool isConnected() const;
 
     // Re-establishes the connection after isConnected() has gone false.
-    // Unlike connect(), reuses the existing lws_context and background
-    // threads - only redoes the WebSocket handshake itself - so it's safe
-    // to call repeatedly from a watchdog loop. Blocks until the handshake
-    // completes (or throws on failure/timeout), same as connect().
+    // Reuses the existing ConnectionManager/async runtime, just redoes the
+    // chat connection itself - safe to call repeatedly from a watchdog
+    // loop. Blocks until the handshake completes (or throws on
+    // failure/timeout), same as connect().
     void reconnect();
 
     // True once the most recent connection attempt (or an already-

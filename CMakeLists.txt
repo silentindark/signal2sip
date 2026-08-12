@@ -162,7 +162,9 @@ add_library(signal2sip_authsocket STATIC
     signal/AuthSocket.cpp
 )
 target_include_directories(signal2sip_authsocket PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(signal2sip_authsocket PUBLIC signal2sip_storage signal2sip_proto signal2sip_util PkgConfig::LIBWEBSOCKETS)
+# libsignal_ffi (libsignal-net-chat, see AuthSocket.cpp's own doc comment)
+# replaced libwebsockets as this target's transport as of 2026-08-12.
+target_link_libraries(signal2sip_authsocket PUBLIC signal2sip_storage signal2sip_proto signal2sip_util libsignal_ffi)
 
 add_executable(authsocket_test test/authsocket_test.cpp)
 target_link_libraries(authsocket_test PRIVATE signal2sip_authsocket)

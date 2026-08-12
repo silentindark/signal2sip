@@ -39,6 +39,8 @@ struct AccountRecord {
     std::string sip_tls_ca_file;
     bool sip_tls_insecure = false;
     std::string outgoing_call_target;
+    std::string signal_proxy;
+    bool signal_censorship_circumvention = false;
     bool enabled = true;
     int64_t config_version = 0;
 };

@@ -865,6 +865,13 @@ const std::vector<ConfigField>& configFields() {
          }},
         {"outgoing_call_target", [](const AccountRecord& a) { return a.outgoing_call_target; },
          [](AccountRecord& a, const std::string& v) { a.outgoing_call_target = v; }},
+        {"signal_proxy", [](const AccountRecord& a) { return a.signal_proxy; },
+         [](AccountRecord& a, const std::string& v) { a.signal_proxy = v; }},
+        {"signal_censorship_circumvention",
+         [](const AccountRecord& a) { return a.signal_censorship_circumvention ? "yes" : "no"; },
+         [](AccountRecord& a, const std::string& v) {
+             a.signal_censorship_circumvention = (v == "yes" || v == "true" || v == "1");
+         }},
     };
     return fields;
 }
@@ -876,7 +883,8 @@ const ConfigField& findConfigField(const std::string& name) {
     throw std::runtime_error(
         "unknown config field '" + name +
         "' - known fields: server_url, sip_host, sip_extension, sip_password, sip_bridge_destination, "
-        "sip_bridge_did, sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure, outgoing_call_target");
+        "sip_bridge_did, sip_srtp, sip_transport, sip_tls_ca_file, sip_tls_insecure, outgoing_call_target, "
+        "signal_proxy, signal_censorship_circumvention");
 }
 
 void cmdConfigGet(const DaemonConfig& config, const std::string& accountName, const std::string& field) {

@@ -57,6 +57,15 @@ CREATE TABLE IF NOT EXISTS account (
     sip_tls_ca_file            TEXT NOT NULL DEFAULT '',
     sip_tls_insecure          INTEGER NOT NULL DEFAULT 0,
     outgoing_call_target       TEXT NOT NULL DEFAULT '',
+    -- "" (default) = no proxy, else "host" or "host:port" (default 443) -
+    -- a transparent TCP/TLS relay to chat.signal.org, matching real
+    -- Signal clients' manual "Proxy" setting (see AuthSocket.h's own doc
+    -- comment / project memory: signal2sip-censorship-circumvention).
+    signal_proxy              TEXT NOT NULL DEFAULT '',
+    -- Matches real clients' separate "Censorship circumvention" toggle
+    -- (automatic SNI domain fronting via Signal's own infrastructure) -
+    -- independent of signal_proxy above.
+    signal_censorship_circumvention INTEGER NOT NULL DEFAULT 0,
     -- Whether the daemon should set this account up at all - the DB-side
     -- replacement for "does a [account.<name>] section exist in the file".
     -- Flipped via `signal2sip-gendb <name> enable`/`disable`.
