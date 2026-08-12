@@ -119,6 +119,60 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
     if (pniKeypair) refreshOne("pni", pniKeypair->private_key);
 }
 
+// PUT /v1/accounts/attributes/ once per setupAccount() - same call
+// gendb's putFetchesMessages()/toggle_discoverability_test.cpp already
+// proved live, just fired here automatically instead of only on a manual
+// `unregister`/`reactivate`. Exists to close a suspected gap behind
+// project memory project_signal2sip_cds_discoverability.md: a real
+// client keeps re-sending this attributes body periodically
+// (RefreshAttributesJob), giving Signal-Server's CDS DynamoDB-stream
+// filter repeated chances to see a clean event with the PNI field
+// present; a `gendb register`-created account that's never connected a
+// real client only ever got the ONE (possibly racy) insert event from
+// registration and then went silent forever. Firing this once per daemon
+// startup/account-(re)init is a cheap, harmless approximation of that
+// periodic re-assertion - unverified whether it actually fixes CDS
+// discoverability, this is the experiment.
+//
+// capabilitiesJson() is intentionally duplicated from gendb/main.cpp
+// (not shared via a header) - keep the two in sync if either changes;
+// not worth a new shared target for five lines of static JSON that two
+// binaries with otherwise-disjoint link graphs would both need to link.
+//
+// Scoped to flow=="standalone" (Flow A / gendb `register`) only - a
+// "linked" (Flow B) account's `name` field must be the encrypted device
+// name (see gendb's putFetchesMessages()), which needs DeviceNameCipher
+// from signal2sip_gendb, not linked into signal2sip-daemon; sending
+// name=null for a linked account would silently blank its shown device
+// name (setAccountAttributes overwrites, doesn't merge - see
+// putFetchesMessages()'s own comment). The confirmed CDS anomaly is
+// specifically about `gendb register`-created (standalone) accounts
+// anyway, so linked accounts are out of scope for this fix, not just
+// skipped for convenience.
+void refreshAccountAttributes(AuthSocket& socket, const AccountRecord& account) {
+    if (account.flow != "standalone") return;
+
+    json body = {
+        {"fetchesMessages", true},
+        {"registrationId", account.registration_id},
+        {"pniRegistrationId", account.pni_registration_id},
+        {"name", nullptr},
+        {"capabilities",
+         json{{"storage", false},
+              {"versionedExpirationTimer", false},
+              {"attachmentBackfill", false},
+              {"spqr", true},
+              {"usernameChangeSyncMessage", true}}},
+        {"unrestrictedUnidentifiedAccess", true},
+        {"discoverableByPhoneNumber", true},
+    };
+    std::string bodyStr = body.dump();
+    Bytes bodyBytes(bodyStr.begin(), bodyStr.end());
+    auto response = socket.request("PUT", "/v1/accounts/attributes/", &bodyBytes);
+    std::cout << "[daemon] PUT /v1/accounts/attributes/ (refresh, CDS-anomaly experiment) -> " << response.status
+               << "\n";
+}
+
 // Ordered, off-service-thread dispatch for work triggered by onPush() -
 // incoming CallMessage handling and DecryptionErrorMessage replies. Both
 // used to be a raw `std::thread(...).detach()` per envelope: that
@@ -1546,6 +1600,7 @@ bool setupAccount(const AccountConfig& accountConfig) {
                    << acct.account.e164 << "\n";
 
         refreshPrekeys(*acct.storage, *acct.socket, acct.account);
+        refreshAccountAttributes(*acct.socket, acct.account);
 
         // Initial sync - see main()'s own storage-sync loop for the
         // periodic re-sync every g_global.storageSyncIntervalSec.
