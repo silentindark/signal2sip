@@ -1,25 +1,39 @@
 #include "ProvisioningClient.h"
 
-#include <libwebsockets.h>
+#include <signal_ffi.h>
 #include <qrencode.h>
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
-#include <deque>
 #include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
-#include <thread>
 
 #include "ProvisioningCipher.h"
 #include "Provisioning.pb.h"
-#include "WebSocketResources.pb.h"
 #include "../signal/FfiUtil.h"
 #include "../util/Base64.h"
+
+// Built on libsignal's own C FFI provisioning-chat client
+// (signal_provisioning_chat_connection_* in signal_ffi.h) as of
+// 2026-08-12, replacing a hand-rolled libwebsockets client - same
+// migration as AuthSocket.cpp (see that file's own doc comment for the
+// full rationale and the general SignalCPromise/async-callback contract,
+// identical here). Two real simplifications this connection type gets
+// for free over AuthSocket's: no auth handshake (this is genuinely an
+// unauthenticated connection, matching the real protocol - the server is
+// just a rendezvous, it never sees the provisioning keys/crypto), and no
+// generic send() capability at all - the FFI only exposes connect/
+// disconnect/init_listener for this connection type, matching that the
+// real protocol never has the linking device send anything over this
+// socket, only receive (an address, then later an encrypted envelope).
+// That also means no keepalive is needed here on our side - nothing to
+// periodically send, and WebSocket-level ping/pong is handled inside the
+// FFI's own transport, same as it was for the old lws code (which never
+// implemented a provisioning-level ping either, just relied on lws's).
 
 namespace signal2sip {
 
@@ -229,26 +243,33 @@ void renderQr(const std::string& text) {
 
 } // namespace
 
+namespace {
+constexpr uint8_t kEnvironmentProd = 1;
+constexpr uint8_t kBuildVariantProduction = 0;
+constexpr const char* kUserAgent = "signal2sip";
+
+SignalMutPointerConnectionManager makeConnectionManager() {
+    // signal_connection_manager_new rejects a null remote_config map -
+    // see AuthSocket.cpp's identical helper for the full explanation.
+    SignalMutPointerBridgedStringMap remoteConfig{};
+    checkError(signal_bridged_string_map_new(&remoteConfig, /*initial_capacity=*/0));
+    SignalMutPointerConnectionManager manager{};
+    checkError(signal_connection_manager_new(&manager, kEnvironmentProd,
+                                              reinterpret_cast<const int8_t*>(kUserAgent), remoteConfig,
+                                              kBuildVariantProduction));
+    checkError(signal_bridged_string_map_destroy(remoteConfig));
+    return manager;
+}
+} // namespace
+
 struct ProvisioningClient::Impl {
-    std::string caCertPath;
-    std::string serverHost;
+    std::string caCertPath;   // unused - Environment::Prod's own pinning applies (see AuthSocket.cpp)
+    std::string serverHost;   // unused for the same reason
     KeyPair ourKeyPair;
 
-    lws_context* context = nullptr;
-    lws* wsi = nullptr;
-    std::thread serviceThread;
-    std::thread keepAliveThread;
-    std::atomic<bool> stopping{false};
-
-    std::mutex connectMutex;
-    std::condition_variable connectCv;
-    bool connected = false;
-    bool connectFailed = false;
-    std::string connectError;
-
-    std::mutex outgoingMutex;
-    std::deque<Bytes> outgoing;
-    Bytes rxBuffer;
+    SignalMutPointerTokioAsyncContext asyncContext{};
+    SignalMutPointerConnectionManager connectionManager{};
+    SignalMutPointerProvisioningChatConnection chat{};
 
     std::mutex resultMutex;
     std::condition_variable resultCv;
@@ -256,30 +277,53 @@ struct ProvisioningClient::Impl {
     std::optional<ProvisionMessageResult> result;
     std::optional<std::string> failure;
 
-    static const lws_protocols kProtocols[];
-    static int callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t len);
+    SignalFfiProvisioningListenerStruct listenerStruct{};
 
-    void enqueue(Bytes message) {
-        {
-            std::lock_guard<std::mutex> lock(outgoingMutex);
-            outgoing.push_back(std::move(message));
-        }
-        if (wsi) lws_callback_on_writable(wsi);
-        lws_cancel_service(context);
+    Impl() {
+        checkError(signal_tokio_async_context_new(&asyncContext));
+        connectionManager = makeConnectionManager();
+        ourKeyPair = generateKeyPair();
+
+        listenerStruct.ctx = this;
+        listenerStruct.received_address = &Impl::onReceivedAddress;
+        listenerStruct.received_envelope = &Impl::onReceivedEnvelope;
+        listenerStruct.connection_interrupted = &Impl::onConnectionInterrupted;
+        listenerStruct.destroy = [](void*) {};
     }
 
-    void sendKeepAlive() {
-        signalservice::WebSocketMessage msg;
-        msg.set_type(signalservice::WebSocketMessage_Type_REQUEST);
-        auto* req = msg.mutable_request();
-        req->set_id(static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count()));
-        req->set_verb("GET");
-        req->set_path("/v1/keepalive");
-        std::string serialized;
-        msg.SerializeToString(&serialized);
-        enqueue(Bytes(serialized.begin(), serialized.end()));
+    ~Impl() {
+        if (chat.raw) {
+            struct State {
+                std::mutex mutex;
+                std::condition_variable cv;
+                bool done = false;
+            } state;
+            SignalCPromisebool promise{};
+            promise.context = &state;
+            promise.complete = [](SignalFfiError* error, SignalType_ConstPointer_bool, const void* context) {
+                auto* st = const_cast<State*>(static_cast<const State*>(context));
+                if (error) signal_error_free(error);
+                {
+                    std::lock_guard<std::mutex> lock(st->mutex);
+                    st->done = true;
+                }
+                st->cv.notify_one();
+            };
+            SignalFfiError* callErr = signal_provisioning_chat_connection_disconnect(
+                &promise, SignalConstPointerTokioAsyncContext{asyncContext.raw}, SignalConstPointerProvisioningChatConnection{chat.raw});
+            if (callErr) {
+                signal_error_free(callErr);
+            } else {
+                std::unique_lock<std::mutex> lock(state.mutex);
+                state.cv.wait(lock, [&] { return state.done; });
+            }
+            SignalFfiError* destroyErr = signal_provisioning_chat_connection_destroy(chat);
+            if (destroyErr) signal_error_free(destroyErr);
+        }
+        SignalFfiError* err = signal_connection_manager_destroy(connectionManager);
+        if (err) signal_error_free(err);
+        err = signal_tokio_async_context_destroy(asyncContext);
+        if (err) signal_error_free(err);
     }
 
     void printLinkUrl(const std::string& address) {
@@ -291,205 +335,165 @@ struct ProvisioningClient::Impl {
         renderQr(url);
     }
 
-    void handleIncomingMessage(const Bytes& data) {
-        signalservice::WebSocketMessage msg;
-        if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size()))) return;
-        if (msg.type() != signalservice::WebSocketMessage_Type_REQUEST || !msg.has_request()) return;
+    // The FFI already unwraps the old WebSocketRequestMessage(verb=PUT,
+    // path=/v1/address) framing and the ProvisioningAddress protobuf for
+    // us - this callback just gets the plain address string directly, no
+    // manual parsing needed anymore (unlike the old lws implementation's
+    // handleIncomingMessage()).
+    static int32_t onReceivedAddress(void* ctx, SignalCStringPtr address, SignalMutPointerServerMessageAck ack) {
+        auto* self = static_cast<Impl*>(ctx);
+        std::string addressStr(reinterpret_cast<const char*>(address));
+        signal_free_string(address);
 
-        const auto& req = msg.request();
+        SignalFfiError* ackErr = signal_server_message_ack_send(SignalConstPointerServerMessageAck{ack.raw});
+        if (ackErr) signal_error_free(ackErr);
+        SignalFfiError* destroyErr = signal_server_message_ack_destroy(ack);
+        if (destroyErr) signal_error_free(destroyErr);
 
-        signalservice::WebSocketMessage ack;
-        ack.set_type(signalservice::WebSocketMessage_Type_RESPONSE);
-        auto* ackResp = ack.mutable_response();
-        ackResp->set_id(req.id());
-        ackResp->set_status(200);
-        ackResp->set_message("OK");
-        std::string serializedAck;
-        ack.SerializeToString(&serializedAck);
-        enqueue(Bytes(serializedAck.begin(), serializedAck.end()));
-
-        if (req.verb() == "PUT" && req.path() == "/v1/address") {
-            signalservice::ProvisioningAddress address;
-            if (!address.ParseFromString(req.body())) return;
-            {
-                std::lock_guard<std::mutex> lock(resultMutex);
-                gotAddress = true;
-            }
-            resultCv.notify_all();
-            printLinkUrl(address.address());
-            return;
-        }
-
-        if (req.verb() == "PUT" && req.path() == "/v1/message") {
-            try {
-                signalservice::ProvisionEnvelope envelope;
-                if (!envelope.ParseFromString(req.body())) throw std::runtime_error("bad ProvisionEnvelope");
-                Bytes publicKey(envelope.publickey().begin(), envelope.publickey().end());
-                Bytes body(envelope.body().begin(), envelope.body().end());
-                Bytes plaintext = decryptProvisionEnvelope(ourKeyPair.privateKey, publicKey, body);
-
-                signalservice::ProvisionMessage pm;
-                if (!pm.ParseFromArray(plaintext.data(), static_cast<int>(plaintext.size()))) {
-                    throw std::runtime_error("bad ProvisionMessage");
-                }
-
-                ProvisionMessageResult r;
-                r.e164 = pm.number();
-                r.aci = pm.aci();
-                r.pni = pm.pni();
-                r.aciIdentityKeyPublic.assign(pm.aciidentitykeypublic().begin(), pm.aciidentitykeypublic().end());
-                r.aciIdentityKeyPrivate.assign(pm.aciidentitykeyprivate().begin(), pm.aciidentitykeyprivate().end());
-                r.pniIdentityKeyPublic.assign(pm.pniidentitykeypublic().begin(), pm.pniidentitykeypublic().end());
-                r.pniIdentityKeyPrivate.assign(pm.pniidentitykeyprivate().begin(), pm.pniidentitykeyprivate().end());
-                r.provisioningCode = pm.provisioningcode();
-                if (pm.has_profilekey()) r.profileKey = Bytes(pm.profilekey().begin(), pm.profilekey().end());
-                if (pm.has_accountentropypool()) r.accountEntropyPool = pm.accountentropypool();
-                if (pm.has_mediarootbackupkey()) {
-                    r.mediaRootBackupKey = Bytes(pm.mediarootbackupkey().begin(), pm.mediarootbackupkey().end());
-                }
-
-                std::lock_guard<std::mutex> lock(resultMutex);
-                result = std::move(r);
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lock(resultMutex);
-                failure = e.what();
-            }
-            resultCv.notify_all();
-        }
-    }
-};
-
-const lws_protocols ProvisioningClient::Impl::kProtocols[] = {
-    {"signal-provisioning-websocket", &ProvisioningClient::Impl::callback, 0, 65536, 0, nullptr, 0},
-    {nullptr, nullptr, 0, 0, 0, nullptr, 0},
-};
-
-int ProvisioningClient::Impl::callback(lws* wsi, lws_callback_reasons reason, void* user, void* in, size_t len) {
-    auto* self = static_cast<Impl*>(lws_context_user(lws_get_context(wsi)));
-    if (!self) return 0;
-
-    switch (reason) {
-        case LWS_CALLBACK_CLIENT_ESTABLISHED: {
-            {
-                std::lock_guard<std::mutex> lock(self->connectMutex);
-                self->connected = true;
-            }
-            self->connectCv.notify_all();
-            break;
-        }
-        case LWS_CALLBACK_CLIENT_CONNECTION_ERROR: {
-            {
-                std::lock_guard<std::mutex> lock(self->connectMutex);
-                self->connectFailed = true;
-                self->connectError = in ? std::string(static_cast<const char*>(in), len) : "connection error";
-            }
-            self->connectCv.notify_all();
-            break;
-        }
-        case LWS_CALLBACK_CLIENT_CLOSED: {
+        {
             std::lock_guard<std::mutex> lock(self->resultMutex);
-            if (!self->result && !self->failure) self->failure = "socket closed before linking completed";
-            self->resultCv.notify_all();
-            break;
+            self->gotAddress = true;
         }
-        case LWS_CALLBACK_CLIENT_RECEIVE: {
-            const auto* bytes = static_cast<const uint8_t*>(in);
-            self->rxBuffer.insert(self->rxBuffer.end(), bytes, bytes + len);
-            if (lws_is_final_fragment(wsi)) {
-                self->handleIncomingMessage(self->rxBuffer);
-                self->rxBuffer.clear();
-            }
-            break;
-        }
-        case LWS_CALLBACK_CLIENT_WRITEABLE: {
-            Bytes message;
-            {
-                std::lock_guard<std::mutex> lock(self->outgoingMutex);
-                if (self->outgoing.empty()) break;
-                message = std::move(self->outgoing.front());
-                self->outgoing.pop_front();
-            }
-            std::vector<uint8_t> buffer(LWS_PRE + message.size());
-            std::memcpy(buffer.data() + LWS_PRE, message.data(), message.size());
-            lws_write(wsi, buffer.data() + LWS_PRE, message.size(), LWS_WRITE_BINARY);
-            {
-                std::lock_guard<std::mutex> lock(self->outgoingMutex);
-                if (!self->outgoing.empty()) lws_callback_on_writable(wsi);
-            }
-            break;
-        }
-        default:
-            break;
+        self->resultCv.notify_all();
+        self->printLinkUrl(addressStr);
+        return 0;
     }
-    return 0;
-}
+
+    // Unlike the address, the envelope's crypto is genuinely ours to
+    // handle (ECDH against our own ephemeral keypair, see
+    // ProvisioningCipher.h) - the FFI has no reason to know our key, so
+    // it just hands back the raw ProvisionEnvelope protobuf bytes exactly
+    // like the old implementation received, and everything from here
+    // down is unchanged from before.
+    static int32_t onReceivedEnvelope(void* ctx, SignalOwnedBuffer envelope, SignalMutPointerServerMessageAck ack) {
+        auto* self = static_cast<Impl*>(ctx);
+        Bytes envelopeBytes = takeOwned(envelope);
+
+        SignalFfiError* ackErr = signal_server_message_ack_send(SignalConstPointerServerMessageAck{ack.raw});
+        if (ackErr) signal_error_free(ackErr);
+        SignalFfiError* destroyErr = signal_server_message_ack_destroy(ack);
+        if (destroyErr) signal_error_free(destroyErr);
+
+        try {
+            signalservice::ProvisionEnvelope pe;
+            if (!pe.ParseFromArray(envelopeBytes.data(), static_cast<int>(envelopeBytes.size()))) {
+                throw std::runtime_error("bad ProvisionEnvelope");
+            }
+            Bytes publicKey(pe.publickey().begin(), pe.publickey().end());
+            Bytes body(pe.body().begin(), pe.body().end());
+            Bytes plaintext = decryptProvisionEnvelope(self->ourKeyPair.privateKey, publicKey, body);
+
+            signalservice::ProvisionMessage pm;
+            if (!pm.ParseFromArray(plaintext.data(), static_cast<int>(plaintext.size()))) {
+                throw std::runtime_error("bad ProvisionMessage");
+            }
+
+            ProvisionMessageResult r;
+            r.e164 = pm.number();
+            r.aci = pm.aci();
+            r.pni = pm.pni();
+            r.aciIdentityKeyPublic.assign(pm.aciidentitykeypublic().begin(), pm.aciidentitykeypublic().end());
+            r.aciIdentityKeyPrivate.assign(pm.aciidentitykeyprivate().begin(), pm.aciidentitykeyprivate().end());
+            r.pniIdentityKeyPublic.assign(pm.pniidentitykeypublic().begin(), pm.pniidentitykeypublic().end());
+            r.pniIdentityKeyPrivate.assign(pm.pniidentitykeyprivate().begin(), pm.pniidentitykeyprivate().end());
+            r.provisioningCode = pm.provisioningcode();
+            if (pm.has_profilekey()) r.profileKey = Bytes(pm.profilekey().begin(), pm.profilekey().end());
+            if (pm.has_accountentropypool()) r.accountEntropyPool = pm.accountentropypool();
+            if (pm.has_mediarootbackupkey()) {
+                r.mediaRootBackupKey = Bytes(pm.mediarootbackupkey().begin(), pm.mediarootbackupkey().end());
+            }
+
+            std::lock_guard<std::mutex> lock(self->resultMutex);
+            self->result = std::move(r);
+        } catch (const std::exception& e) {
+            std::lock_guard<std::mutex> lock(self->resultMutex);
+            self->failure = e.what();
+        }
+        self->resultCv.notify_all();
+        return 0;
+    }
+
+    static int32_t onConnectionInterrupted(void* ctx, SignalFfiError* error) {
+        auto* self = static_cast<Impl*>(ctx);
+        if (error) signal_error_free(error);
+        std::lock_guard<std::mutex> lock(self->resultMutex);
+        if (!self->result && !self->failure) self->failure = "socket closed before linking completed";
+        self->resultCv.notify_all();
+        return 0;
+    }
+};
 
 ProvisioningClient::ProvisioningClient(std::string caCertPath, std::string serverHost) : impl_(new Impl()) {
     impl_->caCertPath = std::move(caCertPath);
     impl_->serverHost = std::move(serverHost);
-    impl_->ourKeyPair = generateKeyPair();
 }
 
-ProvisioningClient::~ProvisioningClient() {
-    impl_->stopping.store(true);
-    if (impl_->context) lws_cancel_service(impl_->context);
-    if (impl_->serviceThread.joinable()) impl_->serviceThread.join();
-    if (impl_->keepAliveThread.joinable()) impl_->keepAliveThread.join();
-    if (impl_->context) {
-        lws_context_destroy(impl_->context);
-        impl_->context = nullptr;
-    }
-    delete impl_;
-}
+ProvisioningClient::~ProvisioningClient() { delete impl_; }
 
 ProvisionMessageResult ProvisioningClient::waitForProvisionMessage() {
-    // Nothing in this file ever called lws_set_log_level(), so
-    // libwebsockets ran at its own built-in default (errors + warnings +
-    // NOTICE) - the NOTICE tier is pure connection-lifecycle bookkeeping
-    // (context creation, object refcounting, accept-gating) that's noise
-    // to an operator watching for the QR/link result, not useful
-    // diagnostics. Real failures still surface via LLL_ERR/LLL_WARN and
-    // via this function's own std::runtime_error on timeout/failure.
-    lws_set_log_level(LLL_ERR | LLL_WARN, nullptr);
+    struct ConnectState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        bool abandoned = false;
+        SignalFfiError* error = nullptr;
+        SignalMutPointerProvisioningChatConnection result{};
+    };
+    auto* state = new ConnectState();
 
-    lws_context_creation_info info{};
-    info.port = CONTEXT_PORT_NO_LISTEN;
-    info.protocols = Impl::kProtocols;
-    info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
-    info.client_ssl_ca_filepath = impl_->caCertPath.c_str();
-    info.user = impl_;
-
-    impl_->context = lws_create_context(&info);
-    if (!impl_->context) throw std::runtime_error("lws_create_context failed");
-
-    lws_client_connect_info connectInfo{};
-    connectInfo.context = impl_->context;
-    connectInfo.address = impl_->serverHost.c_str();
-    connectInfo.port = 443;
-    connectInfo.ssl_connection = LCCSCF_USE_SSL;
-    connectInfo.path = "/v1/websocket/provisioning/";
-    connectInfo.host = connectInfo.address;
-    connectInfo.origin = connectInfo.address;
-    connectInfo.protocol = Impl::kProtocols[0].name;
-    connectInfo.pwsi = &impl_->wsi;
-
-    if (!lws_client_connect_via_info(&connectInfo)) {
-        throw std::runtime_error("lws_client_connect_via_info failed");
-    }
-
-    impl_->serviceThread = std::thread([this] {
-        while (!impl_->stopping.load()) {
-            lws_service(impl_->context, 50);
+    SignalCPromiseMutPointerProvisioningChatConnection promise{};
+    promise.context = state;
+    promise.complete = [](SignalFfiError* error, SignalType_ConstPointer_SignalMutPointerProvisioningChatConnection result,
+                           const void* context) {
+        auto* st = const_cast<ConnectState*>(static_cast<const ConnectState*>(context));
+        bool selfCleanup = false;
+        {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            if (st->abandoned) {
+                selfCleanup = true;
+            } else {
+                st->error = error;
+                if (!error && result) st->result = *result;
+                st->done = true;
+            }
         }
-    });
+        if (selfCleanup) {
+            if (error) signal_error_free(error);
+            // Nobody's waiting anymore (waitForProvisionMessage() already
+            // gave up) - just let the connection get dropped rather than
+            // trying to tear it down from here; this is a one-shot CLI
+            // tool, not a long-lived service that needs to avoid a
+            // second live session the way AuthSocket's reconnect() does.
+            delete st;
+        } else {
+            st->cv.notify_all();
+        }
+    };
 
-    {
-        std::unique_lock<std::mutex> lock(impl_->connectMutex);
-        bool ok = impl_->connectCv.wait_for(lock, std::chrono::seconds(15),
-                                            [this] { return impl_->connected || impl_->connectFailed; });
-        if (!ok) throw std::runtime_error("timed out connecting to provisioning websocket");
-        if (impl_->connectFailed) throw std::runtime_error("provisioning websocket connect failed: " + impl_->connectError);
+    SignalFfiError* callErr = signal_provisioning_chat_connection_connect(
+        &promise, SignalConstPointerTokioAsyncContext{impl_->asyncContext.raw}, SignalConstPointerConnectionManager{impl_->connectionManager.raw});
+    if (callErr) {
+        delete state;
+        checkError(callErr);
     }
+
+    bool ok;
+    {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        ok = state->cv.wait_for(lock, std::chrono::seconds(15), [&] { return state->done; });
+        if (!ok) state->abandoned = true;
+    }
+    if (!ok) throw std::runtime_error("timed out connecting to provisioning websocket");
+
+    SignalFfiError* connectErrPtr = state->error;
+    SignalMutPointerProvisioningChatConnection connectResult = state->result;
+    delete state;
+    checkError(connectErrPtr);
+
+    impl_->chat = connectResult;
+    checkError(signal_provisioning_chat_connection_init_listener(
+        SignalConstPointerProvisioningChatConnection{impl_->chat.raw},
+        SignalConstPointerFfiProvisioningListenerStruct{&impl_->listenerStruct}));
 
     // LIFESPAN_MS/ADDRESS_TIMEOUT_MS from link-new-device.js, both measured
     // from the moment the socket is actually open (same as its ws.on('open')
@@ -497,13 +501,6 @@ ProvisionMessageResult ProvisioningClient::waitForProvisionMessage() {
     auto opened = std::chrono::steady_clock::now();
     auto addressDeadline = opened + std::chrono::seconds(10);
     auto lifespanDeadline = opened + std::chrono::seconds(90);
-
-    impl_->keepAliveThread = std::thread([this] {
-        while (!impl_->stopping.load()) {
-            for (int i = 0; i < 300 && !impl_->stopping.load(); i++) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (!impl_->stopping.load()) impl_->sendKeepAlive();
-        }
-    });
 
     std::unique_lock<std::mutex> lock(impl_->resultMutex);
     bool gotAddressInTime = impl_->resultCv.wait_until(

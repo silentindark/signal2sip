@@ -42,7 +42,11 @@ set(PIN_LLD21 -B${LLD21_BINDIR} -fuse-ld=lld)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(SQLCIPHER REQUIRED IMPORTED_TARGET sqlcipher)
-pkg_check_modules(LIBWEBSOCKETS REQUIRED IMPORTED_TARGET libwebsockets)
+# libwebsockets itself was removed as a build dependency 2026-08-12 -
+# AuthSocket.cpp and gendb/ProvisioningClient.cpp were its only two
+# consumers project-wide, both migrated onto libsignal's own FFI chat-
+# connection client (see AuthSocket.cpp's doc comment for the full
+# rationale). No target links PkgConfig::LIBWEBSOCKETS anymore.
 # Was the same shared /usr/local install tg2sip-webrtc itself links
 # against (PJSIP 2.9, built with --disable-sound - fine for us too, since
 # the whole point of Milestone F's ring-buffer bridge is to never touch
@@ -483,13 +487,13 @@ add_library(signal2sip_gendb STATIC
 )
 target_include_directories(signal2sip_gendb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip_gendb PUBLIC signal2sip_signal signal2sip_storage signal2sip_proto
-    signal2sip_config PkgConfig::LIBWEBSOCKETS CURL::libcurl OpenSSL::Crypto PkgConfig::QRENCODE)
+    signal2sip_config CURL::libcurl OpenSSL::Crypto PkgConfig::QRENCODE)
 
 add_executable(signal2sip-gendb gendb/main.cpp)
 target_include_directories(signal2sip-gendb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(signal2sip-gendb PRIVATE signal2sip_gendb signal2sip_config signal2sip_signal
     signal2sip_storage signal2sip_authsocket signal2sip_proto CURL::libcurl OpenSSL::Crypto
-    PkgConfig::LIBWEBSOCKETS PkgConfig::QRENCODE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
+    PkgConfig::QRENCODE nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS} pthread m)
 # See signal2sip-daemon's own -s comment above - same deal here.
 # PIN_LLD21: gendb also links libsignal_ffi_openssl_safe's BoringSSL Rust
 # code (via signal2sip_signal), so it hits the same distro-lld eh_frame

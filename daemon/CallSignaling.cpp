@@ -270,11 +270,11 @@ std::vector<int> CallMessageSender::sendContent(const std::string& destinationSe
         // ProtocolStores::mutex()). Never held across the network PUT
         // below - doing so previously reintroduced the exact
         // self-deadlock class the CallMessage-handling dispatch (see
-        // main.cpp's onPush()) was written to avoid, since AuthSocket's
-        // single service thread can only ever deliver that PUT's
-        // response by running lws_service() again, which it can't do
-        // while blocked trying to acquire this same lock for an
-        // unrelated incoming envelope.
+        // main.cpp's onPush()) was written to avoid: a push callback
+        // for an unrelated incoming envelope, running on a
+        // libsignal-net-chat worker thread, blocking trying to acquire
+        // this same lock while a send holds it across a PUT that thread
+        // might be needed to help service.
         std::lock_guard<std::mutex> lock(stores_.mutex());
         for (int deviceId : deviceIds) {
             EncryptedMessage encrypted = encryptForDevice(

@@ -1148,20 +1148,24 @@ void onPush(AccountState& acct, const std::string& verb, const std::string& path
     std::cout << "[daemon][" << acct.config.name << "] CallMessage from " << senderServiceId << " device "
                << senderDeviceId << "\n";
 
-    // Must not call handleCallMessage() directly on this thread: it's
-    // AuthSocket's single serviceThread (the one running lws_service()),
-    // and RingRTC can synchronously invoke a send_offer/send_answer/
+    // Must not call handleCallMessage() directly on this thread: it's a
+    // libsignal-net-chat worker thread (AuthSocket's ChatListener push
+    // callback, see AuthSocket.cpp's own doc comment - no longer a single
+    // fixed serviceThread since the 2026-08-12 libwebsockets -> FFI
+    // migration, but still not a thread that's safe to block at length
+    // on), and RingRTC can synchronously invoke a send_offer/send_answer/
     // send_ice callback in reaction to this incoming CallMessage. Those
-    // callbacks block on AuthSocket::request() waiting for a response -
-    // but the response can only ever be delivered by this same thread's
-    // lws_service() loop, which can't run again until this call stack
-    // unwinds. That's a guaranteed self-deadlock (observed live as
-    // "PUT /v1/messages ... timed out waiting for a response" exactly
-    // 30s later, intermittently - only when RingRTC happened to react
-    // synchronously rather than via its own actor thread). Dispatching
-    // via the ordered queue (see EnvelopeDispatchQueue) keeps this
-    // thread free to keep servicing the socket, while still processing
-    // envelopes in arrival order and giving shutdown something to join.
+    // callbacks block on AuthSocket::request() waiting for a response.
+    // Before the migration this was a *guaranteed* self-deadlock (only
+    // one thread ever delivered any response, and it would be the one
+    // blocked); the new async/multi-worker-thread model doesn't have
+    // that exact single-point failure, but nesting a blocking wait
+    // inside a callback invoked from the runtime's own worker pool is
+    // still the kind of thing that starves it under load, not something
+    // to rely on being safe. Dispatching via the ordered queue (see
+    // EnvelopeDispatchQueue) keeps this thread free to keep servicing
+    // the socket, while still processing envelopes in arrival order and
+    // giving shutdown something to join.
     signalservice::CallMessage callMessage = content.callmessage();
     uint32_t localDeviceId = static_cast<uint32_t>(acct.account.device_id);
     acct.dispatchQueue.push([&acct, senderServiceId, senderDeviceId, localDeviceId, callMessage] {
