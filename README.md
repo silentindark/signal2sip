@@ -13,3 +13,7 @@ config instructions.
 Copyright (C) 2026 Vlad Vorobev. Licensed under [AGPL-3.0](LICENSE) (see
 [`NOTICE`](NOTICE)) - see [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)
 for why (statically linking Signal's own AGPL-3.0 `libsignal`/`ringrtc`).
+
+signal2sip is not affiliated with, endorsed by, or sponsored by
+[Signal Messenger, LLC](https://signal.org/) or
+[Signal Technology Foundation](https://signalfoundation.org/).
