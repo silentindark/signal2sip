@@ -133,8 +133,7 @@ fi
 
 $SUDO apt-get install -y \
     build-essential cmake git curl pkg-config python3 lld-21 \
-    libssl-dev libcurl4-openssl-dev libqrencode-dev \
-    libwebsockets-dev nlohmann-json3-dev \
+    libssl-dev libcurl4-openssl-dev libqrencode-dev nlohmann-json3-dev \
     protobuf-compiler libprotobuf-dev libsqlcipher-dev \
     libclang-dev clang libpulse-dev libftxui-dev
 

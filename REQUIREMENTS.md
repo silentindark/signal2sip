@@ -55,8 +55,7 @@ Installed via `apt-get install -y` from Debian's own repos:
 
 ```
 build-essential cmake git curl pkg-config python3
-libssl-dev libcurl4-openssl-dev libqrencode-dev
-libwebsockets-dev nlohmann-json3-dev
+libssl-dev libcurl4-openssl-dev libqrencode-dev nlohmann-json3-dev
 protobuf-compiler libprotobuf-dev libsqlcipher-dev
 libclang-dev clang libpulse-dev libftxui-dev
 ```
@@ -75,8 +74,8 @@ runtime (non-`-dev`) packages must be present on the deployment target:
 
 | Binary | Runtime packages needed |
 |---|---|
-| `signal2sip-daemon` | `libssl3t64`, `libwebsockets19t64`, `libprotobuf32t64`, `libsqlcipher1`, `libpulse0` |
-| `signal2sip-gendb` | `libssl3t64`, `libcurl4t64`, `libwebsockets19t64`, `libqrencode4`, `libprotobuf32t64`, `libsqlcipher1` |
+| `signal2sip-daemon` | `libssl3t64`, `libprotobuf32t64`, `libsqlcipher1`, `libpulse0` |
+| `signal2sip-gendb` | `libssl3t64`, `libcurl4t64`, `libqrencode4`, `libprotobuf32t64`, `libsqlcipher1` |
 | `signal2sip-tui` | `libftxui-component5.0.0`, `libftxui-dom5.0.0`, `libftxui-screen5.0.0`, `libsqlcipher1` |
 
 (exact package names/versions as of Debian 13 trixie - re-check with
