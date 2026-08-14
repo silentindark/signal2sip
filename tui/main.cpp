@@ -15,7 +15,7 @@
 // and Screen 5 (new-account wizard - register or link). Two confirmation
 // severities, matching the concept's own distinction: a plain y/n with
 // the real consequence spelled out for reversible-but-impactful actions
-// (disable/enable/unregister), and a type-the-account-name confirmation
+// (disable/enable/deactivate), and a type-the-account-name confirmation
 // for the one truly irreversible action (delete-account) - mirrors
 // GitHub's own repo-delete pattern. Screen 4 edits are written one
 // changed field at a time via `signal2sip-gendb <name> config set
@@ -637,7 +637,7 @@ int main(int argc, char** argv) {
     // typing for the delete-account variant; `lastResult` is set once the
     // gendb subprocess has actually run, switching the same screen from
     // "confirm?" to "here's what happened" (dismissed by any key).
-    enum class PendingAction { None, Enable, Disable, Unregister, DeleteAccount };
+    enum class PendingAction { None, Enable, Disable, Deactivate, DeleteAccount };
     PendingAction pending = PendingAction::None;
     std::string typedConfirm;
     std::optional<GendbResult> lastResult;
@@ -654,7 +654,7 @@ int main(int argc, char** argv) {
         switch (pending) {
             case PendingAction::Enable: args.push_back("enable"); break;
             case PendingAction::Disable: args.push_back("disable"); break;
-            case PendingAction::Unregister: args.push_back("unregister"); break;
+            case PendingAction::Deactivate: args.push_back("deactivate"); break;
             case PendingAction::DeleteAccount: args.push_back("delete-account"); break;
             case PendingAction::None: return;
         }
@@ -790,7 +790,7 @@ int main(int argc, char** argv) {
                               keyHint("c", tr(Key::FooterConfigureSip)),
                               keyHint("s", tr(Key::FooterSignalSettings)),
                               keyHint("d", detail.enabled ? tr(Key::FooterDisable) : tr(Key::FooterEnable)),
-                              keyHint("u", "unregister"),
+                              keyHint("u", "deactivate"),
                           }) |
                           bgcolor(kBgAlt);
         Element footer2 = hflow({text(" "),
@@ -818,7 +818,7 @@ int main(int argc, char** argv) {
         switch (action) {
             case PendingAction::Enable: return format1(Key::ActionEnableTitle, detailName);
             case PendingAction::Disable: return format1(Key::ActionDisableTitle, detailName);
-            case PendingAction::Unregister: return format1(Key::ActionUnregisterTitle, detailName);
+            case PendingAction::Deactivate: return format1(Key::ActionDeactivateTitle, detailName);
             case PendingAction::DeleteAccount: return format1(Key::ActionDeleteTitle, detailName);
             case PendingAction::None: return "";
         }
@@ -828,7 +828,7 @@ int main(int argc, char** argv) {
         switch (action) {
             case PendingAction::Enable: return tr(Key::ActionEnableBody);
             case PendingAction::Disable: return tr(Key::ActionDisableBody);
-            case PendingAction::Unregister: return tr(Key::ActionUnregisterBody);
+            case PendingAction::Deactivate: return tr(Key::ActionDeactivateBody);
             case PendingAction::DeleteAccount: return tr(Key::ActionDeleteBody);
             case PendingAction::None: return "";
         }
@@ -1691,7 +1691,7 @@ int main(int argc, char** argv) {
             return true;
         }
         if (event == Event::Character('u')) {
-            openConfirm(PendingAction::Unregister);
+            openConfirm(PendingAction::Deactivate);
             return true;
         }
         if (event == Event::Character('x')) {

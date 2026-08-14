@@ -41,6 +41,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -122,7 +123,7 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
 // PUT /v1/accounts/attributes/ once per setupAccount() - same call
 // gendb's putFetchesMessages()/toggle_discoverability_test.cpp already
 // proved live, just fired here automatically instead of only on a manual
-// `unregister`/`reactivate`. Exists to close a suspected gap behind
+// `deactivate`/`reactivate`. Exists to close a suspected gap behind
 // project memory project_signal2sip_cds_discoverability.md: a real
 // client keeps re-sending this attributes body periodically
 // (RefreshAttributesJob), giving Signal-Server's CDS DynamoDB-stream
@@ -329,6 +330,24 @@ struct AccountState {
     // direction from sipCall above; still only one of the two at a time,
     // same one-call-per-account scope).
     pj::Call* incomingSipCall = nullptr;
+
+    // Guards remotePeerId + sipCall + incomingSipCall together (one
+    // call's identity, always changes as a unit) - needed once
+    // something reads them from a thread other than RingRTC's own
+    // callback thread. Added for DTMF-over-text (onPush() reads all
+    // three, on a libsignal-net-chat worker thread, to decide where to
+    // forward a matching text message): a bare pointer read here isn't
+    // like onIncomingCall()'s existing unlocked `if (acct.sipCall)`
+    // truthiness check (harmless if stale) - DTMF actually dereferences
+    // the pointer (`call->dialDtmf(...)`), and stopSipBridge()/
+    // stopIncomingSipCall() do `delete call;` BEFORE `acct.sipCall =
+    // nullptr;`, unlocked - an unsynchronized read in that exact window
+    // would be a real use-after-free, not just a stale value. Take this
+    // only around the actual pointer/string mutation (or the DTMF
+    // check+send) - never around hangup()'s own up-to-5s
+    // disconnect-poll loop, so a hangup in progress never blocks
+    // message handling for seconds.
+    std::mutex callHandoffMutex;
 
     EnvelopeDispatchQueue dispatchQueue;
 
@@ -905,8 +924,14 @@ void stopSipBridge(AccountState& acct) {
         for (int i = 0; i < 50 && !call->disconnected_.load(); i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        delete call;
-        acct.sipCall = nullptr;
+        {
+            // See AccountState::callHandoffMutex's own doc comment -
+            // only the delete+nullptr needs the lock, not the hangup()/
+            // disconnect-poll above.
+            std::lock_guard<std::mutex> lock(acct.callHandoffMutex);
+            delete call;
+            acct.sipCall = nullptr;
+        }
     }
     acct.bridge.reset();
 }
@@ -932,8 +957,14 @@ void stopIncomingSipCall(AccountState& acct) {
         for (int i = 0; i < 50 && !call->disconnected_.load(); i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        delete call;
-        acct.incomingSipCall = nullptr;
+        {
+            // See AccountState::callHandoffMutex's own doc comment -
+            // only the delete+nullptr needs the lock, not the hangup()/
+            // disconnect-poll above.
+            std::lock_guard<std::mutex> lock(acct.callHandoffMutex);
+            delete call;
+            acct.incomingSipCall = nullptr;
+        }
     }
     acct.bridge.reset();
 }
@@ -976,7 +1007,10 @@ void runProbe(AccountState& acct) {
 void onCallState(void* context, const char* remotePeerId, uint64_t callId, int32_t state) {
     auto& acct = *static_cast<AccountState*>(context);
     acct.activeCallId = callId;
-    acct.remotePeerId = remotePeerId;
+    {
+        std::lock_guard<std::mutex> lock(acct.callHandoffMutex);
+        acct.remotePeerId = remotePeerId;
+    }
     std::cout << "[daemon][" << acct.config.name << "] call_state -> " << state << " (peer " << remotePeerId
                << ")\n";
 
@@ -1165,8 +1199,60 @@ void onPush(AccountState& acct, const std::string& verb, const std::string& path
         return;
     }
     if (content.has_datamessage()) {
-        std::cout << "[daemon][" << acct.config.name << "][diag] DataMessage body: " << content.datamessage().body()
-                   << "\n";
+        const auto& dataMessage = content.datamessage();
+        std::cout << "[daemon][" << acct.config.name << "][diag] DataMessage body: " << dataMessage.body() << "\n";
+
+        // DTMF-over-text: Signal's own apps have no in-call dialpad at
+        // all (confirmed 2026-08-13 via source - zero "dtmf" matches
+        // anywhere in Signal-Android; Signal-iOS explicitly disables it,
+        // `callUpdate.supportsDTMF = false` plus a stubbed
+        // CXPlayDTMFCallAction handler in CallKitCallUIAdaptee.swift) -
+        // so a caller bridged through signal2sip has no way to press
+        // touch-tones into a PBX IVR/menu. Same workaround already
+        // proven live in this project's sibling Telegram bridge
+        // (tg2sip-webrtc/tg2sip/gateway.cpp's IsDtmfString/DialDtmf,
+        // hitting the identical "no in-call dialpad" problem there):
+        // while a call with a given peer is active, a plain 1:1 text
+        // message from that SAME peer matching the DTMF alphabet is
+        // forwarded as a real SIP DTMF event (RFC 2833) into the
+        // bridged call instead of being treated as a chat message.
+        // `A-Da-d` (not just uppercase like tg2sip's original) because
+        // PJSIP itself lowercases before matching - matching only
+        // uppercase would silently reject a real lowercase digit for no
+        // reason. Group messages excluded - this is a 1:1-call-scoped
+        // feature, a group chat message that happens to look like
+        // digits from the same person shouldn't fire it.
+        static const std::regex kDtmfRegex("^[0-9A-Da-d*#]{1,32}$");
+        if (!dataMessage.has_groupv2() && std::regex_match(dataMessage.body(), kDtmfRegex)) {
+            // See AccountState::callHandoffMutex's own doc comment -
+            // remotePeerId/sipCall/incomingSipCall are written from
+            // RingRTC's own callback thread, this runs on a
+            // libsignal-net-chat worker thread; held across the whole
+            // check+send since dialDtmf() is a fast, local,
+            // non-blocking PJSIP call (pjmedia_stream_dial_dtmf just
+            // pushes into a small buffer under its own separate
+            // mutex), not a network round-trip.
+            std::lock_guard<std::mutex> lock(acct.callHandoffMutex);
+            if (senderServiceId == acct.remotePeerId) {
+                pj::Call* call = acct.sipCall ? acct.sipCall : acct.incomingSipCall;
+                if (call) {
+                    std::cout << "[daemon][" << acct.config.name << "] sending DTMF '" << dataMessage.body()
+                               << "' into the bridged SIP call\n";
+                    // Required before any pjsua2 call from a thread
+                    // that's never touched PJSIP before - see this
+                    // function's own doc comment for the two silent-
+                    // breakage bugs this project already hit from
+                    // skipping it.
+                    registerPjsipThreadIfNeeded();
+                    try {
+                        call->dialDtmf(dataMessage.body());
+                    } catch (pj::Error& err) {
+                        std::cerr << "[daemon][" << acct.config.name << "] DTMF send failed: " << err.info()
+                                   << "\n";
+                    }
+                }
+            }
+        }
     }
     // A real primary device sends this (SyncMessage.Keys) whenever an
     // already-linked secondary device's account_entropy_pool needs

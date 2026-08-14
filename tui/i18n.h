@@ -27,8 +27,10 @@
 //     wizTransport (sms/voice) - these are real argv values, not display
 //     text, and must stay exactly what gendb parses.
 //   - protocol/brand terms with no real translation in practice (SIP,
-//     TLS, SRTP, E.164, ACI, QR, captcha, unregister/register/link as
-//     gendb subcommand names).
+//     TLS, SRTP, E.164, ACI, QR, captcha, deactivate/register/link as
+//     gendb subcommand names - `unregister` also still works as an
+//     alias for `deactivate` on the gendb CLI, but the TUI only ever
+//     invokes the new name).
 // Everything else - labels, navigation hints, confirmation prose, error/
 // warning messages - is translated.
 #pragma once
@@ -57,8 +59,8 @@ enum class Key {
     DetailTitlebar, FooterConfigureSip, FooterDisable, FooterEnable, FooterSignalSettings,
     FooterDeleteAccount, FooterBack,
     SignalingUdpInsecure, MediaSrtpNotGuaranteedPrefix,
-    ActionEnableTitle, ActionDisableTitle, ActionUnregisterTitle, ActionDeleteTitle,
-    ActionEnableBody, ActionDisableBody, ActionUnregisterBody, ActionDeleteBody,
+    ActionEnableTitle, ActionDisableTitle, ActionDeactivateTitle, ActionDeleteTitle,
+    ActionEnableBody, ActionDisableBody, ActionDeactivateBody, ActionDeleteBody,
     ResultDone, ResultError, AnyKeyToList, TypeAccountName, ConfirmAccountLabel,
     FooterCancel, EnterDelete, TypeNameInFull, FooterConfirm,
     ErrSipHostRequired, ErrSipExtensionRequired, ErrSipPasswordRequired, ErrTlsRequiresCa,
@@ -177,9 +179,9 @@ inline constexpr const char* kTable[kKeyCount][kLangCount] = {
                               "activer {} ?", "abilitare {}?", "¿habilitar {}?", "habilitar {}?"},
     /* ActionDisableTitle */ {"disable {}?", "вимкнути {}?", "выключить {}?", "wyłączyć {}?", "{} deaktivieren?",
                                "désactiver {} ?", "disabilitare {}?", "¿deshabilitar {}?", "desabilitar {}?"},
-    /* ActionUnregisterTitle */ {"unregister {}?", "unregister {}?", "unregister {}?", "unregister {}?",
-                                  "unregister {}?", "unregister {}?", "unregister {}?", "unregister {}?",
-                                  "unregister {}?"},
+    /* ActionDeactivateTitle */ {"deactivate {}?", "deactivate {}?", "deactivate {}?", "deactivate {}?",
+                                  "deactivate {}?", "deactivate {}?", "deactivate {}?", "deactivate {}?",
+                                  "deactivate {}?"},
     /* ActionDeleteTitle */ {"⚠ delete account {}", "⚠ видалити акаунт {}", "⚠ удалить аккаунт {}",
                               "⚠ usuń konto {}", "⚠ Konto {} löschen", "⚠ supprimer le compte {}",
                               "⚠ elimina l'account {}", "⚠ eliminar la cuenta {}", "⚠ excluir a conta {}"},
@@ -217,7 +219,7 @@ inline constexpr const char* kTable[kKeyCount][kLangCount] = {
      "SIGHUP). Las llamadas entrantes dejarán de llegar. Reversible - enable restaurará el estado anterior.",
      "O daemon vai parar de erguer o SIP e a sessão do Signal desta conta em até 30s (ou imediatamente com "
      "SIGHUP). As chamadas recebidas vão parar de chegar. Reversível - enable restaura o estado anterior."},
-    /* ActionUnregisterBody */
+    /* ActionDeactivateBody */
     {"A real but reversible server-side flag (fetchesMessages=false) - the number becomes unreachable for "
      "incoming Signal messages until reactivate. Doesn't touch local data.",
      "Реальний, але оборотний серверний прапорець (fetchesMessages=false) - номер стане недоступним для "
