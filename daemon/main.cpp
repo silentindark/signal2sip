@@ -123,7 +123,7 @@ void refreshPrekeys(Storage& storage, AuthSocket& socket, const AccountRecord& a
 // PUT /v1/accounts/attributes/ once per setupAccount() - same call
 // gendb's putFetchesMessages()/toggle_discoverability_test.cpp already
 // proved live, just fired here automatically instead of only on a manual
-// `unregister`/`reactivate`. Exists to close a suspected gap behind
+// `deactivate`/`reactivate`. Exists to close a suspected gap behind
 // project memory project_signal2sip_cds_discoverability.md: a real
 // client keeps re-sending this attributes body periodically
 // (RefreshAttributesJob), giving Signal-Server's CDS DynamoDB-stream

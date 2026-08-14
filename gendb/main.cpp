@@ -548,7 +548,7 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
                  "else - re-run `register`/`link` to reuse this account name.\n";
 }
 
-// ---- Primary account lifecycle: unregister (soft) / reactivate ----
+// ---- Primary account lifecycle: deactivate (soft, alias: unregister) / reactivate ----
 
 // PUT /v1/accounts/attributes/ over the account's own authenticated
 // WebSocket (same call toggle_discoverability_test.cpp already proved
@@ -558,7 +558,7 @@ void cmdUnlink(const DaemonConfig& config, const std::string& accountName) {
 // NOT merge against the account's current values - so every field below
 // must always be resent, or it gets silently reset to a Java-default
 // (false/null) rather than left alone. fetchesMessages is the only field
-// that actually changes between unregister and reactivate; the rest just
+// that actually changes between deactivate and reactivate; the rest just
 // re-assert the same values cmdVerify/cmdLink already set at account
 // creation.
 // `name` must match whatever cmdLink/cmdVerify already set: null for a
@@ -599,18 +599,18 @@ void putFetchesMessages(Storage& storage, const AccountRecord& account, bool fet
     }
 }
 
-void cmdUnregister(const DaemonConfig& config, const std::string& accountName) {
+void cmdDeactivate(const DaemonConfig& config, const std::string& accountName) {
     Storage storage(config.global.dbPath, config.global.dbKey, accountName);
     if (!storage.hasAccount()) {
         throw std::runtime_error("account '" + accountName + "' has no saved account in the database");
     }
     AccountRecord account = storage.loadAccount();
     putFetchesMessages(storage, account, /*fetchesMessages=*/false);
-    std::cout << "[unregister] account '" << accountName << "' (e164=" << account.e164
+    std::cout << "[deactivate] account '" << accountName << "' (e164=" << account.e164
               << ") is now dormant (fetchesMessages=false) - senders can no longer reach this number.\n";
-    std::cout << "[unregister] this is REVERSIBLE and purely a server-side flag flip - no local data or "
+    std::cout << "[deactivate] this is REVERSIBLE and purely a server-side flag flip - no local data or "
                  "registration/identity keys were touched. Run `reactivate` to bring it back.\n";
-    std::cout << "[unregister] if signal2sip-daemon is currently running this account, stop it (or run "
+    std::cout << "[deactivate] if signal2sip-daemon is currently running this account, stop it (or run "
                  "`signal2sip-gendb " << accountName << " disable`) first - otherwise its already-open "
                  "connection may keep the account looking active until it next reconnects.\n";
 }
@@ -888,7 +888,7 @@ void printUsage() {
           "  signal2sip-gendb <account-name> verify <code> [--config <path>]\n"
           "  signal2sip-gendb <account-name> link [--config <path>]\n"
           "  signal2sip-gendb <account-name> unlink [--config <path>]\n"
-          "  signal2sip-gendb <account-name> unregister [--config <path>]\n"
+          "  signal2sip-gendb <account-name> deactivate [--config <path>]  (alias: unregister)\n"
           "  signal2sip-gendb <account-name> reactivate [--config <path>]\n"
           "  signal2sip-gendb <account-name> delete-account [--config <path>]\n"
           "  signal2sip-gendb <account-name> enable|disable [--config <path>]\n"
@@ -898,16 +898,17 @@ void printUsage() {
           "\n"
           "`delete-account` is REAL and IRREVERSIBLE - it deletes the account from Signal's real servers\n"
           "(DELETE /v1/accounts/me) and frees the phone number for anyone to register, then wipes local data\n"
-          "too on confirmed success. Unlike unregister, there is no undo.\n"
+          "too on confirmed success. Unlike deactivate, there is no undo.\n"
           "\n"
           "`unlink` wipes this account's local data (keys, sessions, cached contacts, SIP/deployment config) from\n"
           "the database. It is LOCAL ONLY - it does not contact Signal's servers, so use it after the account is\n"
           "already gone on the real side (a real unlink/delete-account done elsewhere), not as a way to perform\n"
           "that unlink itself.\n"
           "\n"
-          "`unregister`/`reactivate` are the opposite: a REAL, reversible server-side flag flip\n"
-          "(fetchesMessages) using the account's own stored credentials - senders can't reach an unregistered\n"
-          "number until `reactivate` is run. Neither touches local data or requires re-verification.\n"
+          "`deactivate`/`reactivate` are the opposite: a REAL, reversible server-side flag flip\n"
+          "(fetchesMessages) using the account's own stored credentials - senders can't reach a deactivated\n"
+          "number until `reactivate` is run. Neither touches local data or requires re-verification. `unregister`\n"
+          "still works as an alias for `deactivate`, for anything already scripted against the old name.\n"
           "\n"
           "`enable`/`disable` control whether signal2sip-daemon sets this account up at all - the running daemon\n"
           "picks up a change within 30s (configurable via [global] config_poll_interval_sec), or immediately if\n"
@@ -1014,8 +1015,8 @@ int main(int argc, char** argv) {
             cmdLink(config, args.accountName);
         } else if (args.command == "unlink") {
             cmdUnlink(config, args.accountName);
-        } else if (args.command == "unregister") {
-            cmdUnregister(config, args.accountName);
+        } else if (args.command == "deactivate" || args.command == "unregister") {
+            cmdDeactivate(config, args.accountName);
         } else if (args.command == "reactivate") {
             cmdReactivate(config, args.accountName);
         } else if (args.command == "delete-account") {
